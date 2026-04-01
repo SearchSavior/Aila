@@ -40,6 +40,7 @@ set(SOURCES
     src/utils/Tokenizer.cpp
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
+    src/profile/Device.cpp
 )
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp

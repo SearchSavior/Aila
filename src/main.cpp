@@ -1,9 +1,11 @@
 #include "engine/Engine.hpp"
+#include "profile/Device.hpp"
 #include <iostream>
 #include <string>
 
 int main(int argc, char** argv) {
     // Model directory (default or from command line)
+    CheckDevice();
     std::string model_dir = "E:\\RiderProjects\\Aila\\Qwen3-0.6B";
     if (argc > 1) {
         model_dir = argv[1];

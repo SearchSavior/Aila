@@ -1,7 +1,7 @@
 #pragma once
 
-#include "oneapi/dnnl/dnnl.hpp"
-#include "oneapi/dnnl/dnnl_sycl.hpp"
+#include <dnnl.hpp>
+#include <dnnl_sycl.hpp>
 #include <sycl/sycl.hpp>
 #include <cstddef>
 #include <iostream>
@@ -17,11 +17,6 @@ public:
         eng_ = dnnl::sycl_interop::make_engine(q_.get_device(), q_.get_context());
         stream_ = dnnl::sycl_interop::make_stream(eng_, q_);
 
-        auto dev = q_.get_device();
-        std::cout << "[Context] Device: " << dev.get_info<sycl::info::device::name>() << std::endl;
-        std::cout << "[Context] Global memory: "
-                  << dev.get_info<sycl::info::device::global_mem_size>() / (1024*1024)
-                  << " MB" << std::endl;
     }
 
     sycl::queue& queue() { return q_; }
