@@ -1,0 +1,58 @@
+﻿[Context] Device: Intel(R) Arc(TM) A770 Graphics
+[Context] Global memory: 15930 MB
+========================================
+  Aila Inference Engine (Qwen3-0.6B)
+========================================
+
+[1/3] Initializing GPU context...
+
+[2/3] Loading tokenizer...
+[Tokenizer] Loaded vocab: 151643 tokens (max_id=151642)
+[Tokenizer] Loaded 151291 merge rules
+[Tokenizer] Loaded 26 special tokens from tokenizer.json
+[Tokenizer] Special tokens: im_start=151644 im_end=151645 eot=151643 total_special=26
+
+[3/3] Loading model weights...
+[SafeTensors] Header size: 35552 bytes
+[SafeTensors] Found 311 tensors
+[SafeTensors] Loaded 311 tensors (1433.62 MB) to GPU
+[Qwen3] embed_tokens loaded
+[Qwen3] 28 transformer layers loaded
+[Qwen3] lm_head loaded (standalone)
+[KVCache] Allocated 28 layers, max_seq=4096, 448 MB
+[Qwen3] Model fully loaded and initialized
+
+========================================
+  Engine ready! Type your message.
+========================================
+
+
+User: 
+Aila: [Generate] Prompt tokens: 26
+[Generate] Prefill: 3367.49 ms (7.72088 tok/s)
+Hello! I'm a language model designed to assist with various tasks. I can help with writing, speaking, and understanding different languages. If you have any questions or need assistance, feel free to ask! 😊
+
+[Generate] Decoded 44 tokens in 1463.27 ms (30.0696 tok/s)
+
+
+User: 
+Aila: [Generate] Prompt tokens: 32
+[Generate] Prefill: 65.6993 ms (487.068 tok/s)
+Okay, the user is asking what 1 plus 2 is. Let me think. Well, in basic arithmetic, adding 1 and 2 would be straightforward. So 1 plus 2 equals 3. But wait, maybe they need more context? Like, could there be a trick here? No, it's a simple addition problem. I should just confirm the answer clearly. Let me make sure there's no hidden meaning or any other operations involved. Nope, just addition. So the answer should be 3.
+
+
+1 + 2 equals 3.
+[Generate] Decoded 117 tokens in 4048.78 ms (28.8976 tok/s)
+
+
+User: 
+Aila: [Generate] Prompt tokens: 29
+[Generate] Prefill: 58.6985 ms (494.05 tok/s)
+AI is a type of computer program that can perform tasks automatically. It can learn from data and make decisions based on that data. AI can be used in various fields like healthcare, finance, and education. It helps people work more efficiently and can assist in solving complex problems.
+
+
+AI (Artificial Intelligence) is a type of computer program designed to perform tasks automatically. It learns from data and makes decisions based on that data. AI is used in various fields like healthcare, finance, and education to help people work more efficiently and solve complex problems.
+[Generate] Decoded 111 tokens in 3859.41 ms (28.7609 tok/s)
+
+
+User: Goodbye!
