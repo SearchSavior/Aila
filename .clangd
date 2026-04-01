@@ -1,0 +1,19 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-IC:/Program Files (x86)/Intel/oneAPI/dev-utilities/2025.3/include"
+    - "-IC:/Program Files (x86)/Intel/oneAPI/mkl/latest/include"
+    - "-IC:/Program Files (x86)/Intel/oneAPI/dnnl/latest/include"
+    - "-IC:/Program Files (x86)/Intel/oneAPI/tbb/latest/include"
+    - "-IE:/RiderProjects/Aila/src/include"
+    - "-Wno-unknown-attributes"
+    - "-Wno-ignored-attributes"
+  Remove:
+    - "-mllvm"
+    - "-fno-sycl-early-optimizations"
+    - "-fno-exceptions"
+    - "-fno-cxx-exceptions"
+    - "/Fo*"
+  CompilationDatabase: "E:\\RiderProjects\\Aila\\build\\compile_commands.json"
+Index:
+  Background: Build

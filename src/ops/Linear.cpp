@@ -1,0 +1,117 @@
+#include "Ops.hpp"
+#include <sycl/sycl.hpp>
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+// ============================================================
+// Linear 层实现 (oneDNN MatMul)
+// ============================================================
+
+void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_features, bool preprocessed) {
+    weight_ = &weight;
+    in_features_ = in_features;
+    out_features_ = out_features;
+    preprocessed_ = preprocessed;
+
+    // 预创建 decode (seq_len=1) primitive
+    decode_src_md_ = dnnl::memory::desc({1, in_features}, dnnl::memory::data_type::bf16,
+                                         dnnl::memory::format_tag::ab);
+    
+    if (preprocessed_) {
+        // [in, out] 物理布局
+        decode_weight_md_ = dnnl::memory::desc({in_features, out_features},
+                                                dnnl::memory::data_type::bf16,
+                                                dnnl::memory::format_tag::ab);
+    } else {
+        // [out, in] 物理布局 (逻辑上是 [in, out] 转置)
+        decode_weight_md_ = dnnl::memory::desc({in_features, out_features},
+                                                dnnl::memory::data_type::bf16,
+                                                {1, static_cast<int64_t>(in_features)});
+    }
+
+    decode_dst_md_ = dnnl::memory::desc({1, out_features}, dnnl::memory::data_type::bf16,
+                                         dnnl::memory::format_tag::ab);
+
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), decode_src_md_,
+                                            decode_weight_md_, decode_dst_md_);
+    decode_prim_ = dnnl::matmul(pd);
+    decode_inited_ = true;
+}
+
+void Linear::ensure_primitive(Context& ctx, int seq_len) {
+    if (seq_len == 1 && decode_inited_) return;
+    if (prim_cache_.count(seq_len)) return;
+
+    auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
+                                      dnnl::memory::format_tag::ab);
+    
+    dnnl::memory::desc weight_md;
+    if (preprocessed_) {
+        weight_md = dnnl::memory::desc({in_features_, out_features_},
+                                        dnnl::memory::data_type::bf16,
+                                        dnnl::memory::format_tag::ab);
+    } else {
+        weight_md = dnnl::memory::desc({in_features_, out_features_},
+                                        dnnl::memory::data_type::bf16,
+                                        {1, static_cast<int64_t>(in_features_)});
+    }
+    
+    auto dst_md = dnnl::memory::desc({seq_len, out_features_}, dnnl::memory::data_type::bf16,
+                                      dnnl::memory::format_tag::ab);
+
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md);
+
+    CachedPrimitive cp;
+    cp.prim = dnnl::matmul(pd);
+    cp.src_md = src_md;
+    cp.weight_md = weight_md;
+    cp.dst_md = dst_md;
+    prim_cache_[seq_len] = cp;
+}
+
+void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
+    ensure_primitive(ctx, seq_len);
+
+    if (seq_len == 1 && decode_inited_) {
+        if (!decode_mem_inited_) {
+            decode_src_mem_ = dnnl::sycl_interop::make_memory(decode_src_md_, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, input.data());
+            decode_weight_mem_ = dnnl::sycl_interop::make_memory(decode_weight_md_, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, weight_->data());
+            decode_dst_mem_ = dnnl::sycl_interop::make_memory(decode_dst_md_, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, output.data());
+            decode_mem_inited_ = true;
+        } else {
+            decode_src_mem_.set_data_handle(input.data());
+            decode_weight_mem_.set_data_handle(weight_->data());
+            decode_dst_mem_.set_data_handle(output.data());
+        }
+
+        decode_prim_.execute(ctx.stream(), {
+            {DNNL_ARG_SRC, decode_src_mem_},
+            {DNNL_ARG_WEIGHTS, decode_weight_mem_},
+            {DNNL_ARG_DST, decode_dst_mem_}
+        });
+    } else {
+        auto& cp = prim_cache_[seq_len];
+        if (!cp.mem_inited) {
+            cp.src_mem = dnnl::sycl_interop::make_memory(cp.src_md, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, input.data());
+            cp.weight_mem = dnnl::sycl_interop::make_memory(cp.weight_md, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, weight_->data());
+            cp.dst_mem = dnnl::sycl_interop::make_memory(cp.dst_md, ctx.engine(),
+                        dnnl::sycl_interop::memory_kind::usm, output.data());
+            cp.mem_inited = true;
+        } else {
+            cp.src_mem.set_data_handle(input.data());
+            cp.weight_mem.set_data_handle(weight_->data());
+            cp.dst_mem.set_data_handle(output.data());
+        }
+
+        cp.prim.execute(ctx.stream(), {
+            {DNNL_ARG_SRC, cp.src_mem},
+            {DNNL_ARG_WEIGHTS, cp.weight_mem},
+            {DNNL_ARG_DST, cp.dst_mem}
+        });
+    }
+}

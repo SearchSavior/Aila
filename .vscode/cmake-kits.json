@@ -1,0 +1,10 @@
+[
+    {
+        "name": "Intel oneAPI DPC++/C++ Compiler",
+        "environmentSetupScript": "C:\\Program Files (x86)\\Intel\\oneAPI\\setvars.bat",
+        "compilers": {
+            "C": "icx",
+            "CXX": "icpx"
+        }
+    }
+]

@@ -1,0 +1,69 @@
+{
+    "cmake.configureSettings": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "/Zi /Od",
+        "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+    },
+    "terminal.integrated.profiles.windows": {
+        "oneAPI PowerShell": {
+            "source": "PowerShell",
+            "args": [
+                "-NoExit",
+                "-Command",
+                "cmd /c '\"C:\\Program Files (x86)\\Intel\\oneAPI\\setvars.bat\" && set' | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }; Write-Host ':: oneAPI environment initialized ::' -ForegroundColor Green"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "oneAPI PowerShell",
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\tbb\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\ippcp\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\ipp\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dpl\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dpcpp-ct\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dal\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dal\\latest\\include\\dal",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\latest\\include",
+        ".",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\umf\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\opt\\compiler\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\lib\\clang\\21\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\ocloc\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\mpi\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dnnl\\latest\\include",
+        "C:\\Program Files (x86)\\Intel\\oneAPI\\dev-utilities\\latest\\include",
+        "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.50.35717\\include",
+        "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.50.35717\\ATLMFC\\include",
+        "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\VS\\include",
+        "D:\\Windows Kits\\10\\include\\10.0.26100.0\\ucrt",
+        "D:\\Windows Kits\\10\\include\\10.0.26100.0\\um",
+        "D:\\Windows Kits\\10\\include\\10.0.26100.0\\shared",
+        "D:\\Windows Kits\\10\\include\\10.0.26100.0\\winrt",
+        "D:\\Windows Kits\\10\\include\\10.0.26100.0\\cppwinrt",
+        "C:\\Program Files (x86)\\Windows Kits\\NETFXSDK\\4.8\\include\\um"
+    ],
+    "C_Cpp.default.defines": [],
+    "C_Cpp.default.compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\latest\\bin\\icpx.exe",
+    "C_Cpp.default.compilerArgs": [
+        "-fsycl"
+    ],
+    "C_Cpp.default.cStandard": "c17",
+    //"C_Cpp.intelliSenseEngine": "Tag Parser",
+    "files.exclude": {
+        "**/build": true,
+        "**/node_modules": true,
+        "**/.git": true,
+        "**/llama.cpp": true,
+        "**/oneDNN": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/*.log": true,
+        "**/llama.cpp": true,
+        "**/oneDNN": true
+    }
+}
