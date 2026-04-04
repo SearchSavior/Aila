@@ -58,9 +58,9 @@ int main(int argc, char** argv) {
 
     // Generation config
     GenerationConfig gen_config;
-    gen_config.max_new_tokens = 512;
-    gen_config.temperature = 0.6f;
-    gen_config.top_k = 20;
+    gen_config.max_new_tokens = 1024;
+    gen_config.temperature = 0.7f;
+    gen_config.top_k = 15;
     gen_config.do_sample = false;
     gen_config.decode_chunk_size = 12;
     gen_config.stream_chunk_size = 4;

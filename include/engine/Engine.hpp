@@ -11,6 +11,7 @@
 #include <iostream>
 #include <algorithm>
 #include <vector>
+#include <cctype>
 
 // ============================================================
 // Inference Engine: orchestrates loading, tokenization, inference
@@ -83,11 +84,53 @@ public:
     std::string generate(const std::string& user_message,
                          const GenerationConfig& gen_config = GenerationConfig(),
                          std::function<void(const std::string&)> token_callback = nullptr) {
+        auto trim_copy = [](const std::string& s) -> std::string {
+            std::string out = s;
+            while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
+                out.pop_back();
+            }
+            return out;
+        };
+        auto ends_with_no_think = [&](const std::string& s) -> bool {
+            const std::string cmd = "/no_think";
+            std::string t = trim_copy(s);
+            if (t.size() < cmd.size()) return false;
+            size_t pos = t.size() - cmd.size();
+            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
+            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
+        };
+        auto strip_leading_think_artifacts = [](std::string& text) {
+            auto ltrim = [](std::string& x) {
+                size_t i = 0;
+                while (i < x.size() && std::isspace(static_cast<unsigned char>(x[i]))) ++i;
+                if (i > 0) x.erase(0, i);
+            };
+
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                ltrim(text);
+                if (text.rfind("<think>", 0) == 0) {
+                    text.erase(0, 7);
+                    changed = true;
+                    continue;
+                }
+                if (text.rfind("</think>", 0) == 0) {
+                    text.erase(0, 8);
+                    changed = true;
+                    continue;
+                }
+            }
+            ltrim(text);
+        };
+
+        bool no_think_requested = ends_with_no_think(user_message);
 
         // Reset KV cache for new conversation
         model_.reset();
 
-        // Tokenize with ChatML template (thinking mode bypassed via injected tokens)
+        // Tokenize with ChatML template.
+        // If user message ends with "/no_think", tokenizer will try to disable thinking mode.
         auto input_ids = tokenizer_.apply_chat_template(
             "You are a helpful assistant.", user_message);
 
@@ -129,6 +172,27 @@ public:
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(gen_config.max_new_tokens));
         bool streaming = (token_callback != nullptr);
+        bool suppress_leading_think = no_think_requested;
+        auto emit_stream_piece = [&](const std::string& piece) {
+            if (no_think_requested && suppress_leading_think) {
+                if (piece == "<think>" || piece == "</think>") {
+                    return;
+                }
+                bool all_ws = true;
+                for (unsigned char c : piece) {
+                    if (!std::isspace(c)) {
+                        all_ws = false;
+                        break;
+                    }
+                }
+                if (all_ws) {
+                    return;
+                }
+                suppress_leading_think = false;
+            }
+            output_text += piece;
+            token_callback(piece);
+        };
         int effective_chunk_size = streaming ? std::max(1, gen_config.stream_chunk_size)
                                              : std::max(1, gen_config.decode_chunk_size);
         bool use_chunked_greedy = (!gen_config.do_sample && effective_chunk_size > 1);
@@ -173,8 +237,7 @@ public:
 
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(token_id);
-                        output_text += token_text;
-                        token_callback(token_text);
+                        emit_stream_piece(token_text);
                     } else {
                         generated_token_ids.push_back(token_id);
                     }
@@ -191,8 +254,7 @@ public:
 
                 if (streaming) {
                     std::string token_text = tokenizer_.decode(next_token);
-                    output_text += token_text;
-                    token_callback(token_text);
+                    emit_stream_piece(token_text);
                 } else {
                     generated_token_ids.push_back(next_token);
                 }
@@ -227,6 +289,9 @@ public:
 
         if (!streaming && !generated_token_ids.empty()) {
             output_text = tokenizer_.decode(generated_token_ids);
+        }
+        if (no_think_requested) {
+            strip_leading_think_artifacts(output_text);
         }
 
         return output_text;

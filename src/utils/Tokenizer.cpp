@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <regex>
 #include <cassert>
+#include <cctype>
 
 // ============================================================
 // GPT-2 style byte-to-unicode mapping
@@ -351,6 +352,10 @@ std::string Tokenizer::decode(int token_id) const {
     const std::string& token = id_to_token_[token_id];
 
     if (special_tokens_.count(token)) {
+        // Keep think markers visible by default so users can observe CoT boundaries.
+        if (token == "<think>" || token == "</think>") {
+            return token;
+        }
         return "";
     }
 
@@ -398,6 +403,29 @@ std::vector<int> Tokenizer::apply_chat_template(
     const std::string& user_message) const {
 
     std::vector<int> ids;
+    std::string cleaned_user_message = user_message;
+    bool disable_think = false;
+
+    auto rtrim = [](std::string& s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+            s.pop_back();
+        }
+    };
+
+    rtrim(cleaned_user_message);
+    const std::string kNoThinkCmd = "/no_think";
+    if (cleaned_user_message.size() >= kNoThinkCmd.size()) {
+        size_t pos = cleaned_user_message.size() - kNoThinkCmd.size();
+        if (cleaned_user_message.compare(pos, kNoThinkCmd.size(), kNoThinkCmd) == 0) {
+            bool boundary_ok = (pos == 0) ||
+                               std::isspace(static_cast<unsigned char>(cleaned_user_message[pos - 1]));
+            if (boundary_ok) {
+                disable_think = true;
+                cleaned_user_message.erase(pos);
+                rtrim(cleaned_user_message);
+            }
+        }
+    }
 
     if (!system_prompt.empty()) {
         ids.push_back(im_start_id_);
@@ -409,7 +437,7 @@ std::vector<int> Tokenizer::apply_chat_template(
     }
 
     ids.push_back(im_start_id_);
-    auto user_tokens = encode("user\n" + user_message);
+    auto user_tokens = encode("user\n" + cleaned_user_message);
     ids.insert(ids.end(), user_tokens.begin(), user_tokens.end());
     ids.push_back(im_end_id_);
     auto nl = encode("\n");
@@ -419,15 +447,18 @@ std::vector<int> Tokenizer::apply_chat_template(
     auto asst_tokens = encode("assistant\n");
     ids.insert(ids.end(), asst_tokens.begin(), asst_tokens.end());
 
-    // Inject <think>\n</think>\n to skip thinking mode (Qwen3)
-    auto think_it = special_tokens_.find("<think>");
-    auto end_think_it = special_tokens_.find("</think>");
-    if (think_it != special_tokens_.end() && end_think_it != special_tokens_.end()) {
-        ids.push_back(think_it->second);
-        auto nl_tokens = encode("\n");
-        ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
-        ids.push_back(end_think_it->second);
-        ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
+    // Only attempt to skip thinking when user explicitly appends "/no_think".
+    if (disable_think) {
+        auto end_think_it = special_tokens_.find("</think>");
+        if (end_think_it != special_tokens_.end()) {
+            auto nl_tokens = encode("\n");
+            ids.push_back(end_think_it->second);
+            ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
+
+            // Reinforce no-think behavior with an explicit assistant prefix.
+            auto direct_tokens = encode("Please answer directly and briefly.\n");
+            ids.insert(ids.end(), direct_tokens.begin(), direct_tokens.end());
+        }
     }
 
     return ids;

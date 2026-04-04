@@ -26,6 +26,7 @@ public:
     std::string decode(const std::vector<int>& token_ids) const;
 
     // 应用 ChatML 对话模板
+    // 用户消息末尾追加 "/no_think" 时，会尝试关闭思考模式注入。
     std::vector<int> apply_chat_template(
         const std::string& system_prompt,
         const std::string& user_message) const;
