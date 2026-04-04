@@ -46,6 +46,12 @@ public:
 
         // 4. Initialize model
         model_.load(*ctx_, *weights_, config_, max_seq_len);
+        auto to_mb = [](size_t bytes) -> double {
+            return static_cast<double>(bytes) / (1024.0 * 1024.0);
+        };
+        std::cout << "[Memory] After model load: current="
+                  << to_mb(ctx_->current_allocated_bytes()) << " MB, peak="
+                  << to_mb(ctx_->peak_allocated_bytes()) << " MB" << std::endl;
 
         // 5. Warmup to amortize first-run JIT/primitive costs
         {
@@ -71,6 +77,9 @@ public:
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
             std::cout << "[Warmup] Completed in " << warmup_ms << " ms" << std::endl;
         }
+        std::cout << "[Memory] After warmup: current="
+                  << to_mb(ctx_->current_allocated_bytes()) << " MB, peak="
+                  << to_mb(ctx_->peak_allocated_bytes()) << " MB" << std::endl;
 
         std::cout << "\n========================================" << std::endl;
         std::cout << "  Engine ready! Type your message." << std::endl;
@@ -136,6 +145,20 @@ public:
 
         std::cout << "[Generate] Prompt tokens: " << input_ids.size() << std::endl;
 
+        int available_decode_tokens = model_.max_seq_len() - static_cast<int>(input_ids.size());
+        if (available_decode_tokens <= 0) {
+            std::cerr << "[Generate] Prompt exceeds context window (prompt="
+                      << input_ids.size() << ", max_seq_len=" << model_.max_seq_len() << ")"
+                      << std::endl;
+            return "";
+        }
+        int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
+        if (max_new_tokens < gen_config.max_new_tokens) {
+            std::cout << "[Generate] max_new_tokens clamped from " << gen_config.max_new_tokens
+                      << " to " << max_new_tokens
+                      << " due to context window limit" << std::endl;
+        }
+
         // Upload token IDs to GPU (async, will be waited by first kernel)
         int* token_ids_device = static_cast<int*>(ctx_->alloc_device(input_ids.size() * sizeof(int)));
         ctx_->memcpy_h2d_async(token_ids_device, input_ids.data(), input_ids.size() * sizeof(int));
@@ -168,9 +191,9 @@ public:
 
         // Decode loop (Asynchronous Pipeline)
         std::string output_text;
-        std::vector<int> host_tokens(static_cast<size_t>(gen_config.max_new_tokens));
+        std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
         std::vector<int> generated_token_ids;
-        generated_token_ids.reserve(static_cast<size_t>(gen_config.max_new_tokens));
+        generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
         bool streaming = (token_callback != nullptr);
         bool suppress_leading_think = no_think_requested;
         auto emit_stream_piece = [&](const std::string& piece) {
@@ -199,7 +222,7 @@ public:
         int* generated_tokens_device = nullptr;
         if (use_chunked_greedy) {
             generated_tokens_device = static_cast<int*>(
-                ctx_->alloc_device(static_cast<size_t>(gen_config.max_new_tokens + 1) * sizeof(int)));
+                ctx_->alloc_device(static_cast<size_t>(max_new_tokens + 1) * sizeof(int)));
         }
 
         int generated_count = 0;
@@ -210,9 +233,9 @@ public:
             bool eos_reached = false;
             ctx_->queue().memcpy(generated_tokens_device, current_token_device, sizeof(int));
 
-            while (generated_count < gen_config.max_new_tokens && !eos_reached) {
+            while (generated_count < max_new_tokens && !eos_reached) {
                 int chunk_begin = generated_count;
-                int chunk_end = std::min(gen_config.max_new_tokens, chunk_begin + chunk_size);
+                int chunk_end = std::min(max_new_tokens, chunk_begin + chunk_size);
 
                 for (; generated_count < chunk_end; ++generated_count) {
                     int* current_ptr = generated_tokens_device + generated_count;
@@ -244,7 +267,7 @@ public:
                 }
             }
         } else {
-            while (generated_count < gen_config.max_new_tokens) {
+            while (generated_count < max_new_tokens) {
                 Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
 
                 ctx_->memcpy_d2h(&next_token, current_token_device, sizeof(int));

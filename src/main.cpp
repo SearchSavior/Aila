@@ -33,6 +33,25 @@ bool read_env_flag(const char* name, bool default_value) {
 #endif
 }
 
+int read_env_int(const char* name, int default_value) {
+#ifdef _WIN32
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) == 0 && value) {
+        int parsed = std::atoi(value);
+        free(value);
+        return parsed > 0 ? parsed : default_value;
+    }
+    if (value) free(value);
+    return default_value;
+#else
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : default_value;
+#endif
+}
+
 bool detect_interactive_terminal() {
 #ifdef _WIN32
     return (_isatty(_fileno(stdin)) != 0) && (_isatty(_fileno(stdout)) != 0);
@@ -117,13 +136,21 @@ int main(int argc, char** argv) {
     // Model directory (default or from command line)
     CheckDevice();
     std::string model_dir = "E:\\RiderProjects\\Aila\\Qwen3-0.6B";
+    int max_seq_len = read_env_int("AILA_MAX_SEQ_LEN", 4096);
     if (argc > 1) {
         model_dir = argv[1];
     }
+    if (argc > 2) {
+        int cli_seq = std::atoi(argv[2]);
+        if (cli_seq > 0) {
+            max_seq_len = cli_seq;
+        }
+    }
+    std::cout << "[Config] max_seq_len=" << max_seq_len << std::endl;
 
     // Initialize engine
     InferenceEngine engine;
-    if (!engine.init(model_dir)) {
+    if (!engine.init(model_dir, max_seq_len)) {
         std::cerr << "Failed to initialize inference engine" << std::endl;
         return 1;
     }

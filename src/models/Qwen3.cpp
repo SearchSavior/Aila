@@ -3,8 +3,54 @@
 #include <string>
 #include <cassert>
 #include <cmath>
+#include <algorithm>
+#include <stdexcept>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+
+namespace {
+int round_up_seq(int v, int granularity) {
+    return ((v + granularity - 1) / granularity) * granularity;
+}
+}
+
+void Qwen3Model::ensure_runtime_buffers(Context& ctx, int seq_len) {
+    if (seq_len <= runtime_seq_capacity_) return;
+
+    int H = config_.hidden_size;
+    int QD = config_.num_attention_heads * config_.head_dim;
+    int KVD = config_.num_key_value_heads * config_.head_dim;
+    int FF = config_.intermediate_size;
+    int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
+
+    buf_.hidden   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
+    buf_.residual = Tensor::allocate(ctx, {(int64_t)new_cap, H});
+    buf_.normed   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
+    buf_.qkv      = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(QD + 2 * KVD)});
+    buf_.q        = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)QD});
+    buf_.k        = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)KVD});
+    buf_.v        = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)KVD});
+    buf_.attn_out = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)QD});
+    buf_.gate_up  = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * FF)});
+    buf_.gate     = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)FF});
+    buf_.up       = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)FF});
+    buf_.ffn_out  = Tensor::allocate(ctx, {(int64_t)new_cap, H});
+
+    runtime_seq_capacity_ = new_cap;
+    std::cout << "[Qwen3] Runtime buffers resized: seq_cap=" << runtime_seq_capacity_ << std::endl;
+}
+
+void Qwen3Model::ensure_prefill_scores(Context& ctx, int seq_len) {
+    if (seq_len <= prefill_scores_capacity_) return;
+
+    int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
+    buf_.scores = Tensor::allocate(ctx,
+        {(int64_t)config_.num_attention_heads, (int64_t)new_cap, (int64_t)new_cap},
+        dnnl::memory::data_type::f32);
+
+    prefill_scores_capacity_ = new_cap;
+    std::cout << "[Qwen3] Prefill score buffer resized: seq_cap=" << prefill_scores_capacity_ << std::endl;
+}
 
 // ============================================================
 // Load model weights from SafeTensors
@@ -30,6 +76,8 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
         // 分配转置后的空间
         Tensor dst = Tensor::allocate(ctx, {in_f, out_f}, src.dtype());
         ops::transpose(ctx, src, dst);
+        // transpose kernel is async; ensure completion before freeing/replacing src
+        ctx.synchronize();
         
         // 替换原始 tensor
         weights.replace(name, std::move(dst));
@@ -159,26 +207,15 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
     // --- KV Cache ---
     kv_cache_.init(ctx, config, max_seq_len);
 
-    // --- Activation buffers ---
-    buf_.hidden   = Tensor::allocate(ctx, {(int64_t)max_seq_len, H});
-    buf_.residual = Tensor::allocate(ctx, {(int64_t)max_seq_len, H});
-    buf_.normed   = Tensor::allocate(ctx, {(int64_t)max_seq_len, H});
-    buf_.qkv      = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)(QD + 2 * KVD)});
-    buf_.q        = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)QD});
-    buf_.k        = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)KVD});
-    buf_.v        = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)KVD});
-    buf_.attn_out = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)QD});
-    buf_.gate_up  = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)(2 * FF)});
-    buf_.gate     = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)FF});
-    buf_.up       = Tensor::allocate(ctx, {(int64_t)max_seq_len, (int64_t)FF});
-    buf_.ffn_out  = Tensor::allocate(ctx, {(int64_t)max_seq_len, H});
+    // --- Runtime buffers (lazy grow) ---
+    runtime_seq_capacity_ = 0;
+    prefill_scores_capacity_ = 0;
+    ensure_runtime_buffers(ctx, 1);
+
+    // --- Persistent buffers ---
     buf_.logits   = Tensor::allocate(ctx, {1, (int64_t)config.vocab_size});
     buf_.decode_scores = Tensor::allocate(ctx,
         {(int64_t)config.num_attention_heads, (int64_t)max_seq_len},
-        dnnl::memory::data_type::f32);
-    // Prefill attention scores: [num_heads, max_seq, max_seq] in f32
-    buf_.scores   = Tensor::allocate(ctx,
-        {(int64_t)config.num_attention_heads, (int64_t)max_seq_len, (int64_t)max_seq_len},
         dnnl::memory::data_type::f32);
     buf_.rope_freq = Tensor::allocate(ctx,
         {(int64_t)(config.head_dim / 2)},
@@ -201,12 +238,26 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
 // ============================================================
 
 Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_len) {
+    if (seq_len <= 0) {
+        throw std::runtime_error("Qwen3Model::forward: seq_len must be positive");
+    }
+
     int H = config_.hidden_size;
     int QD = config_.num_attention_heads * config_.head_dim;
     int KVD = config_.num_key_value_heads * config_.head_dim;
     int FF = config_.intermediate_size;
     int start_pos = kv_cache_.current_length();
     int cached_len = start_pos + seq_len;
+    if (cached_len > max_seq_len_) {
+        throw std::runtime_error("Qwen3Model::forward: context window exceeded (cached_len=" +
+                                 std::to_string(cached_len) + ", max_seq_len=" +
+                                 std::to_string(max_seq_len_) + ")");
+    }
+
+    ensure_runtime_buffers(ctx, seq_len);
+    if (seq_len > 1) {
+        ensure_prefill_scores(ctx, seq_len);
+    }
 
     // 1. Embedding lookup
     ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, H);

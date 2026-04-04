@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 
 // ============================================================
 // SYCL + oneDNN 运行时上下文
@@ -29,11 +30,27 @@ public:
         if (!ptr) {
             throw std::runtime_error("GPU memory allocation failed: " + std::to_string(bytes) + " bytes");
         }
+        alloc_bytes_[ptr] = bytes;
+        current_allocated_bytes_ += bytes;
+        if (current_allocated_bytes_ > peak_allocated_bytes_) {
+            peak_allocated_bytes_ = current_allocated_bytes_;
+        }
         return ptr;
     }
 
     void free_device(void* ptr) {
-        if (ptr) sycl::free(ptr, q_);
+        if (!ptr) return;
+        auto it = alloc_bytes_.find(ptr);
+        if (it != alloc_bytes_.end()) {
+            size_t bytes = it->second;
+            if (current_allocated_bytes_ >= bytes) {
+                current_allocated_bytes_ -= bytes;
+            } else {
+                current_allocated_bytes_ = 0;
+            }
+            alloc_bytes_.erase(it);
+        }
+        sycl::free(ptr, q_);
     }
 
     // Host -> Device copy (blocking, for synchronous operations)
@@ -60,8 +77,14 @@ public:
         q_.wait_and_throw();
     }
 
+    size_t current_allocated_bytes() const { return current_allocated_bytes_; }
+    size_t peak_allocated_bytes() const { return peak_allocated_bytes_; }
+
 private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
+    std::unordered_map<void*, size_t> alloc_bytes_;
+    size_t current_allocated_bytes_ = 0;
+    size_t peak_allocated_bytes_ = 0;
 };

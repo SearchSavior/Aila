@@ -28,8 +28,12 @@ public:
     void reset();
 
     const Qwen3Config& config() const { return config_; }
+    int max_seq_len() const { return max_seq_len_; }
 
 private:
+    void ensure_runtime_buffers(Context& ctx, int seq_len);
+    void ensure_prefill_scores(Context& ctx, int seq_len);
+
     Qwen3Config config_;
 
     // Per-layer components
@@ -81,4 +85,6 @@ private:
     } buf_;
 
     int max_seq_len_ = 0;
+    int runtime_seq_capacity_ = 0;
+    int prefill_scores_capacity_ = 0;
 };

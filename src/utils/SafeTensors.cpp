@@ -149,32 +149,12 @@ static Tensor LoadTensorToGPU(const uint8_t* mmap_base_ptr,
     size_t size_in_bytes = meta.byte_offset_end - meta.byte_offset_start;
     const void* host_src_ptr = mmap_base_ptr + meta.byte_offset_start;
 
-    // GPU 分配
-    void* device_ptr = ctx.alloc_device(size_in_bytes);
-
-    // Host -> Device
-    ctx.memcpy_h2d(device_ptr, host_src_ptr, size_in_bytes);
-
     // 构造 shape vector
     std::vector<int64_t> shape(meta.shape.dims, meta.shape.dims + meta.shape.ndims);
     dnnl::memory::data_type dnnl_dtype = to_dnnl_dtype(meta.dtype);
-
-    // 创建 dnnl memory descriptor + memory 对象
-    dnnl::memory::dims dnnl_dims(shape.begin(), shape.end());
-    auto format = get_format_tag(meta.shape.ndims);
-    dnnl::memory::desc md(dnnl_dims, dnnl_dtype, format);
-
-    dnnl::memory gpu_mem = dnnl::sycl_interop::make_memory(
-        md, ctx.engine(),
-        dnnl::sycl_interop::memory_kind::usm,
-        device_ptr
-    );
-
-    // 创建 Tensor (from_dnnl 不拥有内存，但我们需要它拥有)
-    // 使用 view 包装，设置 owns_memory 通过 allocate 路径
-    Tensor t = Tensor::view(ctx, device_ptr, shape, dnnl_dtype);
-    // 注意: 这里的 tensor 不拥有内存，由 ModelWeights 整体管理
-    // dnnl::memory 对象存储在内部以供 oneDNN primitive 使用
+    // Use owning tensor so replacement/free lifecycle is correct.
+    Tensor t = Tensor::allocate(ctx, shape, dnnl_dtype);
+    ctx.memcpy_h2d(t.data(), host_src_ptr, size_in_bytes);
 
     return t;
 }

@@ -40,3 +40,11 @@ Notes:
 - Smaller `stream_chunk_size` gives lower latency per visible token, but usually lower tok/s.
 - Larger `stream_chunk_size` improves throughput, but token display becomes less real-time.
 - On Intel Arc A770, `stream_chunk_size=4` is a good default balance; `8` often gives higher peak throughput.
+
+### Context Window / Memory
+- Use `AILA_MAX_SEQ_LEN=<N>` to control runtime context window (default `4096`).
+- You can also pass it as CLI arg #2: `Aila.exe <model_dir> <max_seq_len>`.
+
+Memory impact:
+- KV cache scales linearly with `max_seq_len`.
+- Activation and prefill score buffers are allocated lazily and grow on demand, so startup VRAM is much lower than preallocating full `[max_seq, ...]` buffers.
