@@ -52,6 +52,25 @@ void Qwen3Model::ensure_prefill_scores(Context& ctx, int seq_len) {
     AILA_LOG_INFO("[Qwen3] Prefill score buffer resized: seq_cap=%d", prefill_scores_capacity_);
 }
 
+void Qwen3Model::ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len) {
+    if (seq_len <= incr_prefill_seq_cap_ && total_len <= incr_prefill_total_cap_) return;
+
+    int new_seq_cap = std::max(seq_len, incr_prefill_seq_cap_);
+    int new_total_cap = std::max(total_len, incr_prefill_total_cap_);
+    // Round up for alignment
+    new_seq_cap = round_up_seq(new_seq_cap, 16);
+    new_total_cap = round_up_seq(new_total_cap, 64);
+
+    buf_.incr_scores = Tensor::allocate(ctx,
+        {(int64_t)config_.num_attention_heads, (int64_t)new_seq_cap, (int64_t)new_total_cap},
+        dnnl::memory::data_type::f32);
+
+    incr_prefill_seq_cap_ = new_seq_cap;
+    incr_prefill_total_cap_ = new_total_cap;
+    AILA_LOG_INFO("[Qwen3] Incremental prefill score buffer resized: seq_cap=%d, total_cap=%d",
+                  incr_prefill_seq_cap_, incr_prefill_total_cap_);
+}
+
 // ============================================================
 // Load model weights from SafeTensors
 // ============================================================
@@ -256,7 +275,11 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
 
     ensure_runtime_buffers(ctx, seq_len);
     if (seq_len > 1) {
-        ensure_prefill_scores(ctx, seq_len);
+        if (start_pos == 0) {
+            ensure_prefill_scores(ctx, seq_len);
+        } else {
+            ensure_incr_prefill_scores(ctx, seq_len, start_pos + seq_len);
+        }
     }
 
     // 1. Embedding lookup
@@ -324,13 +347,22 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
                                   buf_.attn_out, buf_.decode_scores,
                                   config_.num_attention_heads, config_.num_key_value_heads,
                                   config_.head_dim, cached_len);
-        } else {
-            // Prefill mode: full attention matrix
+        } else if (start_pos == 0) {
+            // Initial prefill: full attention matrix (no KV cache history)
             ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v,
                                    buf_.attn_out, buf_.scores,
                                    seq_len,
                                    config_.num_attention_heads, config_.num_key_value_heads,
                                    config_.head_dim);
+        } else {
+            // Incremental prefill: Q attends to full KV cache + new tokens
+            // New K/V were already written to cache by copy_to_cache above
+            ops::attention_prefill_cached(ctx, buf_.q,
+                                          kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                                          buf_.attn_out, buf_.incr_scores,
+                                          seq_len, start_pos,
+                                          config_.num_attention_heads, config_.num_key_value_heads,
+                                          config_.head_dim, kv_cache_.max_length());
         }
 
         // 8. O projection
@@ -392,4 +424,8 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
 
 void Qwen3Model::reset() {
     kv_cache_.reset();
+}
+
+void Qwen3Model::truncate_kv_cache(int new_len) {
+    kv_cache_.truncate(new_len);
 }

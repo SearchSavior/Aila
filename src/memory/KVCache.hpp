@@ -29,6 +29,13 @@ public:
     // 重置 (新对话)
     void reset() { current_len_ = 0; }
 
+    // 截断缓存长度 (用于剥离多轮对话中特定的思维链)
+    void truncate(int new_len) {
+        if (new_len < current_len_) {
+            current_len_ = new_len;
+        }
+    }
+
     int max_length() const { return max_len_; }
 
 private:

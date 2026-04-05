@@ -165,63 +165,23 @@ public:
         history_.add_user(user_message);
 
         // --- Build the token sequence for this turn ---
-        // We construct it incrementally from cached_ids_ to avoid
-        // decode→re-encode mismatches.
-        //
-        // If cached_ids_ is empty (first turn), build from scratch.
-        // Otherwise, append:  <|im_end|>\n  (close prev assistant)
-        //                     <|im_start|>user\n{msg}<|im_end|>\n
-        //                     <|im_start|>assistant\n
-
-        std::vector<int> full_ids;
+        // We always use apply_chat_template to cleanly construct the prompt,
+        // which naturally handles dynamically stripped context (e.g. removed <think> blocks).
+        std::vector<int> full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
         int reusable_prefix = 0;
 
-        if (cached_ids_.empty()) {
-            // First turn: encode from scratch using chat template
-            full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
-            reusable_prefix = 0;
-        } else {
-            // Subsequent turns: build incrementally
-            // The KV cache contains cached_ids_ which ends with the generated tokens
-            // of the previous assistant response. We need to close that turn and
-            // open the new one.
-
-            std::vector<int> new_suffix;
-
-            // Close previous assistant turn: <|im_end|>\n
-            new_suffix.push_back(config_.im_end_id);
-            auto nl_tokens = tokenizer_.encode("\n");
-            new_suffix.insert(new_suffix.end(), nl_tokens.begin(), nl_tokens.end());
-
-            // New user turn: <|im_start|>user\n{message}<|im_end|>\n
-            new_suffix.push_back(config_.im_start_id);
-            auto user_turn = tokenizer_.encode("user\n" + user_message);
-            new_suffix.insert(new_suffix.end(), user_turn.begin(), user_turn.end());
-            new_suffix.push_back(config_.im_end_id);
-            new_suffix.insert(new_suffix.end(), nl_tokens.begin(), nl_tokens.end());
-
-            // Open assistant turn: <|im_start|>assistant\n
-            new_suffix.push_back(config_.im_start_id);
-            auto asst_start = tokenizer_.encode("assistant\n");
-            new_suffix.insert(new_suffix.end(), asst_start.begin(), asst_start.end());
-
-            // Handle /no_think suffix injection
-            if (no_think_requested) {
-                auto end_think_it_pair = tokenizer_.special_token_id("</think>");
-                if (end_think_it_pair >= 0) {
-                    new_suffix.push_back(end_think_it_pair);
-                    new_suffix.insert(new_suffix.end(), nl_tokens.begin(), nl_tokens.end());
-                    auto direct = tokenizer_.encode("Please answer directly and briefly.\n");
-                    new_suffix.insert(new_suffix.end(), direct.begin(), direct.end());
-                }
-            }
-
-            // full_ids = cached_ids_ + new_suffix
-            full_ids.reserve(cached_ids_.size() + new_suffix.size());
-            full_ids.insert(full_ids.end(), cached_ids_.begin(), cached_ids_.end());
-            full_ids.insert(full_ids.end(), new_suffix.begin(), new_suffix.end());
-            reusable_prefix = static_cast<int>(cached_ids_.size());
+        // Find the longest common prefix (LCP) with the current KV cache contents
+        int max_possible_match = std::min(static_cast<int>(cached_ids_.size()), static_cast<int>(full_ids.size()));
+        while (reusable_prefix < max_possible_match && 
+               cached_ids_[reusable_prefix] == full_ids[reusable_prefix]) {
+            reusable_prefix++;
         }
+
+        // Truncate the physical KV cache inside the model to match the reusable prefix.
+        // This is necessary because if we stripped <think> blocks, the sequence diverged,
+        // and we cannot append new tokens to the end of the previous longer sequence.
+        model_.truncate_kv_cache(reusable_prefix);
+        cached_ids_.resize(reusable_prefix);
 
         // --- Context overflow: if too long, clear and rebuild from scratch ---
         int max_ctx = model_.max_seq_len();
@@ -251,6 +211,7 @@ public:
         } else {
             AILA_LOG_INFO("[Generate] Full prefill: %d tokens", total_prompt_len);
         }
+
 
         int available_decode_tokens = max_ctx - total_prompt_len;
         if (available_decode_tokens <= 0) {
@@ -296,6 +257,7 @@ public:
         // Sample first token using unified sampler
         int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
                                                   gen_config, generated_token_ids);
+
         ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
 
         std::string output_text;
@@ -364,6 +326,7 @@ public:
                 for (int i = chunk_begin; i < generated_count; ++i) {
                     int token_id = host_tokens[i];
                     if (tokenizer_.is_eos(token_id)) {
+
                         generated_count = i;
                         eos_reached = true;
                         break;
@@ -434,7 +397,27 @@ public:
         cached_ids_.insert(cached_ids_.end(), generated_token_ids.begin(), generated_token_ids.end());
 
         // Add assistant response to history (for display and overflow rebuild)
-        history_.add_assistant(output_text);
+        // Strip <think>...</think> from the text prior to adding to history so the model
+        // isn't forced to hallucinate its own obsolete reasoning in future turns,
+        // which prevents early EOS truncation behavior.
+        std::string history_text = output_text;
+        size_t start_think = history_text.find("<think>");
+        if (start_think != std::string::npos) {
+            size_t end_think = history_text.find("</think>");
+            if (end_think != std::string::npos) {
+                history_text.erase(start_think, end_think + 8 - start_think);
+            } else {
+                history_text.erase(start_think);
+            }
+            // Strip any remaining leading/trailing whitespace
+            auto ltrim_h = [](std::string& s) {
+                size_t i = 0;
+                while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+                if (i > 0) s.erase(0, i);
+            };
+            ltrim_h(history_text);
+        }
+        history_.add_assistant(history_text);
 
         return output_text;
     }

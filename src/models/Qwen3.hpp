@@ -27,12 +27,16 @@ public:
     // Reset KV cache for new conversation
     void reset();
 
+    // Truncate KV cache to a specific length (for incremental decoding after stripping thoughts)
+    void truncate_kv_cache(int new_len);
+
     const Qwen3Config& config() const { return config_; }
     int max_seq_len() const { return max_seq_len_; }
 
 private:
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
+    void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
 
     Qwen3Config config_;
 
@@ -81,10 +85,13 @@ private:
         Tensor logits;       // [1, vocab_size]
         Tensor decode_scores;// [num_heads, max_seq] for decode attention
         Tensor scores;       // [num_heads, max_seq, max_seq] for prefill attention
+        Tensor incr_scores;  // [num_heads, seq_len, total_len] for incremental prefill attention
         Tensor rope_freq;    // [head_dim/2] precomputed RoPE frequency table (f32)
     } buf_;
 
     int max_seq_len_ = 0;
     int runtime_seq_capacity_ = 0;
     int prefill_scores_capacity_ = 0;
+    int incr_prefill_seq_cap_ = 0;
+    int incr_prefill_total_cap_ = 0;
 };

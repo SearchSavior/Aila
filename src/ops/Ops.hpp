@@ -131,7 +131,7 @@ namespace ops {
                           int num_heads, int num_kv_heads, int head_dim,
                           int cached_len);
 
-    // Prefill Attention (seq_len > 1)
+    // Prefill Attention (seq_len > 1, initial prefill with start_pos=0)
     // q: [seq_len, num_heads * head_dim]
     // k: [seq_len, num_kv_heads * head_dim]  (本次 K, 已 RoPE)
     // v: [seq_len, num_kv_heads * head_dim]  (本次 V)
@@ -142,6 +142,21 @@ namespace ops {
                            Tensor& output, Tensor& scores_buf,
                            int seq_len,
                            int num_heads, int num_kv_heads, int head_dim);
+
+    // Incremental Prefill Attention (seq_len > 1, start_pos > 0)
+    // Q attends to full KV cache [0, start_pos + seq_len) with causal masking.
+    // New K/V must already be written to cache before calling this.
+    // q:       [seq_len, num_heads * head_dim]
+    // k_cache: [num_kv_heads, max_seq_len, head_dim]
+    // v_cache: [num_kv_heads, max_seq_len, head_dim]
+    // output:  [seq_len, num_heads * head_dim]
+    // scores_buf: [num_heads, seq_len, total_len] where total_len = start_pos + seq_len
+    void attention_prefill_cached(Context& ctx,
+                                  Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                  Tensor& output, Tensor& scores_buf,
+                                  int seq_len, int start_pos,
+                                  int num_heads, int num_kv_heads,
+                                  int head_dim, int max_seq_len);
 
     // SwiGLU: output = silu(gate) * up
     // gate, up, output: [n] (element-wise)
