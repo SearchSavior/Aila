@@ -4,11 +4,11 @@
 #include "../src/models/Qwen3.hpp"
 #include "../src/utils/Tokenizer.hpp"
 #include "../src/utils/SafeTensors.hpp"
+#include "../src/profile/Profiling.hpp"
 #include "Types.hpp"
 #include <string>
 #include <functional>
 #include <chrono>
-#include <iostream>
 #include <algorithm>
 #include <vector>
 #include <cctype>
@@ -24,23 +24,23 @@ public:
     bool init(const std::string& model_dir, int max_seq_len = 4096) {
         model_dir_ = model_dir;
 
-        std::cout << "========================================" << std::endl;
-        std::cout << "  Aila Inference Engine (Qwen3-0.6B)" << std::endl;
-        std::cout << "========================================" << std::endl;
+        AILA_LOG_INFO("========================================");
+        AILA_LOG_INFO("  Aila Inference Engine");
+        AILA_LOG_INFO("========================================");
 
         // 1. Create context
-        std::cout << "\n[1/3] Initializing GPU context..." << std::endl;
+        AILA_LOG_INFO("[1/3] Initializing GPU context...");
         ctx_ = std::make_unique<Context>();
 
         // 2. Load tokenizer
-        std::cout << "\n[2/3] Loading tokenizer..." << std::endl;
+        AILA_LOG_INFO("[2/3] Loading tokenizer...");
         if (!tokenizer_.load(model_dir)) {
-            std::cerr << "Failed to load tokenizer" << std::endl;
+            AILA_LOG_ERROR("Failed to load tokenizer");
             return false;
         }
 
         // 3. Load model weights
-        std::cout << "\n[3/3] Loading model weights..." << std::endl;
+        AILA_LOG_INFO("[3/3] Loading model weights...");
         std::string safetensors_path = model_dir + "/model.safetensors";
         weights_ = std::make_unique<ModelWeights>(LoadSafetensors(safetensors_path, *ctx_));
 
@@ -49,9 +49,9 @@ public:
         auto to_mb = [](size_t bytes) -> double {
             return static_cast<double>(bytes) / (1024.0 * 1024.0);
         };
-        std::cout << "[Memory] After model load: current="
-                  << to_mb(ctx_->current_allocated_bytes()) << " MB, peak="
-                  << to_mb(ctx_->peak_allocated_bytes()) << " MB" << std::endl;
+        AILA_LOG_INFO("[Memory] After model load: current=%.2f MB, peak=%.2f MB",
+                      to_mb(ctx_->current_allocated_bytes()),
+                      to_mb(ctx_->peak_allocated_bytes()));
 
         // 5. Warmup to amortize first-run JIT/primitive costs
         {
@@ -75,15 +75,15 @@ public:
             model_.reset();
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
-            std::cout << "[Warmup] Completed in " << warmup_ms << " ms" << std::endl;
+            AILA_LOG_INFO("[Warmup] Completed in %.2f ms", warmup_ms);
         }
-        std::cout << "[Memory] After warmup: current="
-                  << to_mb(ctx_->current_allocated_bytes()) << " MB, peak="
-                  << to_mb(ctx_->peak_allocated_bytes()) << " MB" << std::endl;
+        AILA_LOG_INFO("[Memory] After warmup: current=%.2f MB, peak=%.2f MB",
+                      to_mb(ctx_->current_allocated_bytes()),
+                      to_mb(ctx_->peak_allocated_bytes()));
 
-        std::cout << "\n========================================" << std::endl;
-        std::cout << "  Engine ready! Type your message." << std::endl;
-        std::cout << "========================================\n" << std::endl;
+        AILA_LOG_INFO("========================================");
+        AILA_LOG_INFO("  Engine ready!");
+        AILA_LOG_INFO("========================================");
 
         return true;
     }
@@ -139,24 +139,21 @@ public:
         model_.reset();
 
         // Tokenize with ChatML template.
-        // If user message ends with "/no_think", tokenizer will try to disable thinking mode.
         auto input_ids = tokenizer_.apply_chat_template(
             "You are a helpful assistant.", user_message);
 
-        std::cout << "[Generate] Prompt tokens: " << input_ids.size() << std::endl;
+        AILA_LOG_INFO("[Generate] Prompt tokens: %zu", input_ids.size());
 
         int available_decode_tokens = model_.max_seq_len() - static_cast<int>(input_ids.size());
         if (available_decode_tokens <= 0) {
-            std::cerr << "[Generate] Prompt exceeds context window (prompt="
-                      << input_ids.size() << ", max_seq_len=" << model_.max_seq_len() << ")"
-                      << std::endl;
+            AILA_LOG_ERROR("[Generate] Prompt exceeds context window (prompt=%zu, max_seq_len=%d)",
+                           input_ids.size(), model_.max_seq_len());
             return "";
         }
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
         if (max_new_tokens < gen_config.max_new_tokens) {
-            std::cout << "[Generate] max_new_tokens clamped from " << gen_config.max_new_tokens
-                      << " to " << max_new_tokens
-                      << " due to context window limit" << std::endl;
+            AILA_LOG_INFO("[Generate] max_new_tokens clamped from %d to %d due to context window limit",
+                          gen_config.max_new_tokens, max_new_tokens);
         }
 
         // Upload token IDs to GPU (async, will be waited by first kernel)
@@ -170,8 +167,8 @@ public:
         auto t_prefill = std::chrono::high_resolution_clock::now();
 
         double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-        std::cout << "[Generate] Prefill: " << prefill_ms << " ms ("
-                  << input_ids.size() / (prefill_ms / 1000.0) << " tok/s)" << std::endl;
+        AILA_LOG_INFO("[Generate] Prefill: %.2f ms (%.1f tok/s)",
+                      prefill_ms, input_ids.size() / (prefill_ms / 1000.0));
 
         ctx_->free_device(token_ids_device);
 
@@ -253,7 +250,7 @@ public:
                 for (int i = chunk_begin; i < generated_count; ++i) {
                     int token_id = host_tokens[i];
                     if (tokenizer_.is_eos(token_id)) {
-                        generated_count = i; // EOS token itself is not counted
+                        generated_count = i;
                         eos_reached = true;
                         break;
                     }
@@ -305,10 +302,9 @@ public:
         auto t_decode_end = std::chrono::high_resolution_clock::now();
         double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
 
-        std::cout << "\n[Generate] Decoded " << generated_count << " tokens in "
-                  << decode_ms << " ms ("
-                  << (generated_count > 0 ? generated_count / (decode_ms / 1000.0) : 0)
-                  << " tok/s)" << std::endl;
+        AILA_LOG_INFO("[Generate] Decoded %d tokens in %.2f ms (%.1f tok/s)",
+                      generated_count, decode_ms,
+                      (generated_count > 0 ? generated_count / (decode_ms / 1000.0) : 0.0));
 
         if (!streaming && !generated_token_ids.empty()) {
             output_text = tokenizer_.decode(generated_token_ids);

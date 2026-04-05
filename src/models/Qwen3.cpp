@@ -1,5 +1,5 @@
 #include "Qwen3.hpp"
-#include <iostream>
+#include "profile/Profiling.hpp"
 #include <string>
 #include <cassert>
 #include <cmath>
@@ -37,7 +37,7 @@ void Qwen3Model::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.ffn_out  = Tensor::allocate(ctx, {(int64_t)new_cap, H});
 
     runtime_seq_capacity_ = new_cap;
-    std::cout << "[Qwen3] Runtime buffers resized: seq_cap=" << runtime_seq_capacity_ << std::endl;
+    AILA_LOG_INFO("[Qwen3] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);
 }
 
 void Qwen3Model::ensure_prefill_scores(Context& ctx, int seq_len) {
@@ -49,7 +49,7 @@ void Qwen3Model::ensure_prefill_scores(Context& ctx, int seq_len) {
         dnnl::memory::data_type::f32);
 
     prefill_scores_capacity_ = new_cap;
-    std::cout << "[Qwen3] Prefill score buffer resized: seq_cap=" << prefill_scores_capacity_ << std::endl;
+    AILA_LOG_INFO("[Qwen3] Prefill score buffer resized: seq_cap=%d", prefill_scores_capacity_);
 }
 
 // ============================================================
@@ -143,7 +143,7 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
 
     // --- Embedding ---
     embed_weight_ = &weights.get("model.embed_tokens.weight");
-    std::cout << "[Qwen3] embed_tokens loaded" << std::endl;
+    AILA_LOG_INFO("[Qwen3] embed_tokens loaded");
 
     // --- Layers ---
     layers_.resize(config.num_hidden_layers);
@@ -181,7 +181,7 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
         Tensor* dw = transpose_weight(prefix + "mlp.down_proj.weight");
         layer.down_proj.init(ctx, *dw, FF, H, true);
     }
-    std::cout << "[Qwen3] " << config.num_hidden_layers << " transformer layers loaded" << std::endl;
+    AILA_LOG_INFO("[Qwen3] %d transformer layers loaded", config.num_hidden_layers);
 
     // --- Final norm ---
     final_norm_weight_ = &weights.get("model.norm.weight");
@@ -190,7 +190,7 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
     if (weights.has("lm_head.weight")) {
         Tensor* lw = transpose_weight("lm_head.weight");
         lm_head_.init(ctx, *lw, H, config.vocab_size, true);
-        std::cout << "[Qwen3] lm_head loaded (standalone)" << std::endl;
+        AILA_LOG_INFO("[Qwen3] lm_head loaded (standalone)");
     } else {
         // lm_head shares embed_weight_, but it is [vocab, hidden]
         // Actually, in Qwen, lm_head is typically tied with embed,
@@ -201,7 +201,7 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
         ops::transpose(ctx, src, dst);
         weights.put("lm_head.weight_preprocessed", std::move(dst));
         lm_head_.init(ctx, weights.get("lm_head.weight_preprocessed"), H, config.vocab_size, true);
-        std::cout << "[Qwen3] lm_head (tied, preprocessed copy)" << std::endl;
+        AILA_LOG_INFO("[Qwen3] lm_head (tied, preprocessed copy)");
     }
 
     // --- KV Cache ---
@@ -230,7 +230,7 @@ void Qwen3Model::load(Context& ctx, ModelWeights& weights, const Qwen3Config& co
                        rope_freq_host.size() * sizeof(float));
     }
 
-    std::cout << "[Qwen3] Model fully loaded and initialized" << std::endl;
+    AILA_LOG_INFO("[Qwen3] Model fully loaded and initialized");
 }
 
 // ============================================================

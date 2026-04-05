@@ -1,26 +1,9 @@
 #include "Device.hpp"
-#include <cstdlib>
-#include <iostream>
+#include "Profiling.hpp"
+#include "utils/EnvUtils.hpp"
 #include <string>
 
 namespace {
-
-int read_env_int(const char* name, int default_value) {
-#ifdef _WIN32
-    char* value = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&value, &len, name) == 0 && value) {
-        int parsed = std::atoi(value);
-        free(value);
-        return parsed;
-    }
-    if (value) free(value);
-    return default_value;
-#else
-    const char* value = std::getenv(name);
-    return value ? std::atoi(value) : default_value;
-#endif
-}
 
 const char* matrix_type_name(sycl::ext::oneapi::experimental::matrix::matrix_type t) {
     using matrix_type = sycl::ext::oneapi::experimental::matrix::matrix_type;
@@ -48,30 +31,28 @@ int CheckDevice()
 {
     sycl::queue q(sycl::default_selector_v);
     auto dev = q.get_device();
-    std::cout << "[Context] Device: " << dev.get_info<sycl::info::device::name>() << std::endl;
-        std::cout << "[Context] Global memory: "
-                  << dev.get_info<sycl::info::device::global_mem_size>() / (1024*1024)
-                  << " MB" << std::endl;
+    AILA_LOG_INFO("[Context] Device: %s",
+                  dev.get_info<sycl::info::device::name>().c_str());
+    AILA_LOG_INFO("[Context] Global memory: %llu MB",
+                  (unsigned long long)(dev.get_info<sycl::info::device::global_mem_size>() / (1024*1024)));
 
-    if (read_env_int("AILA_PRINT_MATRIX_COMBOS", 0) != 0) {
+    if (aila::env::read_int_raw("AILA_PRINT_MATRIX_COMBOS", 0) != 0) {
         using sycl::ext::oneapi::experimental::info::device::matrix_combinations;
         auto combos = dev.get_info<matrix_combinations>();
-        std::cout << "[Context] matrix_combinations=" << combos.size() << std::endl;
+        AILA_LOG_INFO("[Context] matrix_combinations=%zu", combos.size());
 
         int shown = 0;
         const int show_max = 64;
         for (const auto& c : combos) {
-            std::cout << "  [JM] m=" << c.msize
-                      << " n=" << c.nsize
-                      << " k=" << c.ksize
-                      << " A=" << matrix_type_name(c.atype)
-                      << " B=" << matrix_type_name(c.btype)
-                      << " C=" << matrix_type_name(c.ctype)
-                      << " D=" << matrix_type_name(c.dtype)
-                      << std::endl;
+            AILA_LOG_INFO("  [JM] m=%zu n=%zu k=%zu A=%s B=%s C=%s D=%s",
+                          c.msize, c.nsize, c.ksize,
+                          matrix_type_name(c.atype),
+                          matrix_type_name(c.btype),
+                          matrix_type_name(c.ctype),
+                          matrix_type_name(c.dtype));
             shown++;
             if (shown >= show_max) {
-                std::cout << "  [JM] ... truncated at " << show_max << " entries" << std::endl;
+                AILA_LOG_INFO("  [JM] ... truncated at %d entries", show_max);
                 break;
             }
         }

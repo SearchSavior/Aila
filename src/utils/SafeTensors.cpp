@@ -1,5 +1,5 @@
 #include "SafeTensors.hpp"
-#include <iostream>
+#include "profile/Profiling.hpp"
 #include <stdexcept>
 #include <algorithm>
 
@@ -116,7 +116,7 @@ std::vector<std::string> ParseHeader(const std::string& header,
                 meta.dtype = DT_S8;
             } else {
                 meta.dtype = DT_UNKNOWN;
-                std::cerr << "[Warning] Unknown dtype: " << dtype << std::endl;
+                AILA_LOG_WARN("Unknown dtype: %.*s", (int)dtype.size(), dtype.data());
             }
 
             for (int64_t dim : tensor_info["shape"].get_array()) {
@@ -134,7 +134,7 @@ std::vector<std::string> ParseHeader(const std::string& header,
             layer_names.push_back(layer_name);
         }
     } catch (const std::exception& e) {
-        std::cerr << "[ParseHeader] Failed: " << e.what() << std::endl;
+        AILA_LOG_ERROR("[ParseHeader] Failed: %s", e.what());
     }
     return layer_names;
 }
@@ -174,13 +174,13 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
         // 解析 header
         uint64_t header_size = *reinterpret_cast<const uint64_t*>(raw_ptr);
         std::string json_str(reinterpret_cast<const char*>(raw_ptr + 8), header_size);
-        std::cout << "[SafeTensors] Header size: " << header_size << " bytes" << std::endl;
+        AILA_LOG_INFO("[SafeTensors] Header size: %llu bytes", (unsigned long long)header_size);
 
         const uint8_t* tensor_data_start = raw_ptr + 8 + header_size;
 
         std::unordered_map<std::string, TensorMeta> metadata;
         auto layer_names = ParseHeader(json_str, metadata);
-        std::cout << "[SafeTensors] Found " << layer_names.size() << " tensors" << std::endl;
+        AILA_LOG_INFO("[SafeTensors] Found %zu tensors", layer_names.size());
 
         // 加载所有 tensor 到 GPU
         size_t total_bytes = 0;
@@ -196,18 +196,17 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
                 weights.put(name, std::move(t));
                 success++;
             } catch (const std::exception& e) {
-                std::cerr << "  [FAIL] " << name << ": " << e.what() << std::endl;
+                AILA_LOG_ERROR("  [FAIL] %s: %s", name.c_str(), e.what());
                 fail++;
             }
         }
 
-        std::cout << "[SafeTensors] Loaded " << success << " tensors ("
-                  << total_bytes / (1024.0 * 1024.0) << " MB) to GPU"
-                  << (fail > 0 ? ", " + std::to_string(fail) + " failed" : "")
-                  << std::endl;
+        AILA_LOG_INFO("[SafeTensors] Loaded %d tensors (%.2f MB) to GPU%s",
+                      success, total_bytes / (1024.0 * 1024.0),
+                      (fail > 0 ? (" , " + std::to_string(fail) + " failed").c_str() : ""));
 
     } catch (const std::exception& e) {
-        std::cerr << "[SafeTensors] Load failed: " << e.what() << std::endl;
+        AILA_LOG_ERROR("[SafeTensors] Load failed: %s", e.what());
         throw;
     }
 

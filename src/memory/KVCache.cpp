@@ -1,5 +1,5 @@
 #include "KVCache.hpp"
-#include <iostream>
+#include "profile/Profiling.hpp"
 
 void KVCache::init(Context& ctx, const Qwen3Config& config, int max_seq_len) {
     max_len_ = max_seq_len;
@@ -19,7 +19,6 @@ void KVCache::init(Context& ctx, const Qwen3Config& config, int max_seq_len) {
         total_bytes += 2 * per_tensor_bytes;
     }
 
-    std::cout << "[KVCache] Allocated " << config.num_hidden_layers << " layers, "
-              << "max_seq=" << max_seq_len << ", "
-              << total_bytes / (1024.0 * 1024.0) << " MB" << std::endl;
+    AILA_LOG_INFO("[KVCache] Allocated %d layers, max_seq=%d, %.2f MB",
+                  config.num_hidden_layers, max_seq_len, total_bytes / (1024.0 * 1024.0));
 }

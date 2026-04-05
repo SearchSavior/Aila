@@ -1,8 +1,9 @@
 #include "Ops.hpp"
+#include "utils/EnvUtils.hpp"
+#include "profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
 #include <cmath>
 #include <cstdlib>
-#include <iostream>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 using namespace sycl::ext::oneapi::experimental::matrix;
@@ -15,21 +16,8 @@ inline int round_up(int x, int align) {
     return ((x + align - 1) / align) * align;
 }
 
-int read_env_int(const char* name, int default_value) {
-#ifdef _WIN32
-    char* value = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&value, &len, name) == 0 && value) {
-        int parsed = std::atoi(value);
-        free(value);
-        return parsed;
-    }
-    if (value) free(value);
-    return default_value;
-#else
-    const char* value = std::getenv(name);
-    return value ? std::atoi(value) : default_value;
-#endif
+int read_env_int_local(const char* name, int default_value) {
+    return aila::env::read_int_raw(name, default_value);
 }
 
 bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
@@ -308,10 +296,10 @@ void attention_decode(Context& ctx,
     static int decode_wg = -1;
     static bool jm_log_once = false;
     if (jm_mode < 0) {
-        jm_mode = read_env_int("AILA_ATTN_JM", 1);
+        jm_mode = read_env_int_local("AILA_ATTN_JM", 1);
     }
     if (decode_wg < 0) {
-        decode_wg = read_env_int("AILA_ATTN_DECODE_WG", 256);
+        decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 256);
         if (decode_wg <= 0) decode_wg = 256;
     }
     if (jm_supported < 0) {
@@ -320,7 +308,7 @@ void attention_decode(Context& ctx,
         bool s2 = supports_jm_bf16_f32(ctx.queue().get_device(), JM2_M, JM2_N, JM2_K);
         jm_supported = (s0 || s1 || s2) ? 1 : 0;
 
-        int force_tile = read_env_int("AILA_ATTN_JM_TILE", -1);
+        int force_tile = read_env_int_local("AILA_ATTN_JM_TILE", -1);
         if (force_tile == 2 && s2) {
             jm_tile_id = 2;
         } else if (force_tile == 1 && s1) {
@@ -341,11 +329,9 @@ void attention_decode(Context& ctx,
 
     bool allow_jm = (jm_mode == 2) || (jm_mode == 1 && jm_supported == 1 && jm_tile_id >= 0);
     if (!jm_log_once && jm_mode > 0) {
-        std::cout << "[JM] mode=" << jm_mode
-                  << ", supported=" << jm_supported
-                  << ", tile_id=" << jm_tile_id
-                  << (allow_jm ? " -> enabled" : " -> fallback baseline")
-                  << std::endl;
+        AILA_LOG_INFO("[JM] mode=%d, supported=%d, tile_id=%d %s",
+                      jm_mode, jm_supported, jm_tile_id,
+                      (allow_jm ? "-> enabled" : "-> fallback baseline"));
         jm_log_once = true;
     }
     if (allow_jm && head_dim == 128 && cached_len > 0) {

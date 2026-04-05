@@ -2,7 +2,7 @@
 #include "simdjson.h"
 #include <fstream>
 #include <sstream>
-#include <iostream>
+#include "profile/Profiling.hpp"
 #include <algorithm>
 #include <regex>
 #include <cassert>
@@ -67,7 +67,7 @@ bool Tokenizer::load(const std::string& model_dir) {
     try {
         std::ifstream vf(vocab_path, std::ios::binary);
         if (!vf.is_open()) {
-            std::cerr << "[Tokenizer] Cannot open " << vocab_path << std::endl;
+            AILA_LOG_ERROR("[Tokenizer] Cannot open %s", vocab_path.c_str());
             return false;
         }
         std::string vocab_str((std::istreambuf_iterator<char>(vf)),
@@ -101,11 +101,11 @@ bool Tokenizer::load(const std::string& model_dir) {
             }
         }
 
-        std::cout << "[Tokenizer] Loaded vocab: " << token_to_id_.size()
-                  << " tokens (max_id=" << max_id << ")" << std::endl;
+        AILA_LOG_INFO("[Tokenizer] Loaded vocab: %zu tokens (max_id=%d)",
+                      token_to_id_.size(), max_id);
 
     } catch (const std::exception& e) {
-        std::cerr << "[Tokenizer] Failed to load vocab: " << e.what() << std::endl;
+        AILA_LOG_ERROR("[Tokenizer] Failed to load vocab: %s", e.what());
         return false;
     }
 
@@ -113,7 +113,7 @@ bool Tokenizer::load(const std::string& model_dir) {
     try {
         std::ifstream mf(merges_path);
         if (!mf.is_open()) {
-            std::cerr << "[Tokenizer] Cannot open " << merges_path << std::endl;
+            AILA_LOG_ERROR("[Tokenizer] Cannot open %s", merges_path.c_str());
             return false;
         }
 
@@ -135,10 +135,10 @@ bool Tokenizer::load(const std::string& model_dir) {
         }
         mf.close();
 
-        std::cout << "[Tokenizer] Loaded " << merges_.size() << " merge rules" << std::endl;
+        AILA_LOG_INFO("[Tokenizer] Loaded %zu merge rules", merges_.size());
 
     } catch (const std::exception& e) {
-        std::cerr << "[Tokenizer] Failed to load merges: " << e.what() << std::endl;
+        AILA_LOG_ERROR("[Tokenizer] Failed to load merges: %s", e.what());
         return false;
     }
 
@@ -170,12 +170,11 @@ bool Tokenizer::load(const std::string& model_dir) {
                 special_tokens_[tok_str] = static_cast<int>(id);
             }
 
-            std::cout << "[Tokenizer] Loaded " << special_tokens_.size()
-                      << " special tokens from tokenizer.json" << std::endl;
+            AILA_LOG_INFO("[Tokenizer] Loaded %zu special tokens from tokenizer.json",
+                          special_tokens_.size());
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Tokenizer] Warning: could not load tokenizer.json: "
-                  << e.what() << std::endl;
+        AILA_LOG_WARN("[Tokenizer] Could not load tokenizer.json: %s", e.what());
     }
 
     // Set key special token IDs
@@ -189,9 +188,8 @@ bool Tokenizer::load(const std::string& model_dir) {
     eot_id_ = find_special("<|endoftext|>");
     eos_id_ = im_end_id_;
 
-    std::cout << "[Tokenizer] Special tokens: im_start=" << im_start_id_
-              << " im_end=" << im_end_id_ << " eot=" << eot_id_
-              << " total_special=" << special_tokens_.size() << std::endl;
+    AILA_LOG_INFO("[Tokenizer] Special tokens: im_start=%d im_end=%d eot=%d total_special=%zu",
+                  im_start_id_, im_end_id_, eot_id_, special_tokens_.size());
 
     return true;
 }
