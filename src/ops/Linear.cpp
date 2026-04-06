@@ -83,27 +83,32 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
             decode_src_ptr_ = input.data();
             decode_weight_ptr_ = weight_->data();
             decode_dst_ptr_ = output.data();
+            // Pre-build args map once
+            decode_args_ = {
+                {DNNL_ARG_SRC, decode_src_mem_},
+                {DNNL_ARG_WEIGHTS, decode_weight_mem_},
+                {DNNL_ARG_DST, decode_dst_mem_}
+            };
             decode_mem_inited_ = true;
         } else {
             if (decode_src_ptr_ != input.data()) {
                 decode_src_mem_.set_data_handle(input.data());
                 decode_src_ptr_ = input.data();
+                decode_args_[DNNL_ARG_SRC] = decode_src_mem_;
             }
             if (decode_weight_ptr_ != weight_->data()) {
                 decode_weight_mem_.set_data_handle(weight_->data());
                 decode_weight_ptr_ = weight_->data();
+                decode_args_[DNNL_ARG_WEIGHTS] = decode_weight_mem_;
             }
             if (decode_dst_ptr_ != output.data()) {
                 decode_dst_mem_.set_data_handle(output.data());
                 decode_dst_ptr_ = output.data();
+                decode_args_[DNNL_ARG_DST] = decode_dst_mem_;
             }
         }
 
-        decode_prim_.execute(ctx.stream(), {
-            {DNNL_ARG_SRC, decode_src_mem_},
-            {DNNL_ARG_WEIGHTS, decode_weight_mem_},
-            {DNNL_ARG_DST, decode_dst_mem_}
-        });
+        decode_prim_.execute(ctx.stream(), decode_args_);
     } else {
         auto& cp = prim_cache_[seq_len];
         if (!cp.mem_inited) {
@@ -116,26 +121,31 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
             cp.src_ptr = input.data();
             cp.weight_ptr = weight_->data();
             cp.dst_ptr = output.data();
+            cp.args = {
+                {DNNL_ARG_SRC, cp.src_mem},
+                {DNNL_ARG_WEIGHTS, cp.weight_mem},
+                {DNNL_ARG_DST, cp.dst_mem}
+            };
             cp.mem_inited = true;
         } else {
             if (cp.src_ptr != input.data()) {
                 cp.src_mem.set_data_handle(input.data());
                 cp.src_ptr = input.data();
+                cp.args[DNNL_ARG_SRC] = cp.src_mem;
             }
             if (cp.weight_ptr != weight_->data()) {
                 cp.weight_mem.set_data_handle(weight_->data());
                 cp.weight_ptr = weight_->data();
+                cp.args[DNNL_ARG_WEIGHTS] = cp.weight_mem;
             }
             if (cp.dst_ptr != output.data()) {
                 cp.dst_mem.set_data_handle(output.data());
                 cp.dst_ptr = output.data();
+                cp.args[DNNL_ARG_DST] = cp.dst_mem;
             }
         }
 
-        cp.prim.execute(ctx.stream(), {
-            {DNNL_ARG_SRC, cp.src_mem},
-            {DNNL_ARG_WEIGHTS, cp.weight_mem},
-            {DNNL_ARG_DST, cp.dst_mem}
-        });
+        cp.prim.execute(ctx.stream(), cp.args);
     }
 }
+

@@ -210,6 +210,29 @@ void swiglu(Context& ctx, Tensor& gate, Tensor& up, Tensor& output, int n) {
         });
 }
 
+void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_dim) {
+    using vec8 = sycl::vec<bf16, 8>;
+    bf16* src_ptr = static_cast<bf16*>(gate_up.data());
+    vec8* o_ptr = reinterpret_cast<vec8*>(output.data());
+
+    int n8 = ff_dim / 8;
+
+    ctx.queue().parallel_for(sycl::range<1>(n8),
+        [=](sycl::id<1> i) {
+            int base = static_cast<int>(i) * 8;
+            // Gate is in first half, Up is in second half
+            vec8 o_vec;
+            for (int k = 0; k < 8; ++k) {
+                float g = static_cast<float>(src_ptr[base + k]);
+                float u = static_cast<float>(src_ptr[ff_dim + base + k]);
+                float silu_g = g / (1.0f + sycl::native::exp(-g));
+                o_vec[k] = bf16(silu_g * u);
+            }
+            o_ptr[i] = o_vec;
+        });
+}
+
+
 // ============================================================
 // SYCL Kernel: Residual Add (a += b, in-place)
 // ============================================================

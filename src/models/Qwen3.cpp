@@ -375,12 +375,9 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
                                 buf_.normed, seq_len, H);
 
         if (seq_len == 1) {
-            // Decode path: fused gate/up projection
+            // Decode path: fused gate/up projection + fused SwiGLU
             layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
-            bf16* gate_up_ptr = static_cast<bf16*>(buf_.gate_up.data());
-            Tensor gate_view = Tensor::view(ctx, gate_up_ptr, {1, (int64_t)FF});
-            Tensor up_view = Tensor::view(ctx, gate_up_ptr + FF, {1, (int64_t)FF});
-            ops::swiglu(ctx, gate_view, up_view, buf_.gate, seq_len * FF);
+            ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, FF);
         } else {
             // Prefill path
             layer.gate_proj.forward(ctx, buf_.normed, buf_.gate, seq_len);

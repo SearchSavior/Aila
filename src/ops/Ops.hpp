@@ -46,6 +46,9 @@ private:
     void* decode_weight_ptr_ = nullptr;
     void* decode_dst_ptr_ = nullptr;
 
+    // 预缓存 decode args map，避免热循环中每次重构
+    std::unordered_map<int, dnnl::memory> decode_args_;
+
     void ensure_primitive(Context& ctx, int seq_len);
 
     // 运行时 primitive 缓存 (非 decode 模式)
@@ -63,6 +66,9 @@ private:
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
         void* dst_ptr = nullptr;
+
+        // 预缓存 args map
+        std::unordered_map<int, dnnl::memory> args;
     };
     std::unordered_map<int, CachedPrimitive> prim_cache_;
 };
@@ -162,6 +168,13 @@ namespace ops {
     // gate, up, output: [n] (element-wise)
     void swiglu(Context& ctx, Tensor& gate, Tensor& up,
                 Tensor& output, int n);
+
+    // Fused SwiGLU on concatenated [gate|up] tensor (decode optimization)
+    // gate_up: [2 * ff_dim], output: [ff_dim]
+    // Reads first half as gate, second half as up, computes silu(gate)*up
+    void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up,
+                               Tensor& output, int ff_dim);
+
 
     // 残差连接: a += b (in-place)
     void residual_add(Context& ctx, Tensor& a, Tensor& b, int n);
