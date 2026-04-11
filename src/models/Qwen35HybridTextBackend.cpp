@@ -148,7 +148,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_z_dim_ = linear_kv_dim_;
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
-    use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", false);
+    use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -346,6 +346,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     prefill_scores_capacity_ = 0;
     incr_prefill_seq_cap_ = 0;
     incr_prefill_total_cap_ = 0;
+    clear_embedding_overrides();
     ensure_runtime_buffers(ctx, 1);
 
     buf_.logits = Tensor::allocate(ctx, {1, (int64_t)cfg_.vocab_size});
@@ -355,9 +356,37 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
 
     AILA_LOG_INFO("[Qwen3.5] Hybrid text backend loaded: layers=%d hidden=%d vocab=%d",
                   cfg_.num_hidden_layers, hidden_size_, cfg_.vocab_size);
-    AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=1 to enable DeltaNet host path)",
+    AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback)",
                   use_delta_linear_ ? "delta-host" : "legacy-attn");
     return true;
+}
+
+void Qwen35HybridTextBackend::set_embedding_overrides(
+    const std::vector<int>& positions,
+    const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
+    int hidden_size) {
+    if (positions.empty() || embeddings.empty()) {
+        clear_embedding_overrides();
+        return;
+    }
+    if (hidden_size <= 0) {
+        clear_embedding_overrides();
+        return;
+    }
+    if (embeddings.size() != static_cast<size_t>(positions.size()) * static_cast<size_t>(hidden_size)) {
+        clear_embedding_overrides();
+        return;
+    }
+
+    embed_override_positions_ = positions;
+    embed_override_values_ = embeddings;
+    embed_override_hidden_size_ = hidden_size;
+}
+
+void Qwen35HybridTextBackend::clear_embedding_overrides() {
+    embed_override_positions_.clear();
+    embed_override_values_.clear();
+    embed_override_hidden_size_ = 0;
 }
 
 void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache, int seq_len) {
@@ -519,6 +548,17 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     }
 
     ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, hidden_size_);
+    if (!embed_override_positions_.empty() && embed_override_hidden_size_ == hidden_size_) {
+        bf16* hidden_ptr = static_cast<bf16*>(buf_.hidden.data());
+        for (size_t i = 0; i < embed_override_positions_.size(); ++i) {
+            int pos = embed_override_positions_[i];
+            if (pos < start_pos || pos >= start_pos + seq_len) continue;
+            int local_row = pos - start_pos;
+            const bf16* src = embed_override_values_.data() + i * static_cast<size_t>(hidden_size_);
+            bf16* dst = hidden_ptr + static_cast<size_t>(local_row) * static_cast<size_t>(hidden_size_);
+            ctx.queue().memcpy(dst, src, static_cast<size_t>(hidden_size_) * sizeof(bf16));
+        }
+    }
     ops::rms_norm(ctx, buf_.hidden, *layers_[0].input_ln_weight, cfg_.rms_norm_eps,
                   buf_.normed, seq_len, hidden_size_);
 

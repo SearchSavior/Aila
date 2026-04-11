@@ -14,14 +14,14 @@ A high-performance LLM inference engine built with **SYCL + oneDNN**, designed t
 
 Currently supports:
 - **Qwen3 BF16 family** (0.6B / 4B)
-- **Qwen3.5-0.8B hybrid text backend (phase-1)**
+- **Qwen3.5-0.8B hybrid backend**
 
 Model architecture parameters are loaded from each model's `config.json` at runtime.
 Model weights are auto-detected from either:
 - `model.safetensors` (single file), or
 - `model.safetensors.index.json` + `model-xxxxx-of-xxxxx.safetensors` shards.
 
-For Qwen3.5-0.8B, text generation is enabled in phase-1. The linear-attention text path includes `in_proj_a/b`, depthwise `conv1d`, and recurrent state update logic (DeltaNet-style decode path). Vision/image inputs are parsed via message content parts but currently return a clear "vision backend not enabled" error until phase-2 vision kernels are enabled.
+For Qwen3.5-0.8B, the hybrid text path is enabled, including `in_proj_a/b`, depthwise `conv1d`, and recurrent state update logic (DeltaNet-style decode path). OpenAI-style message inputs can also carry image parts, which are encoded into vision embeddings and injected into the language prompt. The image path is still an experimental V1 implementation: single-image understanding works for smoke tests, while small-object counting and spatial reasoning still need more alignment work.
 
 ## Verified Devices
 
@@ -150,7 +150,7 @@ Aila exposes a stable C ABI through `aila_api.h`, suitable for any language with
 
 `aila_generate_messages` returns `NULL` on parse/template/runtime errors. Use
 `aila_last_error_code()` + `aila_last_error_message()` to inspect failures
-(including explicit vision-disabled errors for image/video content in text-only mode).
+(including explicit video-not-enabled errors and image encode/runtime failures).
 
 ```c
 #include "aila_api.h"

@@ -4,6 +4,7 @@
 #include "../src/models/IModelBackend.hpp"
 #include "../src/models/Qwen3DenseBackend.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
+#include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/utils/Tokenizer.hpp"
 #include "../src/utils/ModelConfig.hpp"
 #include "../src/utils/ModelSpec.hpp"
@@ -79,7 +80,17 @@ public:
                 config_.tie_word_embeddings = model_spec_.qwen35_text.tie_word_embeddings;
                 config_.eos_token_id = model_spec_.qwen35_text.eos_token_id;
                 if (model_spec_.vision.enabled) {
-                    AILA_LOG_INFO("[ModelSpec] vision encoder found (phase-1 text backend keeps vision disabled)");
+                    AILA_LOG_INFO("[ModelSpec] vision encoder found");
+                }
+
+                // Qwen3.5-0.8B is a VL-capable model. In text-only phase, a stronger
+                // default system prompt avoids drifting to image-assumption replies.
+                if (!model_spec_.vision.enabled && system_prompt_ == "You are a helpful assistant.") {
+                    system_prompt_ =
+                        "You are a helpful text assistant. "
+                        "Reply in the user's language when possible. "
+                        "Do not assume images or videos unless explicitly provided.";
+                    AILA_LOG_INFO("[Config] Applied Qwen3.5 text-only default system prompt");
                 }
             } else {
                 config_ = model_spec_.qwen3;
@@ -105,6 +116,23 @@ public:
         if (!backend_->load(*ctx_, *weights_, model_spec_, max_seq_len, &backend_error)) {
             AILA_LOG_ERROR("Failed to initialize model backend: %s", backend_error.c_str());
             return false;
+        }
+
+        vision_backend_enabled_ = false;
+        vision_encoder_.reset();
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid && model_spec_.vision.enabled) {
+            vision_encoder_ = std::make_unique<aila::vision::Qwen35VisionEncoder>();
+            std::string vision_error;
+            if (vision_encoder_->load(*ctx_, *weights_, model_spec_, model_dir_, &vision_error)) {
+                vision_backend_enabled_ = true;
+                AILA_LOG_INFO("[Vision] Qwen3.5 vision encoder loaded (out_hidden=%d)",
+                              vision_encoder_->out_hidden_size());
+            } else {
+                AILA_LOG_WARN("[Vision] Vision encoder init failed, falling back to text-only: %s",
+                              vision_error.c_str());
+                vision_encoder_.reset();
+                vision_backend_enabled_ = false;
+            }
         }
 
         auto to_mb = [](size_t bytes) -> double {
@@ -192,18 +220,97 @@ public:
                          std::function<void(const std::string&)> token_callback = nullptr) {
         clear_error();
         if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+            auto rtrim_inplace = [](std::string& s) {
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+                    s.pop_back();
+                }
+            };
+            auto strip_no_think_suffix = [&](std::string& s) -> bool {
+                const std::string cmd = "/no_think";
+                rtrim_inplace(s);
+                if (s.size() < cmd.size()) return false;
+                size_t pos = s.size() - cmd.size();
+                if (s.compare(pos, cmd.size(), cmd) != 0) return false;
+                bool boundary_ok = (pos == 0) ||
+                                   std::isspace(static_cast<unsigned char>(s[pos - 1]));
+                if (!boundary_ok) return false;
+                s.erase(pos);
+                rtrim_inplace(s);
+                return true;
+            };
+            auto strip_think_blocks = [](std::string& text) {
+                while (true) {
+                    size_t start = text.find("<think>");
+                    if (start == std::string::npos) break;
+                    size_t end = text.find("</think>", start);
+                    if (end == std::string::npos) {
+                        text.erase(start);
+                        break;
+                    }
+                    text.erase(start, end + 8 - start);
+                }
+                size_t i = 0;
+                while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+                if (i > 0) text.erase(0, i);
+                while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+                    text.pop_back();
+                }
+            };
+            auto drop_oldest_mm_pair = [&]() -> bool {
+                int first_user = -1;
+                for (int i = 0; i < static_cast<int>(mm_history_.size()); ++i) {
+                    if (mm_history_[(size_t)i].role == "user") {
+                        first_user = i;
+                        break;
+                    }
+                }
+                if (first_user < 0) return false;
+                int erase_count = 1;
+                if (first_user + 1 < static_cast<int>(mm_history_.size()) &&
+                    mm_history_[(size_t)(first_user + 1)].role == "assistant") {
+                    erase_count = 2;
+                }
+                mm_history_.erase(mm_history_.begin() + first_user,
+                                  mm_history_.begin() + first_user + erase_count);
+                return true;
+            };
+
+            if ((mm_history_.empty() || mm_history_[0].role != "system") && !system_prompt_.empty()) {
+                Message sys_msg;
+                sys_msg.role = "system";
+                sys_msg.content.push_back(ContentPart{ContentType::Text, system_prompt_, ""});
+                mm_history_.insert(mm_history_.begin(), std::move(sys_msg));
+            }
+
+            std::string cleaned_user_message = user_message;
+            strip_no_think_suffix(cleaned_user_message);
             Message user_msg;
             user_msg.role = "user";
-            user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
+            user_msg.content.push_back(ContentPart{ContentType::Text, cleaned_user_message, ""});
             mm_history_.push_back(user_msg);
+
             std::string out = generate_messages(mm_history_, gen_config, token_callback);
+            while (last_error_code_ == EngineErrorCode::ContextOverflow) {
+                if (!drop_oldest_mm_pair()) {
+                    break;
+                }
+                AILA_LOG_WARN("[Generate] Qwen3.5 history truncated to fit context window (%zu messages remaining)",
+                              mm_history_.size());
+                out = generate_messages(mm_history_, gen_config, token_callback);
+            }
+
             if (last_error_code_ != EngineErrorCode::Ok) {
-                mm_history_.pop_back();
+                if (!mm_history_.empty() && mm_history_.back().role == "user") {
+                    mm_history_.pop_back();
+                }
                 return "";
             }
+
+            std::string history_text = out;
+            strip_think_blocks(history_text);
             Message assistant_msg;
             assistant_msg.role = "assistant";
-            assistant_msg.content.push_back(ContentPart{ContentType::Text, out, ""});
+            assistant_msg.content.push_back(ContentPart{ContentType::Text, history_text, ""});
             mm_history_.push_back(assistant_msg);
             return out;
         }
@@ -593,6 +700,9 @@ public:
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
         }
+        if (auto* q35_backend = dynamic_cast<Qwen35HybridTextBackend*>(backend_.get())) {
+            q35_backend->clear_embedding_overrides();
+        }
 
         GenerationConfig tuned_cfg = gen_config;
         if (model_spec_.family == ModelFamily::Qwen35Hybrid && tuned_cfg.do_sample) {
@@ -628,8 +738,77 @@ public:
         }
 
         std::string tmpl_err;
+        std::vector<Message> render_messages;
+        render_messages.reserve(messages.size());
+        std::vector<sycl::ext::oneapi::bfloat16> vision_embeddings_flat;
+        size_t total_vision_tokens = 0;
+
+        for (const auto& m : messages) {
+            Message out_msg;
+            out_msg.role = m.role;
+            for (const auto& p : m.content) {
+                if (p.type == ContentType::Text) {
+                    out_msg.content.push_back(p);
+                    continue;
+                }
+                if (p.type == ContentType::Video) {
+                    set_error(EngineErrorCode::TemplateError,
+                              "Video content is not enabled yet in this backend");
+                    return "";
+                }
+                if (p.type == ContentType::Image) {
+                    if (!vision_backend_enabled_ || !vision_encoder_ || !vision_encoder_->ready()) {
+                        set_error(EngineErrorCode::VisionNotEnabled,
+                                  "Vision content is not enabled for this backend");
+                        return "";
+                    }
+
+                    aila::vision::VisionEncodeResult encoded;
+                    std::string vision_err;
+                    if (!vision_encoder_->encode_image(p.uri, encoded, &vision_err)) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Vision encode failed: " + vision_err);
+                        return "";
+                    }
+                    if (encoded.token_count <= 0) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Vision encode produced zero tokens");
+                        return "";
+                    }
+                    if (encoded.embeddings.size() !=
+                        static_cast<size_t>(encoded.token_count) * static_cast<size_t>(config_.hidden_size)) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Vision embedding size mismatch with language hidden size");
+                        return "";
+                    }
+                    AILA_LOG_INFO("[Vision] Encoded image '%s' -> %d tokens",
+                                  p.uri.c_str(), encoded.token_count);
+
+                    ContentPart ph;
+                    ph.type = ContentType::Text;
+                    ph.text.reserve(static_cast<size_t>(encoded.token_count) * 12u + 32u);
+                    ph.text += "<|vision_start|>";
+                    for (int i = 0; i < encoded.token_count; ++i) {
+                        ph.text += "<|image_pad|>";
+                    }
+                    ph.text += "<|vision_end|>";
+                    out_msg.content.push_back(std::move(ph));
+
+                    total_vision_tokens += static_cast<size_t>(encoded.token_count);
+                    vision_embeddings_flat.insert(
+                        vision_embeddings_flat.end(),
+                        encoded.embeddings.begin(),
+                        encoded.embeddings.end());
+                    continue;
+                }
+                set_error(EngineErrorCode::TemplateError, "Unknown content part type");
+                return "";
+            }
+            render_messages.push_back(std::move(out_msg));
+        }
+
         std::vector<int> full_ids;
-        if (!template_registry_.render(model_spec_.family, tokenizer_, messages,
+        if (!template_registry_.render(model_spec_.family, tokenizer_, render_messages,
                                        vision_backend_enabled_, true, full_ids, &tmpl_err)) {
             AILA_LOG_ERROR("[GenerateMessages] Template render failed: %s", tmpl_err.c_str());
             EngineErrorCode code = (tmpl_err.find("Vision content is not enabled") != std::string::npos)
@@ -637,6 +816,42 @@ public:
                                        : EngineErrorCode::TemplateError;
             set_error(code, tmpl_err);
             return "";
+        }
+
+        if (total_vision_tokens > 0) {
+            auto* q35_backend = dynamic_cast<Qwen35HybridTextBackend*>(backend_.get());
+            if (!q35_backend) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "Vision embedding override requires Qwen35 backend");
+                return "";
+            }
+
+            int image_pad_id = model_spec_.vision.image_token_id;
+            if (image_pad_id < 0) {
+                image_pad_id = tokenizer_.special_token_id("<|image_pad|>");
+            }
+            if (image_pad_id < 0) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "Tokenizer/model does not provide image token id");
+                return "";
+            }
+
+            std::vector<int> image_positions;
+            image_positions.reserve(total_vision_tokens);
+            for (int i = 0; i < static_cast<int>(full_ids.size()); ++i) {
+                if (full_ids[static_cast<size_t>(i)] == image_pad_id) {
+                    image_positions.push_back(i);
+                }
+            }
+
+            if (image_positions.size() != total_vision_tokens) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "Mismatch between rendered image tokens and encoded vision tokens");
+                return "";
+            }
+
+            q35_backend->set_embedding_overrides(image_positions, vision_embeddings_flat, config_.hidden_size);
+            AILA_LOG_INFO("[Vision] Injecting %zu image embeddings into prompt", total_vision_tokens);
         }
 
         int max_ctx = backend_->max_seq_len();
@@ -653,8 +868,8 @@ public:
         }
         int available_decode_tokens = max_ctx - total_prompt_len;
         if (available_decode_tokens <= 0) {
-            AILA_LOG_ERROR("[GenerateMessages] Prompt exceeds context window (prompt=%d max_seq=%d)",
-                           total_prompt_len, max_ctx);
+            AILA_LOG_WARN("[GenerateMessages] Prompt exceeds context window (prompt=%d max_seq=%d)",
+                          total_prompt_len, max_ctx);
             set_error(EngineErrorCode::ContextOverflow, "Prompt exceeds context window");
             return "";
         }
@@ -1058,6 +1273,7 @@ private:
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
+    std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
     aila::templating::TemplateRegistry template_registry_;
     Tokenizer tokenizer_;
     bool vision_backend_enabled_ = false;

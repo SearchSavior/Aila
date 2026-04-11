@@ -4,13 +4,146 @@
 #include <sstream>
 #include "profile/Profiling.hpp"
 #include <algorithm>
-#include <regex>
+#include <array>
 #include <cassert>
 #include <cctype>
+#include <cstring>
 
 // ============================================================
 // GPT-2 style byte-to-unicode mapping
 // ============================================================
+
+namespace {
+
+struct Utf8Char {
+    uint32_t cp = 0;
+    size_t bytes = 1;
+};
+
+Utf8Char decode_utf8_char(const std::string& text, size_t offset) {
+    Utf8Char out{};
+    if (offset >= text.size()) {
+        return out;
+    }
+
+    const unsigned char c0 = static_cast<unsigned char>(text[offset]);
+    out.cp = c0;
+    out.bytes = 1;
+
+    if (c0 < 0x80) {
+        return out;
+    }
+
+    auto cont = [&](size_t idx) -> uint32_t {
+        return static_cast<unsigned char>(text[offset + idx]) & 0x3Fu;
+    };
+
+    if ((c0 & 0xE0) == 0xC0 && offset + 1 < text.size()) {
+        out.cp = ((c0 & 0x1Fu) << 6) | cont(1);
+        out.bytes = 2;
+    } else if ((c0 & 0xF0) == 0xE0 && offset + 2 < text.size()) {
+        out.cp = ((c0 & 0x0Fu) << 12) | (cont(1) << 6) | cont(2);
+        out.bytes = 3;
+    } else if ((c0 & 0xF8) == 0xF0 && offset + 3 < text.size()) {
+        out.cp = ((c0 & 0x07u) << 18) | (cont(1) << 12) | (cont(2) << 6) | cont(3);
+        out.bytes = 4;
+    }
+
+    return out;
+}
+
+bool is_newline_cp(uint32_t cp) {
+    return cp == '\n' || cp == '\r';
+}
+
+bool is_whitespace_cp(uint32_t cp) {
+    switch (cp) {
+    case '\t':
+    case '\n':
+    case '\v':
+    case '\f':
+    case '\r':
+    case ' ':
+        return true;
+    default:
+        break;
+    }
+
+    return cp == 0x0085 || cp == 0x00A0 || cp == 0x1680 ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F ||
+           cp == 0x205F || cp == 0x3000;
+}
+
+bool is_mark_cp(uint32_t cp) {
+    return (cp >= 0x0300 && cp <= 0x036F) ||
+           (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+           (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+           (cp >= 0x20D0 && cp <= 0x20FF) ||
+           (cp >= 0xFE20 && cp <= 0xFE2F);
+}
+
+bool is_digit_cp(uint32_t cp) {
+    return (cp >= '0' && cp <= '9') ||
+           (cp >= 0x0660 && cp <= 0x0669) ||
+           (cp >= 0x06F0 && cp <= 0x06F9) ||
+           (cp >= 0x0966 && cp <= 0x096F) ||
+           (cp >= 0xFF10 && cp <= 0xFF19);
+}
+
+bool is_ascii_punct_cp(uint32_t cp) {
+    return cp < 0x80 && std::ispunct(static_cast<unsigned char>(cp)) != 0;
+}
+
+bool is_punctuation_or_symbol_cp(uint32_t cp) {
+    if (is_ascii_punct_cp(cp)) {
+        return true;
+    }
+    return (cp >= 0x2000 && cp <= 0x206F) ||
+           (cp >= 0x20A0 && cp <= 0x214F) ||
+           (cp >= 0x2190 && cp <= 0x27BF) ||
+           (cp >= 0x2E00 && cp <= 0x2E7F) ||
+           (cp >= 0x3000 && cp <= 0x303F) ||
+           (cp >= 0xFE10 && cp <= 0xFE1F) ||
+           (cp >= 0xFE30 && cp <= 0xFE6F) ||
+           (cp >= 0xFF01 && cp <= 0xFF0F) ||
+           (cp >= 0xFF1A && cp <= 0xFF20) ||
+           (cp >= 0xFF3B && cp <= 0xFF40) ||
+           (cp >= 0xFF5B && cp <= 0xFF65) ||
+           (cp >= 0x1F300 && cp <= 0x1FAFF);
+}
+
+bool is_letter_cp(uint32_t cp) {
+    if (cp < 0x80) {
+        return std::isalpha(static_cast<unsigned char>(cp)) != 0;
+    }
+    if (is_whitespace_cp(cp) || is_newline_cp(cp) || is_digit_cp(cp) ||
+        is_mark_cp(cp) || is_punctuation_or_symbol_cp(cp)) {
+        return false;
+    }
+    return cp >= 0x80;
+}
+
+bool is_letter_or_mark_cp(uint32_t cp) {
+    return is_letter_cp(cp) || is_mark_cp(cp);
+}
+
+bool is_ascii_case_insensitive_match(const std::string& text,
+                                     size_t offset,
+                                     const char* literal) {
+    for (size_t i = 0; literal[i] != '\0'; ++i) {
+        if (offset + i >= text.size()) {
+            return false;
+        }
+        unsigned char a = static_cast<unsigned char>(text[offset + i]);
+        unsigned char b = static_cast<unsigned char>(literal[i]);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 std::unordered_map<uint8_t, std::string> Tokenizer::byte_to_unicode() {
     std::unordered_map<uint8_t, std::string> b2u;
@@ -177,6 +310,17 @@ bool Tokenizer::load(const std::string& model_dir) {
         AILA_LOG_WARN("[Tokenizer] Could not load tokenizer.json: %s", e.what());
     }
 
+    special_token_order_.clear();
+    special_token_order_.reserve(special_tokens_.size());
+    for (const auto& [token, _] : special_tokens_) {
+        special_token_order_.push_back(token);
+    }
+    std::sort(special_token_order_.begin(), special_token_order_.end(),
+              [](const std::string& a, const std::string& b) {
+                  if (a.size() != b.size()) return a.size() > b.size();
+                  return a < b;
+              });
+
     // Set key special token IDs
     auto find_special = [&](const std::string& token) -> int {
         auto it = special_tokens_.find(token);
@@ -203,50 +347,185 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
     std::vector<std::string> result;
     if (text.empty()) return result;
 
-    std::string remaining = text;
-    while (!remaining.empty()) {
-        // Check for special tokens first
-        bool found_special = false;
-        for (auto& sp : special_tokens_) {
-            if (remaining.size() >= sp.first.size() &&
-                remaining.substr(0, sp.first.size()) == sp.first) {
-                result.push_back(sp.first);
-                remaining = remaining.substr(sp.first.size());
-                found_special = true;
-                break;
+    auto try_match_special = [&](size_t offset, std::string& matched) -> bool {
+        for (const auto& token : special_token_order_) {
+            if (offset + token.size() <= text.size() &&
+                text.compare(offset, token.size(), token) == 0) {
+                matched = token;
+                return true;
             }
         }
-        if (found_special) continue;
+        return false;
+    };
 
-        size_t end = 1;
-        unsigned char c0 = static_cast<unsigned char>(remaining[0]);
+    size_t i = 0;
+    while (i < text.size()) {
+        std::string special;
+        if (try_match_special(i, special)) {
+            result.push_back(special);
+            i += special.size();
+            continue;
+        }
 
-        if (c0 <= 0x7F) {
-            if (std::isalpha(c0)) {
-                while (end < remaining.size() && std::isalpha(static_cast<unsigned char>(remaining[end])))
-                    end++;
-            } else if (std::isdigit(c0)) {
-                while (end < remaining.size() && std::isdigit(static_cast<unsigned char>(remaining[end])))
-                    end++;
-            } else if (c0 == ' ') {
-                while (end < remaining.size() && std::isalpha(static_cast<unsigned char>(remaining[end])))
-                    end++;
-                if (end == 1) {
-                    while (end < remaining.size() && remaining[end] == ' ')
-                        end++;
+        const size_t start = i;
+        const Utf8Char cur = decode_utf8_char(text, i);
+
+        if (cur.cp == '\'' || cur.cp == 0x2019) {
+            static const std::array<const char*, 6> contractions = {
+                "s", "t", "re", "ve", "m", "ll"
+            };
+            for (const char* suffix : contractions) {
+                if (is_ascii_case_insensitive_match(text, i + cur.bytes, suffix)) {
+                    size_t len = cur.bytes + std::strlen(suffix);
+                    result.push_back(text.substr(i, len));
+                    i += len;
+                    special.clear();
+                    break;
                 }
-            } else {
-                end = 1;
             }
-        } else {
-            if ((c0 & 0xE0) == 0xC0) end = 2;
-            else if ((c0 & 0xF0) == 0xE0) end = 3;
-            else if ((c0 & 0xF8) == 0xF0) end = 4;
-            if (end > remaining.size()) end = remaining.size();
+            if (i != start) {
+                continue;
+            }
+            if (is_ascii_case_insensitive_match(text, i + cur.bytes, "d")) {
+                result.push_back(text.substr(i, cur.bytes + 1));
+                i += cur.bytes + 1;
+                continue;
+            }
         }
 
-        result.push_back(remaining.substr(0, end));
-        remaining = remaining.substr(end);
+        if (!is_newline_cp(cur.cp) && !is_letter_cp(cur.cp) && !is_digit_cp(cur.cp)) {
+            size_t j = i + cur.bytes;
+            if (j < text.size()) {
+                Utf8Char next = decode_utf8_char(text, j);
+                if (is_letter_or_mark_cp(next.cp)) {
+                    while (j < text.size()) {
+                        Utf8Char cp = decode_utf8_char(text, j);
+                        if (!is_letter_or_mark_cp(cp.cp)) {
+                            break;
+                        }
+                        j += cp.bytes;
+                    }
+                    result.push_back(text.substr(start, j - start));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        if (is_letter_or_mark_cp(cur.cp)) {
+            size_t j = i + cur.bytes;
+            while (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (!is_letter_or_mark_cp(cp.cp)) {
+                    break;
+                }
+                j += cp.bytes;
+            }
+            result.push_back(text.substr(start, j - start));
+            i = j;
+            continue;
+        }
+
+        if (is_digit_cp(cur.cp)) {
+            result.push_back(text.substr(i, cur.bytes));
+            i += cur.bytes;
+            continue;
+        }
+
+        if (cur.cp == ' ') {
+            size_t j = i + cur.bytes;
+            if (j < text.size()) {
+                Utf8Char next = decode_utf8_char(text, j);
+                if (is_punctuation_or_symbol_cp(next.cp) &&
+                    !is_letter_or_mark_cp(next.cp) &&
+                    !is_digit_cp(next.cp) &&
+                    !is_whitespace_cp(next.cp)) {
+                    while (j < text.size()) {
+                        Utf8Char cp = decode_utf8_char(text, j);
+                        if (is_whitespace_cp(cp.cp) || is_letter_or_mark_cp(cp.cp) || is_digit_cp(cp.cp)) {
+                            break;
+                        }
+                        j += cp.bytes;
+                    }
+                    while (j < text.size()) {
+                        Utf8Char cp = decode_utf8_char(text, j);
+                        if (!is_newline_cp(cp.cp)) {
+                            break;
+                        }
+                        j += cp.bytes;
+                    }
+                    result.push_back(text.substr(start, j - start));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        if (is_punctuation_or_symbol_cp(cur.cp) &&
+            !is_letter_or_mark_cp(cur.cp) &&
+            !is_digit_cp(cur.cp) &&
+            !is_whitespace_cp(cur.cp)) {
+            size_t j = i + cur.bytes;
+            while (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (is_whitespace_cp(cp.cp) || is_letter_or_mark_cp(cp.cp) || is_digit_cp(cp.cp)) {
+                    break;
+                }
+                j += cp.bytes;
+            }
+            while (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (!is_newline_cp(cp.cp)) {
+                    break;
+                }
+                j += cp.bytes;
+            }
+            result.push_back(text.substr(start, j - start));
+            i = j;
+            continue;
+        }
+
+        if (is_whitespace_cp(cur.cp)) {
+            size_t j = i;
+            while (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (!is_whitespace_cp(cp.cp) || is_newline_cp(cp.cp)) {
+                    break;
+                }
+                j += cp.bytes;
+            }
+            if (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (is_newline_cp(cp.cp)) {
+                    while (j < text.size()) {
+                        Utf8Char nl = decode_utf8_char(text, j);
+                        if (!is_newline_cp(nl.cp)) {
+                            break;
+                        }
+                        j += nl.bytes;
+                    }
+                    result.push_back(text.substr(start, j - start));
+                    i = j;
+                    continue;
+                }
+            }
+            if (j == start) {
+                j += cur.bytes;
+            }
+            while (j < text.size()) {
+                Utf8Char cp = decode_utf8_char(text, j);
+                if (!is_whitespace_cp(cp.cp) || is_newline_cp(cp.cp)) {
+                    break;
+                }
+                j += cp.bytes;
+            }
+            result.push_back(text.substr(start, j - start));
+            i = j;
+            continue;
+        }
+
+        result.push_back(text.substr(i, cur.bytes));
+        i += cur.bytes;
     }
 
     return result;
@@ -541,4 +820,3 @@ std::vector<int> Tokenizer::apply_chat_template(
 
     return ids;
 }
-

@@ -74,6 +74,7 @@ private:
 
     // 特殊 token 映射
     std::unordered_map<std::string, int> special_tokens_;
+    std::vector<std::string> special_token_order_;
 
     // BPE 编码核心: 将 byte 序列进行 BPE 合并
     std::vector<std::string> bpe_encode(const std::vector<std::string>& tokens) const;

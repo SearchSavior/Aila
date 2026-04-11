@@ -3,6 +3,7 @@
 #include "IModelBackend.hpp"
 #include "../ops/Ops.hpp"
 #include <vector>
+#include <sycl/sycl.hpp>
 
 class Qwen35HybridTextBackend : public IModelBackend {
 public:
@@ -18,6 +19,11 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+
+    void set_embedding_overrides(const std::vector<int>& positions,
+                                 const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
+                                 int hidden_size);
+    void clear_embedding_overrides();
 
 private:
     struct Layer {
@@ -127,4 +133,8 @@ private:
     int max_qkv_dim_ = 0;
     int max_attn_dim_ = 0;
     bool use_delta_linear_ = false;
+
+    std::vector<int> embed_override_positions_;
+    std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;
+    int embed_override_hidden_size_ = 0;
 };

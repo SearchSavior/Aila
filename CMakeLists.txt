@@ -50,6 +50,7 @@ set(LIB_SOURCES
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
     src/templates/TemplateRegistry.cpp
+    src/vision/Qwen35VisionEncoder.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
@@ -91,6 +92,9 @@ target_include_directories(simdjson PUBLIC ${PROJECT_SOURCE_DIR}/third_party/sim
 add_library(AilaLib STATIC ${LIB_SOURCES})
 target_compile_definitions(AilaLib PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson)
+if(WIN32)
+    target_link_libraries(AilaLib PUBLIC windowscodecs ole32)
+endif()
 target_include_directories(AilaLib PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
@@ -102,6 +106,9 @@ target_include_directories(AilaLib PUBLIC
 add_library(AilaShared SHARED ${LIB_SOURCES})
 target_compile_definitions(AilaShared PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_BUILDING_DLL)
 target_link_libraries(AilaShared PUBLIC DNNL::dnnl simdjson)
+if(WIN32)
+    target_link_libraries(AilaShared PUBLIC windowscodecs ole32)
+endif()
 target_include_directories(AilaShared PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
