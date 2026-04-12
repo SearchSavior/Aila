@@ -1382,20 +1382,35 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             }
 
             time_stage(DecodeStage::QkNormRope, [&] {
-                ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
-                ops::head_rms_norm(ctx, *k_for_attn, *layer.k_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len, full_kv_heads_, full_head_dim_);
+                if (seq_len == 1) {
+                    ops::decode_prepare_qkv_partial(ctx, buf_.q, *k_for_attn, *v_for_attn,
+                                                    *layer.q_norm_weight, *layer.k_norm_weight,
+                                                    cache.k, cache.v, start_pos,
+                                                    full_q_heads_, full_kv_heads_, full_head_dim_,
+                                                    cfg_.rms_norm_eps, full_rotary_dim,
+                                                    cfg_.rope.rope_theta,
+                                                    cfg_.rope.mrope_interleaved,
+                                                    mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+                                                    mrope_prompt_len_, mrope_text_pos_delta_,
+                                                    cfg_.rope.mrope_section[0],
+                                                    cfg_.rope.mrope_section[1],
+                                                    cfg_.rope.mrope_section[2]);
+                } else {
+                    ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
+                                       cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
+                    ops::head_rms_norm(ctx, *k_for_attn, *layer.k_norm_weight,
+                                       cfg_.rms_norm_eps, seq_len, full_kv_heads_, full_head_dim_);
 
-                ops::apply_rope_partial(ctx, buf_.q, *k_for_attn, seq_len, start_pos,
-                                        full_q_heads_, full_kv_heads_, full_head_dim_,
-                                        full_rotary_dim, cfg_.rope.rope_theta,
-                                        cfg_.rope.mrope_interleaved,
-                                        mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                        mrope_prompt_len_, mrope_text_pos_delta_,
-                                        cfg_.rope.mrope_section[0],
-                                        cfg_.rope.mrope_section[1],
-                                        cfg_.rope.mrope_section[2]);
+                    ops::apply_rope_partial(ctx, buf_.q, *k_for_attn, seq_len, start_pos,
+                                            full_q_heads_, full_kv_heads_, full_head_dim_,
+                                            full_rotary_dim, cfg_.rope.rope_theta,
+                                            cfg_.rope.mrope_interleaved,
+                                            mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+                                            mrope_prompt_len_, mrope_text_pos_delta_,
+                                            cfg_.rope.mrope_section[0],
+                                            cfg_.rope.mrope_section[1],
+                                            cfg_.rope.mrope_section[2]);
+                }
             });
             if (debug_this_layer && seq_len > 0) {
                 char tag_q[64];
@@ -1410,10 +1425,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             }
 
             time_stage(DecodeStage::KvCache, [&] {
-                ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
-                                   full_kv_heads_, full_head_dim_, max_seq_len_);
-                ops::copy_to_cache(ctx, *v_for_attn, cache.v, seq_len, start_pos,
-                                   full_kv_heads_, full_head_dim_, max_seq_len_);
+                if (seq_len > 1) {
+                    ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
+                                       full_kv_heads_, full_head_dim_, max_seq_len_);
+                    ops::copy_to_cache(ctx, *v_for_attn, cache.v, seq_len, start_pos,
+                                       full_kv_heads_, full_head_dim_, max_seq_len_);
+                }
             });
 
             time_stage(DecodeStage::Attention, [&] {
