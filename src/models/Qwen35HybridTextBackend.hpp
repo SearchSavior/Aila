@@ -73,6 +73,7 @@ private:
         Tensor linear_conv_state; // [kernel-1, conv_channels] (f32)
         std::vector<float> host_linear_state;
         std::vector<float> host_linear_conv_state;
+        bool device_state_dirty = false;
     };
 
     struct Buffers {
@@ -100,6 +101,9 @@ private:
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
+    void run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
+                                     Tensor& qkv_src, Tensor& z_src,
+                                     Tensor& a_src, Tensor& b_src);
     void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
                                Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                int seq_len);
@@ -153,6 +157,7 @@ private:
     int max_qkv_dim_ = 0;
     int max_attn_dim_ = 0;
     bool use_delta_linear_ = false;
+    bool use_device_linear_decode_ = true;
 
     struct LinearDeltaScratch {
         std::vector<sycl::ext::oneapi::bfloat16> h_qkv;

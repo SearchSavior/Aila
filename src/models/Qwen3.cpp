@@ -311,10 +311,9 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
                                     config_.num_attention_heads, config_.num_key_value_heads,
                                     config_.head_dim, config_.rms_norm_eps, config_.rope_theta);
         } else {
-            // Prefill path: keep split projections for better throughput on larger M
-            layer.q_proj.forward(ctx, buf_.normed, buf_.q, seq_len);
-            layer.k_proj.forward(ctx, buf_.normed, buf_.k, seq_len);
-            layer.v_proj.forward(ctx, buf_.normed, buf_.v, seq_len);
+            // Prefill path: use fused QKV projection to cut matmul launches.
+            layer.qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
+            ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v, seq_len, QD, KVD);
 
             // 4.5 Qwen3 QK-norm: per-head RMSNorm on Q and K (before RoPE)
             ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
@@ -379,9 +378,9 @@ Tensor& Qwen3Model::forward(Context& ctx, const int* token_ids_device, int seq_l
             layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
             ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, FF);
         } else {
-            // Prefill path
-            layer.gate_proj.forward(ctx, buf_.normed, buf_.gate, seq_len);
-            layer.up_proj.forward(ctx, buf_.normed, buf_.up, seq_len);
+            // Prefill path: use fused gate/up projection to cut matmul launches.
+            layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
+            ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
             ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
         }
         

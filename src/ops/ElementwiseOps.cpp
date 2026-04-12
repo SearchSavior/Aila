@@ -357,6 +357,38 @@ void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
         });
 }
 
+void split_linear_all(Context& ctx, Tensor& linear_all, Tensor& qkv,
+                      Tensor& z, Tensor& a, Tensor& b,
+                      int seq_len, int qkv_dim, int z_dim,
+                      int a_dim, int b_dim) {
+    bf16* src = static_cast<bf16*>(linear_all.data());
+    bf16* qkv_ptr = static_cast<bf16*>(qkv.data());
+    bf16* z_ptr = static_cast<bf16*>(z.data());
+    bf16* a_ptr = static_cast<bf16*>(a.data());
+    bf16* b_ptr = static_cast<bf16*>(b.data());
+    int total = qkv_dim + z_dim + a_dim + b_dim;
+
+    ctx.queue().parallel_for(sycl::range<2>(seq_len, total),
+        [=](sycl::id<2> idx) {
+            int s = idx[0];
+            int c = idx[1];
+            int src_idx = s * total + c;
+
+            if (c < qkv_dim) {
+                qkv_ptr[s * qkv_dim + c] = src[src_idx];
+            } else if (c < qkv_dim + z_dim) {
+                int zc = c - qkv_dim;
+                z_ptr[s * z_dim + zc] = src[src_idx];
+            } else if (c < qkv_dim + z_dim + a_dim) {
+                int ac = c - qkv_dim - z_dim;
+                a_ptr[s * a_dim + ac] = src[src_idx];
+            } else {
+                int bc = c - qkv_dim - z_dim - a_dim;
+                b_ptr[s * b_dim + bc] = src[src_idx];
+            }
+        });
+}
+
 void split_q_gate(Context& ctx, Tensor& q_gate, Tensor& q, Tensor& gate,
                   int seq_len, int num_heads, int head_dim) {
     bf16* src = static_cast<bf16*>(q_gate.data());

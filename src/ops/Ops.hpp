@@ -212,6 +212,17 @@ namespace ops {
     void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
                        int seq_len, int ff_dim);
 
+    // Split fused linear-attention projection output:
+    // linear_all: [seq_len, qkv_dim + z_dim + a_dim + b_dim]
+    //   -> qkv: [seq_len, qkv_dim]
+    //   -> z:   [seq_len, z_dim]
+    //   -> a:   [seq_len, a_dim]
+    //   -> b:   [seq_len, b_dim]
+    void split_linear_all(Context& ctx, Tensor& linear_all, Tensor& qkv,
+                          Tensor& z, Tensor& a, Tensor& b,
+                          int seq_len, int qkv_dim, int z_dim,
+                          int a_dim, int b_dim);
+
     // Split gated attention Q projection output where per-head layout is
     // [q_head | gate_head] and heads are packed consecutively:
     // q_gate: [seq_len, num_heads * (2 * head_dim)]
