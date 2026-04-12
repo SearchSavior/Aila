@@ -104,6 +104,10 @@ private:
     void run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
                                      Tensor& qkv_src, Tensor& z_src,
                                      Tensor& a_src, Tensor& b_src);
+    void debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
+                                           Layer& layer, LayerCache& cache,
+                                           Tensor& qkv_src, Tensor& z_src,
+                                           Tensor& a_src, Tensor& b_src);
     void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
                                Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                int seq_len);

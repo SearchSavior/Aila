@@ -190,7 +190,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
-    use_device_linear_decode_ = aila::env::read_flag("AILA_Q35_LINEAR_DECODE_GPU", false);
+    use_device_linear_decode_ = aila::env::read_flag("AILA_Q35_LINEAR_DECODE_GPU", true);
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -507,8 +507,14 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
 
     AILA_LOG_INFO("[Qwen3.5] Hybrid text backend loaded: layers=%d hidden=%d vocab=%d",
                   cfg_.num_hidden_layers, hidden_size_, cfg_.vocab_size);
+    const char* linear_mode = "legacy-attn";
+    if (use_delta_linear_) {
+        linear_mode = use_device_linear_decode_
+            ? "delta-prefill-host/decode-gpu"
+            : "delta-host";
+    }
     AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback)",
-                  use_delta_linear_ ? "delta-host" : "legacy-attn");
+                  linear_mode);
     return true;
 }
 
@@ -609,6 +615,138 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
+
+    if (q_heads == num_heads && head_k_dim == head_v_dim) {
+        const int head_dim = head_k_dim;
+        const int head_wg = std::max(32, aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_WG", 256));
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> v_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> z_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
+                [=](sycl::nd_item<1> item) {
+                    auto softplus_dev = [](float x) {
+                        if (x > 20.0f) return x;
+                        if (x < -20.0f) return sycl::exp(x);
+                        return sycl::log1p(sycl::exp(x));
+                    };
+                    auto silu_dev = [](float x) {
+                        return x / (1.0f + sycl::exp(-x));
+                    };
+                    auto conv_channel = [&](int channel) {
+                        float v = 0.0f;
+                        bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
+                        if (kernel > 1 && conv_state_ptr) {
+                            for (int j = 0; j < kernel - 1; ++j) {
+                                v += conv_state_ptr[static_cast<size_t>(j) * qkv_dim + channel]
+                                    * static_cast<float>(w[j]);
+                            }
+                        }
+                        v += static_cast<float>(qkv_ptr[channel]) * static_cast<float>(w[kernel - 1]);
+                        return silu_dev(v);
+                    };
+
+                    int hv = static_cast<int>(item.get_group(0));
+                    int hk = hv;
+                    int lid = static_cast<int>(item.get_local_id(0));
+                    int q_base = hk * head_dim;
+                    int k_base = q_dim + hk * head_dim;
+                    int v_base = q_dim + q_dim + hv * head_dim;
+                    int z_base = hv * head_dim;
+                    float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
+
+                    for (int d = lid; d < head_dim; d += head_wg) {
+                        q_local[d] = conv_channel(q_base + d);
+                        k_local[d] = conv_channel(k_base + d);
+                        v_local[d] = conv_channel(v_base + d);
+                        z_local[d] = static_cast<float>(z_ptr[z_base + d]);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    if (kernel > 1 && conv_state_ptr) {
+                        for (int row = 0; row < kernel - 2; ++row) {
+                            size_t dst = static_cast<size_t>(row) * qkv_dim;
+                            size_t src = static_cast<size_t>(row + 1) * qkv_dim;
+                            for (int d = lid; d < head_dim; d += head_wg) {
+                                conv_state_ptr[dst + q_base + d] = conv_state_ptr[src + q_base + d];
+                                conv_state_ptr[dst + k_base + d] = conv_state_ptr[src + k_base + d];
+                                conv_state_ptr[dst + v_base + d] = conv_state_ptr[src + v_base + d];
+                            }
+                            item.barrier(sycl::access::fence_space::global_and_local);
+                        }
+                        for (int d = lid; d < head_dim; d += head_wg) {
+                            size_t dst = static_cast<size_t>(kernel - 2) * qkv_dim;
+                            conv_state_ptr[dst + q_base + d] = static_cast<float>(qkv_ptr[q_base + d]);
+                            conv_state_ptr[dst + k_base + d] = static_cast<float>(qkv_ptr[k_base + d]);
+                            conv_state_ptr[dst + v_base + d] = static_cast<float>(qkv_ptr[v_base + d]);
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::global_and_local);
+
+                    float q_sq = 0.0f;
+                    float k_sq = 0.0f;
+                    for (int d = lid; d < head_dim; d += head_wg) {
+                        q_sq += q_local[d] * q_local[d];
+                        k_sq += k_local[d] * k_local[d];
+                    }
+                    q_sq = sycl::reduce_over_group(item.get_group(), q_sq, sycl::plus<float>());
+                    k_sq = sycl::reduce_over_group(item.get_group(), k_sq, sycl::plus<float>());
+                    float q_scale = 1.0f / sycl::sqrt(q_sq + eps);
+                    float k_scale = 1.0f / sycl::sqrt(k_sq + eps);
+
+                    for (int d = lid; d < head_dim; d += head_wg) {
+                        q_local[d] *= q_scale;
+                        k_local[d] *= k_scale;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    float beta = 1.0f / (1.0f + sycl::exp(-static_cast<float>(b_ptr[hv])));
+                    float alpha = static_cast<float>(a_ptr[hv]);
+                    float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
+                                * (-sycl::exp(a_log_ptr[hv]));
+                    float decay = sycl::exp(g_pre);
+
+                    for (int dv = lid; dv < head_dim; dv += head_wg) {
+                        float acc = 0.0f;
+                        for (int j = 0; j < head_dim; ++j) {
+                            size_t off = static_cast<size_t>(j) * head_dim + dv;
+                            float sv = S[off] * decay;
+                            S[off] = sv;
+                            acc += sv * k_local[j];
+                        }
+
+                        float dval = (v_local[dv] - acc) * beta;
+                        float out = 0.0f;
+                        for (int j = 0; j < head_dim; ++j) {
+                            size_t off = static_cast<size_t>(j) * head_dim + dv;
+                            float sv = S[off] + k_local[j] * dval;
+                            S[off] = sv;
+                            out += sv * q_local[j];
+                        }
+                        out_local[dv] = out * scale;
+                    }
+                    item.barrier(sycl::access::fence_space::global_and_local);
+
+                    float out_sq = 0.0f;
+                    for (int d = lid; d < head_dim; d += head_wg) {
+                        out_sq += out_local[d] * out_local[d];
+                    }
+                    out_sq = sycl::reduce_over_group(item.get_group(), out_sq, sycl::plus<float>());
+                    float out_scale = 1.0f / sycl::sqrt(out_sq / static_cast<float>(head_dim) + eps);
+
+                    for (int d = lid; d < head_dim; d += head_wg) {
+                        float n = out_local[d] * out_scale * norm_w_ptr[d];
+                        out_ptr[hv * head_dim + d] = bf16(n * silu_dev(z_local[d]));
+                    }
+                });
+        });
+        cache.device_state_dirty = true;
+        return;
+    }
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> q_local(sycl::range<1>(q_dim), cgh);
@@ -751,6 +889,119 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     });
 
     cache.device_state_dirty = true;
+}
+
+void Qwen35HybridTextBackend::debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
+                                                                Layer& layer, LayerCache& cache,
+                                                                Tensor& qkv_src, Tensor& z_src,
+                                                                Tensor& a_src, Tensor& b_src) {
+    std::vector<float> orig_state(cache.host_linear_state.size(), 0.0f);
+    std::vector<float> orig_conv(cache.host_linear_conv_state.size(), 0.0f);
+    if (cache.linear_state.valid() && !orig_state.empty()) {
+        ctx.memcpy_d2h(orig_state.data(), cache.linear_state.data(),
+                       orig_state.size() * sizeof(float));
+    }
+    if (cache.linear_conv_state.valid() && !orig_conv.empty()) {
+        ctx.memcpy_d2h(orig_conv.data(), cache.linear_conv_state.data(),
+                       orig_conv.size() * sizeof(float));
+    }
+
+    run_linear_delta_decode_gpu(ctx, layer, cache, qkv_src, z_src, a_src, b_src);
+
+    std::vector<bf16> gpu_out((size_t)linear_kv_dim_);
+    std::vector<float> gpu_state(orig_state.size(), 0.0f);
+    std::vector<float> gpu_conv(orig_conv.size(), 0.0f);
+    ctx.memcpy_d2h(gpu_out.data(), buf_.attn_out.data(), gpu_out.size() * sizeof(bf16));
+    if (cache.linear_state.valid() && !gpu_state.empty()) {
+        ctx.memcpy_d2h(gpu_state.data(), cache.linear_state.data(),
+                       gpu_state.size() * sizeof(float));
+    }
+    if (cache.linear_conv_state.valid() && !gpu_conv.empty()) {
+        ctx.memcpy_d2h(gpu_conv.data(), cache.linear_conv_state.data(),
+                       gpu_conv.size() * sizeof(float));
+    }
+
+    if (cache.linear_state.valid() && !orig_state.empty()) {
+        ctx.memcpy_h2d(cache.linear_state.data(), orig_state.data(),
+                       orig_state.size() * sizeof(float));
+    }
+    if (cache.linear_conv_state.valid() && !orig_conv.empty()) {
+        ctx.memcpy_h2d(cache.linear_conv_state.data(), orig_conv.data(),
+                       orig_conv.size() * sizeof(float));
+    }
+    cache.host_linear_state = orig_state;
+    cache.host_linear_conv_state = orig_conv;
+    cache.device_state_dirty = false;
+
+    bool prev_use_device = use_device_linear_decode_;
+    use_device_linear_decode_ = false;
+    run_linear_delta_host(ctx, layer, cache, qkv_src, z_src, a_src, b_src, 1);
+    use_device_linear_decode_ = prev_use_device;
+
+    std::vector<bf16> host_out((size_t)linear_kv_dim_);
+    ctx.memcpy_d2h(host_out.data(), buf_.attn_out.data(), host_out.size() * sizeof(bf16));
+
+    auto max_abs_bf16 = [](const std::vector<bf16>& a, const std::vector<bf16>& b,
+                           size_t* idx_out, float* a_val_out, float* b_val_out) {
+        float best = 0.0f;
+        size_t best_idx = 0;
+        float best_a = 0.0f;
+        float best_b = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i) {
+            float av = static_cast<float>(a[i]);
+            float bv = static_cast<float>(b[i]);
+            float diff = std::abs(av - bv);
+            if (diff > best) {
+                best = diff;
+                best_idx = i;
+                best_a = av;
+                best_b = bv;
+            }
+        }
+        if (idx_out) *idx_out = best_idx;
+        if (a_val_out) *a_val_out = best_a;
+        if (b_val_out) *b_val_out = best_b;
+        return best;
+    };
+    auto max_abs_f32 = [](const std::vector<float>& a, const std::vector<float>& b,
+                          size_t* idx_out, float* a_val_out, float* b_val_out) {
+        float best = 0.0f;
+        size_t best_idx = 0;
+        float best_a = 0.0f;
+        float best_b = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i) {
+            float diff = std::abs(a[i] - b[i]);
+            if (diff > best) {
+                best = diff;
+                best_idx = i;
+                best_a = a[i];
+                best_b = b[i];
+            }
+        }
+        if (idx_out) *idx_out = best_idx;
+        if (a_val_out) *a_val_out = best_a;
+        if (b_val_out) *b_val_out = best_b;
+        return best;
+    };
+
+    size_t out_idx = 0, state_idx = 0, conv_idx = 0;
+    float gpu_out_val = 0.0f, host_out_val = 0.0f;
+    float gpu_state_val = 0.0f, host_state_val = 0.0f;
+    float gpu_conv_val = 0.0f, host_conv_val = 0.0f;
+    float out_diff = max_abs_bf16(gpu_out, host_out, &out_idx, &gpu_out_val, &host_out_val);
+    float state_diff = gpu_state.empty() ? 0.0f
+        : max_abs_f32(gpu_state, cache.host_linear_state,
+                      &state_idx, &gpu_state_val, &host_state_val);
+    float conv_diff = gpu_conv.empty() ? 0.0f
+        : max_abs_f32(gpu_conv, cache.host_linear_conv_state,
+                      &conv_idx, &gpu_conv_val, &host_conv_val);
+
+    AILA_LOG_INFO(
+        "[Q35LinearCompare] layer=%d out_max=%.6g idx=%zu gpu=%.6g host=%.6g "
+        "state_max=%.6g idx=%zu gpu=%.6g host=%.6g conv_max=%.6g idx=%zu gpu=%.6g host=%.6g",
+        layer_idx, out_diff, out_idx, gpu_out_val, host_out_val,
+        state_diff, state_idx, gpu_state_val, host_state_val,
+        conv_diff, conv_idx, gpu_conv_val, host_conv_val);
 }
 
 void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
@@ -920,6 +1171,8 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         throw std::runtime_error("Qwen35HybridTextBackend::forward: seq_len must be positive");
     }
     bool profile_decode = (seq_len == 1) && aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
+    bool compare_linear_decode = (seq_len == 1) && aila::env::read_flag("AILA_Q35_LINEAR_DECODE_COMPARE", false);
+    int compare_linear_decode_layer = aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_COMPARE_LAYER", -1);
     int profile_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
     std::array<double, static_cast<size_t>(DecodeStage::Count)> stage_ms{};
     auto time_stage = [&](DecodeStage stage, auto&& fn) {
@@ -1021,7 +1274,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                                                      {1, (int64_t)linear_kv_heads_});
                         Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
                                                      {1, (int64_t)linear_kv_heads_});
-                        if (use_device_linear_decode_) {
+                        bool do_compare = compare_linear_decode &&
+                            (compare_linear_decode_layer < 0 || compare_linear_decode_layer == i);
+                        if (use_device_linear_decode_ && do_compare) {
+                            debug_compare_linear_delta_decode(ctx, i, layer, cache,
+                                                              qkv_view, z_view, a_view, b_view);
+                        } else if (use_device_linear_decode_) {
                             run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
                         } else {
                             run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, seq_len);
