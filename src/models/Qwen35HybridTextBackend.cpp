@@ -1342,8 +1342,11 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 layer.linear_o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
             });
         } else {
+            Tensor q_decode_view;
+            Tensor q_gate_decode_view;
             Tensor k_decode_view;
             Tensor v_decode_view;
+            Tensor* q_for_attn = &buf_.q;
             Tensor* k_for_attn = &buf_.k;
             Tensor* v_for_attn = &buf_.v;
 
@@ -1353,16 +1356,17 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 });
                 time_stage(DecodeStage::FullSplit, [&] {
                     bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
-                    Tensor q_proj_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
+                    if (cfg_.attn_output_gate) {
+                        q_gate_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
+                        q_for_attn = &buf_.q;
+                    } else {
+                        q_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_dim_});
+                        q_for_attn = &q_decode_view;
+                    }
                     k_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
                     v_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_, {1, (int64_t)full_kv_dim_});
                     k_for_attn = &k_decode_view;
                     v_for_attn = &v_decode_view;
-                    if (cfg_.attn_output_gate) {
-                        ops::split_q_gate(ctx, q_proj_view, buf_.q, buf_.z, seq_len, full_q_heads_, full_head_dim_);
-                    } else {
-                        ops::copy_tensor(ctx, q_proj_view, buf_.q, full_q_dim_);
-                    }
                 });
             } else {
                 layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
@@ -1375,7 +1379,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     ops::copy_tensor(ctx, buf_.qkv, buf_.q, seq_len * full_q_dim_);
                 }
             }
-            if (debug_this_layer && seq_len > 0) {
+            if (debug_this_layer && seq_len > 0 && cfg_.attn_output_gate) {
                 char tag[64];
                 std::snprintf(tag, sizeof(tag), "layer%d_full_gate_z", i);
                 log_row_stats(tag, buf_.z, dbg_row, full_q_dim_);
@@ -1383,18 +1387,34 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
             time_stage(DecodeStage::QkNormRope, [&] {
                 if (seq_len == 1) {
-                    ops::decode_prepare_qkv_partial(ctx, buf_.q, *k_for_attn, *v_for_attn,
-                                                    *layer.q_norm_weight, *layer.k_norm_weight,
-                                                    cache.k, cache.v, start_pos,
-                                                    full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                    cfg_.rms_norm_eps, full_rotary_dim,
-                                                    cfg_.rope.rope_theta,
-                                                    cfg_.rope.mrope_interleaved,
-                                                    mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                                    mrope_prompt_len_, mrope_text_pos_delta_,
-                                                    cfg_.rope.mrope_section[0],
-                                                    cfg_.rope.mrope_section[1],
-                                                    cfg_.rope.mrope_section[2]);
+                    if (cfg_.attn_output_gate) {
+                        ops::decode_prepare_qgkv_packed_partial(ctx, q_gate_decode_view, *k_for_attn, *v_for_attn,
+                                                                buf_.q, buf_.z,
+                                                                *layer.q_norm_weight, *layer.k_norm_weight,
+                                                                cache.k, cache.v, start_pos,
+                                                                full_q_heads_, full_kv_heads_, full_head_dim_,
+                                                                cfg_.rms_norm_eps, full_rotary_dim,
+                                                                cfg_.rope.rope_theta,
+                                                                cfg_.rope.mrope_interleaved,
+                                                                mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+                                                                mrope_prompt_len_, mrope_text_pos_delta_,
+                                                                cfg_.rope.mrope_section[0],
+                                                                cfg_.rope.mrope_section[1],
+                                                                cfg_.rope.mrope_section[2]);
+                    } else {
+                        ops::decode_prepare_qkv_partial(ctx, *q_for_attn, *k_for_attn, *v_for_attn,
+                                                        *layer.q_norm_weight, *layer.k_norm_weight,
+                                                        cache.k, cache.v, start_pos,
+                                                        full_q_heads_, full_kv_heads_, full_head_dim_,
+                                                        cfg_.rms_norm_eps, full_rotary_dim,
+                                                        cfg_.rope.rope_theta,
+                                                        cfg_.rope.mrope_interleaved,
+                                                        mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+                                                        mrope_prompt_len_, mrope_text_pos_delta_,
+                                                        cfg_.rope.mrope_section[0],
+                                                        cfg_.rope.mrope_section[1],
+                                                        cfg_.rope.mrope_section[2]);
+                    }
                 } else {
                     ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
                                        cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
@@ -1419,7 +1439,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 std::snprintf(tag_q, sizeof(tag_q), "layer%d_full_q_after_rope", i);
                 std::snprintf(tag_k, sizeof(tag_k), "layer%d_full_k_after_rope", i);
                 std::snprintf(tag_v, sizeof(tag_v), "layer%d_full_v", i);
-                log_row_stats(tag_q, buf_.q, dbg_row, full_q_dim_);
+                log_row_stats(tag_q, *q_for_attn, dbg_row, full_q_dim_);
                 log_row_stats(tag_k, *k_for_attn, dbg_row, full_kv_dim_);
                 log_row_stats(tag_v, *v_for_attn, dbg_row, full_kv_dim_);
             }
@@ -1435,7 +1455,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
             time_stage(DecodeStage::Attention, [&] {
                 if (seq_len == 1) {
-                    ops::attention_decode(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
+                    ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
                                           full_q_heads_, full_kv_heads_, full_head_dim_, cached_len);
                 } else if (start_pos == 0) {
                     ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,

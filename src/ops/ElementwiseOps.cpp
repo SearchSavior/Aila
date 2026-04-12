@@ -587,4 +587,162 @@ void decode_prepare_qkv_partial(Context& ctx,
     });
 }
 
+void decode_prepare_qgkv_packed_partial(Context& ctx,
+                                        Tensor& q_gate_packed, Tensor& k, Tensor& v,
+                                        Tensor& q_out, Tensor& gate_out,
+                                        Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                        Tensor& k_cache, Tensor& v_cache,
+                                        int start_pos,
+                                        int num_heads_q, int num_kv_heads, int head_dim,
+                                        float eps, int rotary_dim, float theta,
+                                        bool interleaved,
+                                        const int* pos_t,
+                                        const int* pos_h,
+                                        const int* pos_w,
+                                        int prompt_pos_len,
+                                        int text_pos_delta,
+                                        int mrope_section_t,
+                                        int mrope_section_h,
+                                        int mrope_section_w) {
+    bf16* packed_ptr = static_cast<bf16*>(q_gate_packed.data());
+    bf16* q_ptr = static_cast<bf16*>(q_out.data());
+    bf16* gate_ptr = static_cast<bf16*>(gate_out.data());
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
+    bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
+    bf16* k_cache_ptr = static_cast<bf16*>(k_cache.data());
+    bf16* v_cache_ptr = static_cast<bf16*>(v_cache.data());
+    int max_seq_len = static_cast<int>(k_cache.shape(1));
+    int packed_per_head = head_dim * 2;
+    int k_dim = num_kv_heads * head_dim;
+    int rot = std::max(2, std::min(head_dim, rotary_dim));
+    if (rot & 1) --rot;
+    int half_dim = rot / 2;
+    int wg_size = (head_dim > 128 ? 256 : 128);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(num_heads_q * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int head = item.get_group(0);
+                int lid = item.get_local_id(0);
+                int packed_base = head * packed_per_head;
+                int q_base = head * head_dim;
+
+                auto rotary_position = [&](int d) {
+                    int global_pos = start_pos;
+                    int pos_scalar = global_pos;
+                    if (global_pos >= prompt_pos_len) {
+                        pos_scalar = global_pos + text_pos_delta;
+                    }
+
+                    float position_value = static_cast<float>(pos_scalar);
+                    if (interleaved && pos_t && pos_h && pos_w) {
+                        int stream = 0;
+                        if ((d % 3) == 1 && (d / 3) < mrope_section_h) {
+                            stream = 1;
+                        } else if ((d % 3) == 2 && (d / 3) < mrope_section_w) {
+                            stream = 2;
+                        } else {
+                            stream = 0;
+                        }
+
+                        int t_val = (global_pos < prompt_pos_len) ? pos_t[global_pos] : pos_scalar;
+                        int h_val = (global_pos < prompt_pos_len) ? pos_h[global_pos] : pos_scalar;
+                        int w_val = (global_pos < prompt_pos_len) ? pos_w[global_pos] : pos_scalar;
+                        if (stream == 1) position_value = static_cast<float>(h_val);
+                        else if (stream == 2) position_value = static_cast<float>(w_val);
+                        else position_value = static_cast<float>(t_val);
+                    }
+                    return position_value;
+                };
+
+                float sum_sq = 0.0f;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float qv = static_cast<float>(packed_ptr[packed_base + d]);
+                    q_ptr[q_base + d] = bf16(qv);
+                    gate_ptr[q_base + d] = packed_ptr[packed_base + head_dim + d];
+                    sum_sq += qv * qv;
+                }
+                local_sum[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                float q_rms = sycl::sqrt(local_sum[0] / static_cast<float>(head_dim) + eps);
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(q_ptr[q_base + d]);
+                    float w = static_cast<float>(qn_ptr[d]);
+                    q_ptr[q_base + d] = bf16((x / q_rms) * w);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int d = lid; d < half_dim; d += wg_size) {
+                    float pos = rotary_position(d);
+                    float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(rot));
+                    float angle = pos * freq;
+                    float c = sycl::native::cos(angle);
+                    float s = sycl::native::sin(angle);
+                    float q0 = static_cast<float>(q_ptr[q_base + d]);
+                    float q1 = static_cast<float>(q_ptr[q_base + d + half_dim]);
+                    q_ptr[q_base + d] = bf16(q0 * c - q1 * s);
+                    q_ptr[q_base + d + half_dim] = bf16(q1 * c + q0 * s);
+                }
+
+                if (head >= num_kv_heads) {
+                    return;
+                }
+
+                int k_base = head * head_dim;
+                item.barrier(sycl::access::fence_space::local_space);
+                sum_sq = 0.0f;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(k_ptr[k_base + d]);
+                    sum_sq += x * x;
+                }
+                local_sum[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                float k_rms = sycl::sqrt(local_sum[0] / static_cast<float>(head_dim) + eps);
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(k_ptr[k_base + d]);
+                    float w = static_cast<float>(kn_ptr[d]);
+                    k_ptr[k_base + d] = bf16((x / k_rms) * w);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int d = lid; d < half_dim; d += wg_size) {
+                    float pos = rotary_position(d);
+                    float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(rot));
+                    float angle = pos * freq;
+                    float c = sycl::native::cos(angle);
+                    float s = sycl::native::sin(angle);
+                    float k0 = static_cast<float>(k_ptr[k_base + d]);
+                    float k1 = static_cast<float>(k_ptr[k_base + d + half_dim]);
+                    k_ptr[k_base + d] = bf16(k0 * c - k1 * s);
+                    k_ptr[k_base + d + half_dim] = bf16(k1 * c + k0 * s);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    k_cache_ptr[cache_base + d] = k_ptr[k_base + d];
+                    v_cache_ptr[cache_base + d] = v_ptr[k_base + d];
+                }
+            });
+    });
+}
+
 } // namespace ops

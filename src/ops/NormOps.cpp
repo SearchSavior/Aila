@@ -20,29 +20,28 @@ void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
     int wg_size = 256; // Intel A770 倾向于较大的 WG 以掩盖延迟
 
     ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> row_cache(sycl::range<1>(hidden_size), cgh);
         cgh.parallel_for(sycl::nd_range<1>(seq_len * wg_size, wg_size),
             [=](sycl::nd_item<1> item) {
                 int row = item.get_group(0);
                 int lid = item.get_local_id(0);
-                auto sg = item.get_sub_group();
                 int wg = item.get_local_range(0);
 
                 float local_sum_sq = 0.0f;
-                // 每个线程负责一部分数据的累加
                 for (int h = lid; h < hidden_size; h += wg) {
                     float val = static_cast<float>(in_ptr[row * hidden_size + h]);
+                    row_cache[h] = val;
                     local_sum_sq += val * val;
                 }
+                item.barrier(sycl::access::fence_space::local_space);
 
-                // 使用 Sub-group 原语快速规约
                 float group_sum = sycl::reduce_over_group(item.get_group(), local_sum_sq, sycl::plus<>());
-                float rms = sycl::sqrt(group_sum / static_cast<float>(hidden_size) + eps);
+                float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
 
-                // 应用归一化
                 for (int h = lid; h < hidden_size; h += wg) {
-                    float val = static_cast<float>(in_ptr[row * hidden_size + h]);
+                    float val = row_cache[h];
                     float w = static_cast<float>(w_ptr[h]);
-                    out_ptr[row * hidden_size + h] = bf16(val / rms * w);
+                    out_ptr[row * hidden_size + h] = bf16(val * inv_rms * w);
                 }
             });
     });
@@ -59,6 +58,7 @@ void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
     int wg_size = 256;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> row_cache(sycl::range<1>(hidden_size), cgh);
         cgh.parallel_for(sycl::nd_range<1>(seq_len * wg_size, wg_size),
             [=](sycl::nd_item<1> item) {
                 int row = item.get_group(0);
@@ -69,17 +69,19 @@ void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
                 for (int h = lid; h < hidden_size; h += wg) {
                     float val = static_cast<float>(in_ptr[row * hidden_size + h]) +
                                 static_cast<float>(res_ptr[row * hidden_size + h]);
-                    in_ptr[row * hidden_size + h] = bf16(val);
+                    row_cache[h] = val;
                     local_sum_sq += val * val;
                 }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 float group_sum = sycl::reduce_over_group(item.get_group(), local_sum_sq, sycl::plus<>());
-                float rms = sycl::sqrt(group_sum / static_cast<float>(hidden_size) + eps);
+                float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
 
                 for (int h = lid; h < hidden_size; h += wg) {
-                    float val = static_cast<float>(in_ptr[row * hidden_size + h]);
+                    float val = row_cache[h];
                     float w = static_cast<float>(w_ptr[h]);
-                    out_ptr[row * hidden_size + h] = bf16(val / rms * w);
+                    in_ptr[row * hidden_size + h] = bf16(val);
+                    out_ptr[row * hidden_size + h] = bf16(val * inv_rms * w);
                 }
             });
     });

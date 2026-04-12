@@ -165,6 +165,26 @@ namespace ops {
                                     int mrope_section_h = 0,
                                     int mrope_section_w = 0);
 
+    // Decode fused prep for packed Q+gate layout (seq_len=1):
+    // split packed q/gate -> q_out/gate_out, Q/K RMSNorm + partial RoPE, then write K/V to cache.
+    void decode_prepare_qgkv_packed_partial(Context& ctx,
+                                            Tensor& q_gate_packed, Tensor& k, Tensor& v,
+                                            Tensor& q_out, Tensor& gate_out,
+                                            Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                            Tensor& k_cache, Tensor& v_cache,
+                                            int start_pos,
+                                            int num_heads_q, int num_kv_heads, int head_dim,
+                                            float eps, int rotary_dim, float theta,
+                                            bool interleaved = false,
+                                            const int* pos_t = nullptr,
+                                            const int* pos_h = nullptr,
+                                            const int* pos_w = nullptr,
+                                            int prompt_pos_len = 0,
+                                            int text_pos_delta = 0,
+                                            int mrope_section_t = 0,
+                                            int mrope_section_h = 0,
+                                            int mrope_section_w = 0);
+
     // GQA Attention (decode 模式, seq_len=1)
     // q:       [1, num_heads * head_dim]
     // k_cache: [num_kv_heads, cached_len, head_dim]
