@@ -42,6 +42,7 @@ private:
 
         // full attention branch
         Linear q_proj, k_proj, v_proj, o_proj;
+        Linear qkv_proj;
         Tensor* q_norm_weight = nullptr;
         Tensor* k_norm_weight = nullptr;
 
@@ -55,6 +56,7 @@ private:
 
         // FFN
         Linear gate_proj, up_proj, down_proj;
+        Linear gate_up_proj;
 
         std::vector<float> host_linear_A_negexp;
         std::vector<float> host_linear_dt_bias;
@@ -68,6 +70,8 @@ private:
         // DeltaNet recurrent state S per head: [num_heads, key_dim, value_dim] (f32)
         Tensor linear_state;
         Tensor linear_conv_state; // [kernel-1, conv_channels] (f32)
+        std::vector<float> host_linear_state;
+        std::vector<float> host_linear_conv_state;
     };
 
     struct Buffers {
@@ -81,6 +85,8 @@ private:
         Tensor a;
         Tensor b;
         Tensor attn_out;
+        Tensor full_qkv;
+        Tensor gate_up;
         Tensor gate;
         Tensor up;
         Tensor logits;
@@ -124,6 +130,7 @@ private:
     int full_q_dim_ = 0;
     int full_kv_dim_ = 0;
     int full_q_proj_dim_ = 0;
+    int full_fused_qkv_dim_ = 0;
 
     int linear_q_heads_ = 0;
     int linear_kv_heads_ = 0;

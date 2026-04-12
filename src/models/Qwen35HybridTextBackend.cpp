@@ -76,6 +76,8 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
     buf_.a = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)linear_kv_heads_});
     buf_.b = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)linear_kv_heads_});
     buf_.attn_out = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
+    buf_.full_qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)full_fused_qkv_dim_});
+    buf_.gate_up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * ff_dim_)});
     buf_.gate = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
     buf_.up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
 
@@ -142,6 +144,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     full_q_dim_ = full_q_heads_ * full_head_dim_;
     full_kv_dim_ = full_kv_heads_ * full_head_dim_;
     full_q_proj_dim_ = cfg_.attn_output_gate ? (2 * full_q_dim_) : full_q_dim_;
+    full_fused_qkv_dim_ = full_q_proj_dim_ + 2 * full_kv_dim_;
 
     linear_q_heads_ = cfg_.linear_num_key_heads;
     linear_kv_heads_ = cfg_.linear_num_value_heads;
@@ -192,7 +195,64 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     fused_weights_.clear();
     layers_.resize(cfg_.num_hidden_layers);
     layer_caches_.resize(cfg_.num_hidden_layers);
-    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 2 + 1);
+    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 3 + 1);
+
+    auto fuse_three_cols = [&](Tensor& a, Tensor& b, Tensor& c) {
+        int64_t rows = a.shape(0);
+        int64_t a_cols = a.shape(1);
+        int64_t b_cols = b.shape(1);
+        int64_t c_cols = c.shape(1);
+        int64_t total_cols = a_cols + b_cols + c_cols;
+
+        Tensor out = Tensor::allocate(ctx, {rows, total_cols}, a.dtype());
+        bf16* a_ptr = static_cast<bf16*>(a.data());
+        bf16* b_ptr = static_cast<bf16*>(b.data());
+        bf16* c_ptr = static_cast<bf16*>(c.data());
+        bf16* o_ptr = static_cast<bf16*>(out.data());
+
+        ctx.queue().parallel_for(sycl::range<2>(rows, total_cols),
+            [=](sycl::id<2> idx) {
+                int r = idx[0];
+                int cidx = idx[1];
+                int64_t out_idx = static_cast<int64_t>(r) * total_cols + cidx;
+                if (cidx < a_cols) {
+                    o_ptr[out_idx] = a_ptr[static_cast<int64_t>(r) * a_cols + cidx];
+                } else if (cidx < a_cols + b_cols) {
+                    int bc = cidx - static_cast<int>(a_cols);
+                    o_ptr[out_idx] = b_ptr[static_cast<int64_t>(r) * b_cols + bc];
+                } else {
+                    int cc = cidx - static_cast<int>(a_cols + b_cols);
+                    o_ptr[out_idx] = c_ptr[static_cast<int64_t>(r) * c_cols + cc];
+                }
+            });
+        return out;
+    };
+
+    auto fuse_two_cols = [&](Tensor& a, Tensor& b) {
+        int64_t rows = a.shape(0);
+        int64_t a_cols = a.shape(1);
+        int64_t b_cols = b.shape(1);
+        int64_t total_cols = a_cols + b_cols;
+
+        Tensor out = Tensor::allocate(ctx, {rows, total_cols}, a.dtype());
+        bf16* a_ptr = static_cast<bf16*>(a.data());
+        bf16* b_ptr = static_cast<bf16*>(b.data());
+        bf16* o_ptr = static_cast<bf16*>(out.data());
+
+        ctx.queue().parallel_for(sycl::range<2>(rows, total_cols),
+            [=](sycl::id<2> idx) {
+                int r = idx[0];
+                int cidx = idx[1];
+                int64_t out_idx = static_cast<int64_t>(r) * total_cols + cidx;
+                if (cidx < a_cols) {
+                    o_ptr[out_idx] = a_ptr[static_cast<int64_t>(r) * a_cols + cidx];
+                } else {
+                    int bc = cidx - static_cast<int>(a_cols);
+                    o_ptr[out_idx] = b_ptr[static_cast<int64_t>(r) * b_cols + bc];
+                }
+            });
+        return out;
+    };
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         auto& layer = layers_[i];
@@ -287,6 +347,12 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 if (cache.linear_conv_state.numel() > 0) {
                     ctx.queue().memset(cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
                 }
+                cache.host_linear_state.assign(
+                    (size_t)linear_kv_heads_ * (size_t)linear_head_dim_ * (size_t)cfg_.linear_value_head_dim,
+                    0.0f);
+                cache.host_linear_conv_state.assign(
+                    (size_t)std::max(0, linear_conv_kernel_dim_ - 1) * (size_t)linear_conv_channels_,
+                    0.0f);
             } else {
                 cache.k = Tensor::allocate(ctx,
                                            {(int64_t)linear_q_heads_, (int64_t)max_seq_len_, (int64_t)linear_head_dim_},
@@ -296,6 +362,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                                            dnnl::memory::data_type::bf16);
                 cache.linear_state = Tensor();
                 cache.linear_conv_state = Tensor();
+                cache.host_linear_state.clear();
+                cache.host_linear_conv_state.clear();
             }
         } else {
             Tensor* q_w = transpose_weight(prefix + "self_attn.q_proj.weight");
@@ -305,6 +373,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.q_proj.init(ctx, *q_w, hidden_size_, full_q_proj_dim_, true);
             layer.k_proj.init(ctx, *k_w, hidden_size_, full_kv_dim_, true);
             layer.v_proj.init(ctx, *v_w, hidden_size_, full_kv_dim_, true);
+            fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
+            layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
             layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
             layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
             layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
@@ -317,6 +387,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                                        dnnl::memory::data_type::bf16);
             cache.linear_state = Tensor();
             cache.linear_conv_state = Tensor();
+            cache.host_linear_state.clear();
+            cache.host_linear_conv_state.clear();
         }
 
         Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
@@ -324,6 +396,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
         layer.gate_proj.init(ctx, *gate_w, hidden_size_, ff_dim_, true);
         layer.up_proj.init(ctx, *up_w, hidden_size_, ff_dim_, true);
+        fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
+        layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
         layer.down_proj.init(ctx, *down_w, ff_dim_, hidden_size_, true);
     }
 
@@ -450,14 +524,15 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
     ctx.memcpy_d2h(h_a.data(), buf_.a.data(), h_a.size() * sizeof(bf16));
     ctx.memcpy_d2h(h_b.data(), buf_.b.data(), h_b.size() * sizeof(bf16));
 
-    std::vector<float> h_conv_state((size_t)std::max(0, kernel - 1) * linear_conv_channels_);
-    if (kernel > 1) {
-        ctx.memcpy_d2h(h_conv_state.data(), cache.linear_conv_state.data(),
-                       h_conv_state.size() * sizeof(float));
+    std::vector<float>& h_conv_state = cache.host_linear_conv_state;
+    if (h_conv_state.size() != (size_t)std::max(0, kernel - 1) * (size_t)linear_conv_channels_) {
+        h_conv_state.assign((size_t)std::max(0, kernel - 1) * (size_t)linear_conv_channels_, 0.0f);
     }
 
-    std::vector<float> state((size_t)num_heads * head_k_dim * head_v_dim);
-    ctx.memcpy_d2h(state.data(), cache.linear_state.data(), state.size() * sizeof(float));
+    std::vector<float>& state = cache.host_linear_state;
+    if (state.size() != (size_t)num_heads * (size_t)head_k_dim * (size_t)head_v_dim) {
+        state.assign((size_t)num_heads * (size_t)head_k_dim * (size_t)head_v_dim, 0.0f);
+    }
 
     std::vector<float> conv_in((size_t)seq_len * qkv_dim);
     std::vector<float> z((size_t)seq_len * z_dim);
@@ -564,12 +639,6 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
     std::vector<bf16> out_bf16(out.size());
     for (size_t i = 0; i < out.size(); ++i) out_bf16[i] = bf16(out[i]);
     ctx.memcpy_h2d(buf_.attn_out.data(), out_bf16.data(), out_bf16.size() * sizeof(bf16));
-    ctx.memcpy_h2d(cache.linear_state.data(), state.data(), state.size() * sizeof(float));
-
-    if (kernel > 1) {
-        ctx.memcpy_h2d(cache.linear_conv_state.data(), h_conv_state.data(),
-                       h_conv_state.size() * sizeof(float));
-    }
 }
 
 Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
@@ -702,22 +771,42 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             }
             layer.linear_o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
         } else {
-            layer.q_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
-            ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z, seq_len, full_q_heads_, full_head_dim_);
+            Tensor k_decode_view;
+            Tensor v_decode_view;
+            Tensor* k_for_attn = &buf_.k;
+            Tensor* v_for_attn = &buf_.v;
+
+            if (seq_len == 1) {
+                layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
+                bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
+                Tensor q_proj_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
+                k_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
+                v_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_, {1, (int64_t)full_kv_dim_});
+                k_for_attn = &k_decode_view;
+                v_for_attn = &v_decode_view;
+                if (cfg_.attn_output_gate) {
+                    ops::split_q_gate(ctx, q_proj_view, buf_.q, buf_.z, seq_len, full_q_heads_, full_head_dim_);
+                } else {
+                    ops::copy_tensor(ctx, q_proj_view, buf_.q, full_q_dim_);
+                }
+            } else {
+                layer.q_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
+                ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z, seq_len, full_q_heads_, full_head_dim_);
+                layer.k_proj.forward(ctx, buf_.normed, buf_.k, seq_len);
+                layer.v_proj.forward(ctx, buf_.normed, buf_.v, seq_len);
+            }
             if (debug_this_layer && seq_len > 0) {
                 char tag[64];
                 std::snprintf(tag, sizeof(tag), "layer%d_full_gate_z", i);
                 log_row_stats(tag, buf_.z, dbg_row, full_q_dim_);
             }
 
-            layer.k_proj.forward(ctx, buf_.normed, buf_.k, seq_len);
-            layer.v_proj.forward(ctx, buf_.normed, buf_.v, seq_len);
             ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
                                cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
-            ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight,
+            ops::head_rms_norm(ctx, *k_for_attn, *layer.k_norm_weight,
                                cfg_.rms_norm_eps, seq_len, full_kv_heads_, full_head_dim_);
 
-            ops::apply_rope_partial(ctx, buf_.q, buf_.k, seq_len, start_pos,
+            ops::apply_rope_partial(ctx, buf_.q, *k_for_attn, seq_len, start_pos,
                                     full_q_heads_, full_kv_heads_, full_head_dim_,
                                     full_rotary_dim, cfg_.rope.rope_theta,
                                     cfg_.rope.mrope_interleaved,
@@ -734,13 +823,13 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 std::snprintf(tag_k, sizeof(tag_k), "layer%d_full_k_after_rope", i);
                 std::snprintf(tag_v, sizeof(tag_v), "layer%d_full_v", i);
                 log_row_stats(tag_q, buf_.q, dbg_row, full_q_dim_);
-                log_row_stats(tag_k, buf_.k, dbg_row, full_kv_dim_);
-                log_row_stats(tag_v, buf_.v, dbg_row, full_kv_dim_);
+                log_row_stats(tag_k, *k_for_attn, dbg_row, full_kv_dim_);
+                log_row_stats(tag_v, *v_for_attn, dbg_row, full_kv_dim_);
             }
 
-            ops::copy_to_cache(ctx, buf_.k, cache.k, seq_len, start_pos,
+            ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
                                full_kv_heads_, full_head_dim_, max_seq_len_);
-            ops::copy_to_cache(ctx, buf_.v, cache.v, seq_len, start_pos,
+            ops::copy_to_cache(ctx, *v_for_attn, cache.v, seq_len, start_pos,
                                full_kv_heads_, full_head_dim_, max_seq_len_);
 
             if (seq_len == 1) {
@@ -787,9 +876,14 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             log_row_stats(tag2, buf_.normed, dbg_row, hidden_size_);
         }
 
-        layer.gate_proj.forward(ctx, buf_.normed, buf_.gate, seq_len);
-        layer.up_proj.forward(ctx, buf_.normed, buf_.up, seq_len);
-        ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
+        if (seq_len == 1) {
+            layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
+            ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
+        } else {
+            layer.gate_proj.forward(ctx, buf_.normed, buf_.gate, seq_len);
+            layer.up_proj.forward(ctx, buf_.normed, buf_.up, seq_len);
+            ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
+        }
         layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
 
         if (i < cfg_.num_hidden_layers - 1) {
@@ -861,6 +955,8 @@ void Qwen35HybridTextBackend::reset() {
             cache.linear_conv_state.context()->queue().memset(
                 cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
         }
+        std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
+        std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
     }
 }
 
