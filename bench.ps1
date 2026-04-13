@@ -8,48 +8,106 @@ param(
     [double]$Temperature = 0.7,
     [int]$TopK = 15,
     [double]$TopP = 0.95,
-    [UInt64]$Seed = 42
+    [UInt64]$Seed = 42,
+    [int]$WaitTimeoutSec = 3600
 )
 
 $ErrorActionPreference = "Stop"
 
-cmd /c '"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" && set' |
-    ForEach-Object {
-        if ($_ -match '^([^=]+)=(.*)$') {
-            [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+$mutexName = 'Global\AilaBenchSingleton'
+$mutex = [System.Threading.Mutex]::new($false, $mutexName)
+$hasMutex = $false
+
+function Acquire-BenchMutex {
+    param(
+        [System.Threading.Mutex]$Mutex,
+        [int]$TimeoutSec
+    )
+
+    try {
+        if ($Mutex.WaitOne(0)) {
+            return $true
         }
     }
-Write-Host ':: oneAPI environment initialized ::' -ForegroundColor Green
+    catch [System.Threading.AbandonedMutexException] {
+        Write-Host ':: benchmark mutex was abandoned, recovering lock ::' -ForegroundColor Yellow
+        return $true
+    }
 
-$root = "e:\RiderProjects\Aila"
-$buildDir = Join-Path $root "build"
-$logPath = Join-Path $root "bench_log.txt"
-$mode = if ($Sample.IsPresent) { "sample" } else { "greedy" }
+    if ($TimeoutSec -lt 0) {
+        Write-Host ':: another benchmark is running, waiting for lock ::' -ForegroundColor Yellow
+        try {
+            $Mutex.WaitOne() | Out-Null
+            return $true
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            Write-Host ':: benchmark mutex was abandoned while waiting, recovering lock ::' -ForegroundColor Yellow
+            return $true
+        }
+    }
 
-$header = "=== bench $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode model=$ModelDir pp=$PromptTokens tg=$GenTokens iters=$BenchIters warmup=$WarmupIters seed=$Seed temp=$Temperature topk=$TopK topp=$TopP ==="
-$header | Tee-Object -FilePath $logPath -Append | Out-Null
-
-Set-Location $buildDir
-
-$args = @(
-    "-m", $ModelDir,
-    "--bench",
-    "--bench-pp", "$PromptTokens",
-    "--bench-tg", "$GenTokens",
-    "--bench-iters", "$BenchIters",
-    "--bench-warmup", "$WarmupIters",
-    "--seed", "$Seed",
-    "-t", "$Temperature",
-    "-k", "$TopK",
-    "-p", "$TopP"
-)
-
-if ($Sample.IsPresent) {
-    $args += "--bench-sample"
-} else {
-    $args += "--bench-greedy"
+    Write-Host ":: another benchmark is running, waiting up to $TimeoutSec s for lock ::" -ForegroundColor Yellow
+    try {
+        return $Mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        Write-Host ':: benchmark mutex was abandoned while waiting, recovering lock ::' -ForegroundColor Yellow
+        return $true
+    }
 }
 
-& .\Aila.exe @args | Tee-Object -FilePath $logPath -Append
+try {
+    $hasMutex = Acquire-BenchMutex -Mutex $mutex -TimeoutSec $WaitTimeoutSec
+    if (-not $hasMutex) {
+        throw "Timed out waiting for benchmark lock after $WaitTimeoutSec seconds."
+    }
 
-Set-Location $root
+    cmd /c '"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" && set' |
+        ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+        }
+    Write-Host ':: oneAPI environment initialized ::' -ForegroundColor Green
+
+    $root = "e:\RiderProjects\Aila"
+    $buildDir = Join-Path $root "build"
+    $logPath = Join-Path $root "bench_log.txt"
+    $mode = if ($Sample.IsPresent) { "sample" } else { "greedy" }
+
+    $header = "=== bench $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode model=$ModelDir pp=$PromptTokens tg=$GenTokens iters=$BenchIters warmup=$WarmupIters seed=$Seed temp=$Temperature topk=$TopK topp=$TopP ==="
+    $header | Tee-Object -FilePath $logPath -Append | Out-Null
+
+    Push-Location $buildDir
+    try {
+        $args = @(
+            "-m", $ModelDir,
+            "--bench",
+            "--bench-pp", "$PromptTokens",
+            "--bench-tg", "$GenTokens",
+            "--bench-iters", "$BenchIters",
+            "--bench-warmup", "$WarmupIters",
+            "--seed", "$Seed",
+            "-t", "$Temperature",
+            "-k", "$TopK",
+            "-p", "$TopP"
+        )
+
+        if ($Sample.IsPresent) {
+            $args += "--bench-sample"
+        } else {
+            $args += "--bench-greedy"
+        }
+
+        & .\Aila.exe @args | Tee-Object -FilePath $logPath -Append
+    }
+    finally {
+        Pop-Location
+    }
+}
+finally {
+    if ($hasMutex) {
+        $mutex.ReleaseMutex()
+    }
+    $mutex.Dispose()
+}

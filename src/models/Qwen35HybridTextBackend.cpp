@@ -618,7 +618,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
 
     if (q_heads == num_heads && head_k_dim == head_v_dim) {
         const int head_dim = head_k_dim;
-        const int head_wg = std::max(32, aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_WG", 256));
+        const int head_wg = std::max(32, aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_WG", 128));
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
