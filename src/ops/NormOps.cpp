@@ -19,6 +19,32 @@ void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
 
     int wg_size = 256; // Intel A770 倾向于较大的 WG 以掩盖延迟
 
+    if (seq_len == 1) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
+                [=](sycl::nd_item<1> item) {
+                    int lid = item.get_local_id(0);
+
+                    float local_sum_sq = 0.0f;
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        float val = static_cast<float>(in_ptr[h]);
+                        local_sum_sq += val * val;
+                    }
+
+                    float group_sum = sycl::reduce_over_group(
+                        item.get_group(), local_sum_sq, sycl::plus<float>());
+                    float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
+
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        float val = static_cast<float>(in_ptr[h]);
+                        float w = static_cast<float>(w_ptr[h]);
+                        out_ptr[h] = bf16(val * inv_rms * w);
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> row_cache(sycl::range<1>(hidden_size), cgh);
         cgh.parallel_for(sycl::nd_range<1>(seq_len * wg_size, wg_size),
@@ -56,6 +82,76 @@ void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
     bf16* out_ptr = static_cast<bf16*>(output.data());
 
     int wg_size = 256;
+
+    if (seq_len == 1) {
+        if (hidden_size == 1024) {
+            constexpr int hidden = 1024;
+            constexpr int lanes_per_item = 4;
+            ctx.queue().submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
+                    [=](sycl::nd_item<1> item) {
+                        int lid = static_cast<int>(item.get_local_id(0));
+                        int base = lid * lanes_per_item;
+
+                        float v0 = static_cast<float>(in_ptr[base + 0]) +
+                                   static_cast<float>(res_ptr[base + 0]);
+                        float v1 = static_cast<float>(in_ptr[base + 1]) +
+                                   static_cast<float>(res_ptr[base + 1]);
+                        float v2 = static_cast<float>(in_ptr[base + 2]) +
+                                   static_cast<float>(res_ptr[base + 2]);
+                        float v3 = static_cast<float>(in_ptr[base + 3]) +
+                                   static_cast<float>(res_ptr[base + 3]);
+
+                        float local_sum_sq = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+                        float group_sum = sycl::reduce_over_group(
+                            item.get_group(), local_sum_sq, sycl::plus<float>());
+                        float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden) + eps);
+
+                        float w0 = static_cast<float>(w_ptr[base + 0]);
+                        float w1 = static_cast<float>(w_ptr[base + 1]);
+                        float w2 = static_cast<float>(w_ptr[base + 2]);
+                        float w3 = static_cast<float>(w_ptr[base + 3]);
+
+                        in_ptr[base + 0] = bf16(v0);
+                        in_ptr[base + 1] = bf16(v1);
+                        in_ptr[base + 2] = bf16(v2);
+                        in_ptr[base + 3] = bf16(v3);
+                        out_ptr[base + 0] = bf16(v0 * inv_rms * w0);
+                        out_ptr[base + 1] = bf16(v1 * inv_rms * w1);
+                        out_ptr[base + 2] = bf16(v2 * inv_rms * w2);
+                        out_ptr[base + 3] = bf16(v3 * inv_rms * w3);
+                    });
+            });
+            return;
+        }
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
+                [=](sycl::nd_item<1> item) {
+                    int lid = item.get_local_id(0);
+
+                    float local_sum_sq = 0.0f;
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        float val = static_cast<float>(in_ptr[h]) +
+                                    static_cast<float>(res_ptr[h]);
+                        local_sum_sq += val * val;
+                    }
+
+                    float group_sum = sycl::reduce_over_group(
+                        item.get_group(), local_sum_sq, sycl::plus<float>());
+                    float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
+
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        float val = static_cast<float>(in_ptr[h]) +
+                                    static_cast<float>(res_ptr[h]);
+                        float w = static_cast<float>(w_ptr[h]);
+                        in_ptr[h] = bf16(val);
+                        out_ptr[h] = bf16(val * inv_rms * w);
+                    }
+                });
+        });
+        return;
+    }
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> row_cache(sycl::range<1>(hidden_size), cgh);

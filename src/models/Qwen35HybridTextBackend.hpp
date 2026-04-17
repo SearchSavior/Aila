@@ -74,6 +74,7 @@ private:
         std::vector<float> host_linear_state;
         std::vector<float> host_linear_conv_state;
         bool device_state_dirty = false;
+        int linear_conv_head = 0; // Ring-buffer head for the oldest conv row.
     };
 
     struct Buffers {
@@ -104,6 +105,10 @@ private:
     void run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
                                      Tensor& qkv_src, Tensor& z_src,
                                      Tensor& a_src, Tensor& b_src);
+    void run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
+                                     Tensor& qkv_src, Tensor& z_src,
+                                     Tensor& a_src, Tensor& b_src,
+                                     Tensor& out_dst);
     void debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
                                            Layer& layer, LayerCache& cache,
                                            Tensor& qkv_src, Tensor& z_src,

@@ -249,6 +249,33 @@ void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_
     bf16* src_ptr = static_cast<bf16*>(gate_up.data());
     vec8* o_ptr = reinterpret_cast<vec8*>(output.data());
 
+    if (ff_dim == 3584) {
+        constexpr int wg_size = 256;
+        constexpr int chunk_count = 3584 / 8;
+        vec8* gate_ptr = reinterpret_cast<vec8*>(src_ptr);
+        vec8* up_ptr = reinterpret_cast<vec8*>(src_ptr + 3584);
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
+                [=](sycl::nd_item<1> item) {
+                    int lid = static_cast<int>(item.get_local_id(0));
+                    for (int chunk = lid; chunk < chunk_count; chunk += wg_size) {
+                        vec8 g_vec = gate_ptr[chunk];
+                        vec8 u_vec = up_ptr[chunk];
+                        vec8 o_vec;
+                        for (int k = 0; k < 8; ++k) {
+                            float g = static_cast<float>(g_vec[k]);
+                            float u = static_cast<float>(u_vec[k]);
+                            float silu_g = g / (1.0f + sycl::native::exp(-g));
+                            o_vec[k] = bf16(silu_g * u);
+                        }
+                        o_ptr[chunk] = o_vec;
+                    }
+                });
+        });
+        return;
+    }
+
     int n8 = ff_dim / 8;
 
     ctx.queue().parallel_for(sycl::range<1>(n8),
@@ -425,6 +452,28 @@ void sigmoid_mul(Context& ctx, Tensor& input, Tensor& gate, Tensor& output, int 
     bf16* in_ptr = static_cast<bf16*>(input.data());
     bf16* g_ptr = static_cast<bf16*>(gate.data());
     bf16* o_ptr = static_cast<bf16*>(output.data());
+
+    if ((n & 7) == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        vec8* in8_ptr = reinterpret_cast<vec8*>(input.data());
+        vec8* g8_ptr = reinterpret_cast<vec8*>(gate.data());
+        vec8* o8_ptr = reinterpret_cast<vec8*>(output.data());
+        int n8 = n / 8;
+
+        ctx.queue().parallel_for(sycl::range<1>(n8), [=](sycl::id<1> idx) {
+            vec8 in_vec = in8_ptr[idx];
+            vec8 g_vec = g8_ptr[idx];
+            vec8 o_vec;
+            for (int k = 0; k < 8; ++k) {
+                float in_v = static_cast<float>(in_vec[k]);
+                float g_v = static_cast<float>(g_vec[k]);
+                float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+                o_vec[k] = bf16(in_v * s);
+            }
+            o8_ptr[idx] = o_vec;
+        });
+        return;
+    }
 
     ctx.queue().parallel_for(sycl::range<1>(n), [=](sycl::id<1> idx) {
         int i = idx[0];

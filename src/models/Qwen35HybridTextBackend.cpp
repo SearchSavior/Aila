@@ -426,6 +426,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 cache.host_linear_conv_state.assign(
                     (size_t)std::max(0, linear_conv_kernel_dim_ - 1) * (size_t)linear_conv_channels_,
                     0.0f);
+                cache.linear_conv_head = 0;
             } else {
                 cache.k = Tensor::allocate(ctx,
                                            {(int64_t)linear_q_heads_, (int64_t)max_seq_len_, (int64_t)linear_head_dim_},
@@ -437,6 +438,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 cache.linear_conv_state = Tensor();
                 cache.host_linear_state.clear();
                 cache.host_linear_conv_state.clear();
+                cache.linear_conv_head = 0;
             }
         } else {
             Tensor* q_w = transpose_weight(prefix + "self_attn.q_proj.weight");
@@ -462,6 +464,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             cache.linear_conv_state = Tensor();
             cache.host_linear_state.clear();
             cache.host_linear_conv_state.clear();
+            cache.linear_conv_head = 0;
         }
 
         Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
@@ -510,7 +513,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     const char* linear_mode = "legacy-attn";
     if (use_delta_linear_) {
         linear_mode = use_device_linear_decode_
-            ? "delta-prefill-host/decode-gpu"
+            ? "delta-prefill-gpu-iter/decode-gpu-ring"
             : "delta-host";
     }
     AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback)",
@@ -589,6 +592,13 @@ void Qwen35HybridTextBackend::clear_mrope_positions() {
 void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
                                                           Tensor& qkv_src, Tensor& z_src,
                                                           Tensor& a_src, Tensor& b_src) {
+    run_linear_delta_decode_gpu(ctx, layer, cache, qkv_src, z_src, a_src, b_src, buf_.attn_out);
+}
+
+void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
+                                                          Tensor& qkv_src, Tensor& z_src,
+                                                          Tensor& a_src, Tensor& b_src,
+                                                          Tensor& out_dst) {
     const int qkv_dim = linear_qkv_dim_;
     const int z_dim = linear_z_dim_;
     const int q_dim = linear_q_dim_;
@@ -598,15 +608,17 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     const int head_k_dim = linear_head_dim_;
     const int head_v_dim = cfg_.linear_value_head_dim;
     const int kernel = linear_conv_kernel_dim_;
+    const int conv_rows = std::max(0, kernel - 1);
+    const int conv_head = (conv_rows > 0) ? (cache.linear_conv_head % conv_rows) : 0;
     const float eps = cfg_.rms_norm_eps;
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
-    const int wg = std::max(64, aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_WG", 256));
+    constexpr int wg = 256;
 
     bf16* qkv_ptr = static_cast<bf16*>(qkv_src.data());
     bf16* z_ptr = static_cast<bf16*>(z_src.data());
     bf16* a_ptr = static_cast<bf16*>(a_src.data());
     bf16* b_ptr = static_cast<bf16*>(b_src.data());
-    bf16* out_ptr = static_cast<bf16*>(buf_.attn_out.data());
+    bf16* out_ptr = static_cast<bf16*>(out_dst.data());
     float* state_ptr = static_cast<float*>(cache.linear_state.data());
     float* conv_state_ptr = cache.linear_conv_state.valid()
         ? static_cast<float*>(cache.linear_conv_state.data())
@@ -618,7 +630,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
 
     if (q_heads == num_heads && head_k_dim == head_v_dim) {
         const int head_dim = head_k_dim;
-        const int head_wg = std::max(32, aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_WG", 128));
+        constexpr int head_wg = 128;
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
@@ -640,9 +652,10 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     auto conv_channel = [&](int channel) {
                         float v = 0.0f;
                         bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
-                        if (kernel > 1 && conv_state_ptr) {
+                        if (conv_rows > 0 && conv_state_ptr) {
                             for (int j = 0; j < kernel - 1; ++j) {
-                                v += conv_state_ptr[static_cast<size_t>(j) * qkv_dim + channel]
+                                int row = (conv_head + j) % conv_rows;
+                                v += conv_state_ptr[static_cast<size_t>(row) * qkv_dim + channel]
                                     * static_cast<float>(w[j]);
                             }
                         }
@@ -667,25 +680,14 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    if (kernel > 1 && conv_state_ptr) {
-                        for (int row = 0; row < kernel - 2; ++row) {
-                            size_t dst = static_cast<size_t>(row) * qkv_dim;
-                            size_t src = static_cast<size_t>(row + 1) * qkv_dim;
-                            for (int d = lid; d < head_dim; d += head_wg) {
-                                conv_state_ptr[dst + q_base + d] = conv_state_ptr[src + q_base + d];
-                                conv_state_ptr[dst + k_base + d] = conv_state_ptr[src + k_base + d];
-                                conv_state_ptr[dst + v_base + d] = conv_state_ptr[src + v_base + d];
-                            }
-                            item.barrier(sycl::access::fence_space::global_and_local);
-                        }
+                    if (conv_rows > 0 && conv_state_ptr) {
+                        size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
                         for (int d = lid; d < head_dim; d += head_wg) {
-                            size_t dst = static_cast<size_t>(kernel - 2) * qkv_dim;
                             conv_state_ptr[dst + q_base + d] = static_cast<float>(qkv_ptr[q_base + d]);
                             conv_state_ptr[dst + k_base + d] = static_cast<float>(qkv_ptr[k_base + d]);
                             conv_state_ptr[dst + v_base + d] = static_cast<float>(qkv_ptr[v_base + d]);
                         }
                     }
-                    item.barrier(sycl::access::fence_space::global_and_local);
 
                     float q_sq = 0.0f;
                     float k_sq = 0.0f;
@@ -745,6 +747,9 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                 });
         });
         cache.device_state_dirty = true;
+        if (conv_rows > 0) {
+            cache.linear_conv_head = (conv_head + 1) % conv_rows;
+        }
         return;
     }
 
@@ -778,9 +783,10 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                 for (int c = lid; c < qkv_dim; c += wg) {
                     float v = 0.0f;
                     bf16* w = conv_w_ptr + static_cast<size_t>(c) * kernel;
-                    if (kernel > 1 && conv_state_ptr) {
+                    if (conv_rows > 0 && conv_state_ptr) {
                         for (int j = 0; j < kernel - 1; ++j) {
-                            v += conv_state_ptr[static_cast<size_t>(j) * qkv_dim + c]
+                            int row = (conv_head + j) % conv_rows;
+                            v += conv_state_ptr[static_cast<size_t>(row) * qkv_dim + c]
                                 * static_cast<float>(w[j]);
                         }
                     }
@@ -796,21 +802,12 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                if (kernel > 1 && conv_state_ptr) {
-                    for (int row = 0; row < kernel - 2; ++row) {
-                        size_t dst_base = static_cast<size_t>(row) * qkv_dim;
-                        size_t src_base = static_cast<size_t>(row + 1) * qkv_dim;
-                        for (int c = lid; c < qkv_dim; c += wg) {
-                            conv_state_ptr[dst_base + c] = conv_state_ptr[src_base + c];
-                        }
-                        item.barrier(sycl::access::fence_space::global_and_local);
-                    }
+                if (conv_rows > 0 && conv_state_ptr) {
+                    size_t dst_base = static_cast<size_t>(conv_head) * qkv_dim;
                     for (int idx = lid; idx < qkv_dim; idx += wg) {
-                        conv_state_ptr[static_cast<size_t>(kernel - 2) * qkv_dim + idx]
-                            = static_cast<float>(qkv_ptr[idx]);
+                        conv_state_ptr[dst_base + idx] = static_cast<float>(qkv_ptr[idx]);
                     }
                 }
-                item.barrier(sycl::access::fence_space::global_and_local);
 
                 for (int h = lid; h < q_heads; h += wg) {
                     float q_sum = 0.0f;
@@ -889,6 +886,9 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     });
 
     cache.device_state_dirty = true;
+    if (conv_rows > 0) {
+        cache.linear_conv_head = (conv_head + 1) % conv_rows;
+    }
 }
 
 void Qwen35HybridTextBackend::debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
@@ -1287,10 +1287,33 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     });
                 } else {
                     layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                    ops::split_linear_all(ctx, buf_.linear_all, buf_.qkv, buf_.z, buf_.a, buf_.b,
-                                          seq_len, linear_qkv_dim_, linear_z_dim_,
-                                          linear_kv_heads_, linear_kv_heads_);
-                    run_linear_delta_host(ctx, layer, cache, buf_.qkv, buf_.z, buf_.a, buf_.b, seq_len);
+                    if (use_device_linear_decode_) {
+                        bf16* fused_base = static_cast<bf16*>(buf_.linear_all.data());
+                        bf16* out_base = static_cast<bf16*>(buf_.attn_out.data());
+                        const int64_t fused_stride = buf_.linear_all.shape(1);
+                        const int64_t out_stride = buf_.attn_out.shape(1);
+                        for (int t = 0; t < seq_len; ++t) {
+                            bf16* row_ptr = fused_base + static_cast<size_t>(t) * fused_stride;
+                            Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)linear_qkv_dim_});
+                            Tensor z_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_,
+                                                         {1, (int64_t)linear_z_dim_});
+                            Tensor a_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_ + linear_z_dim_,
+                                                         {1, (int64_t)linear_kv_heads_});
+                            Tensor b_view = Tensor::view(ctx,
+                                                         row_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
+                                                         {1, (int64_t)linear_kv_heads_});
+                            Tensor out_view = Tensor::view(ctx,
+                                                           out_base + static_cast<size_t>(t) * out_stride,
+                                                           {1, (int64_t)linear_kv_dim_});
+                            run_linear_delta_decode_gpu(ctx, layer, cache,
+                                                        qkv_view, z_view, a_view, b_view, out_view);
+                        }
+                    } else {
+                        ops::split_linear_all(ctx, buf_.linear_all, buf_.qkv, buf_.z, buf_.a, buf_.b,
+                                              seq_len, linear_qkv_dim_, linear_z_dim_,
+                                              linear_kv_heads_, linear_kv_heads_);
+                        run_linear_delta_host(ctx, layer, cache, buf_.qkv, buf_.z, buf_.a, buf_.b, seq_len);
+                    }
                 }
             } else {
                 layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
@@ -1638,6 +1661,7 @@ void Qwen35HybridTextBackend::reset() {
         std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
         std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
         cache.device_state_dirty = false;
+        cache.linear_conv_head = 0;
     }
 }
 

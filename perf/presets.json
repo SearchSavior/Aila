@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "models": {
+    "q35_text": {
+      "path": "Qwen3.5-0.8B",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-0.8B text anchor"
+    },
+    "q3_06": {
+      "path": "Qwen3-0.6B",
+      "maxSeqLen": 4096,
+      "description": "Qwen3-0.6B smoke regression"
+    },
+    "q3_4": {
+      "path": "Qwen3-4B",
+      "maxSeqLen": 4096,
+      "description": "Qwen3-4B smoke regression"
+    }
+  },
+  "presets": {
+    "phase_gate_q35_text": {
+      "anchorModel": "q35_text",
+      "build": {
+        "buildDir": "build",
+        "config": "Release",
+        "jobs": 36,
+        "clean": false
+      },
+      "benchmarks": [
+        {
+          "name": "greedy_short",
+          "promptTokens": 64,
+          "genTokens": 64,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "greedy",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        },
+        {
+          "name": "greedy_main",
+          "promptTokens": 256,
+          "genTokens": 256,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "greedy",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        },
+        {
+          "name": "sample_main",
+          "promptTokens": 256,
+          "genTokens": 256,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "sample",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        }
+      ],
+      "decodeProfile": {
+        "name": "decode_profile_main",
+        "promptTokens": 128,
+        "genTokens": 128,
+        "benchIters": 1,
+        "warmupIters": 1,
+        "mode": "greedy",
+        "temperature": 0.7,
+        "topK": 15,
+        "topP": 0.95,
+        "seed": 42,
+        "profileEvery": 32
+      },
+      "smokes": [
+        {
+          "name": "q35_text_smoke",
+          "modelAlias": "q35_text",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectContainsAny": ["2", "二", "两"]
+        },
+        {
+          "name": "q35_multiturn_smoke",
+          "modelAlias": "q35_text",
+          "messagesJson": "perf/fixtures/smoke_multi_turn.json",
+          "maxTokens": 24,
+          "mode": "sample",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42,
+          "expectNonEmpty": true,
+          "expectContainsAny": ["Alice", "alice", "爱丽丝"]
+        },
+        {
+          "name": "q3_06_smoke",
+          "modelAlias": "q3_06",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        },
+        {
+          "name": "q3_4_smoke",
+          "modelAlias": "q3_4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        }
+      ],
+      "autotune": {
+        "enabled": false,
+        "benchmarkCase": "greedy_main",
+        "objective": "decodeTokPerSec",
+        "envMatrix": {
+          "AILA_ATTN_DECODE_WG": [256, 512],
+          "AILA_ATTN_JM_TILE": [0, 1, 2]
+        }
+      }
+    }
+  }
+}
