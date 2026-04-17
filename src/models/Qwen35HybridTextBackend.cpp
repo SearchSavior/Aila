@@ -635,20 +635,19 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> v_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> z_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> head_params(sycl::range<1>(2), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
                 [=](sycl::nd_item<1> item) {
                     auto softplus_dev = [](float x) {
                         if (x > 20.0f) return x;
-                        if (x < -20.0f) return sycl::exp(x);
-                        return sycl::log1p(sycl::exp(x));
+                        if (x < -20.0f) return sycl::native::exp(x);
+                        return sycl::log1p(sycl::native::exp(x));
                     };
                     auto silu_dev = [](float x) {
-                        return x / (1.0f + sycl::exp(-x));
+                        return x / (1.0f + sycl::native::exp(-x));
                     };
 
                     int hv = static_cast<int>(item.get_group(0));
@@ -659,6 +658,8 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     int v_base = q_dim + q_dim + hv * head_dim;
                     int z_base = hv * head_dim;
                     float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
+                    float v_reg = 0.0f;
+                    float z_reg = 0.0f;
 
                     if (lid < head_dim) {
                         auto conv_channel = [&](int channel) {
@@ -675,8 +676,8 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
 
                         q_local[lid] = conv_channel(q_base + lid);
                         k_local[lid] = conv_channel(k_base + lid);
-                        v_local[lid] = conv_channel(v_base + lid);
-                        z_local[lid] = static_cast<float>(z_ptr[z_base + lid]);
+                        v_reg = conv_channel(v_base + lid);
+                        z_reg = static_cast<float>(z_ptr[z_base + lid]);
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
@@ -700,11 +701,18 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    float beta = 1.0f / (1.0f + sycl::exp(-static_cast<float>(b_ptr[hv])));
-                    float alpha = static_cast<float>(a_ptr[hv]);
-                    float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
-                                * (-sycl::exp(a_log_ptr[hv]));
-                    float decay = sycl::exp(g_pre);
+                    if (lid == 0) {
+                        float beta = 1.0f / (1.0f + sycl::native::exp(-static_cast<float>(b_ptr[hv])));
+                        float alpha = static_cast<float>(a_ptr[hv]);
+                        float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
+                                    * (-sycl::native::exp(a_log_ptr[hv]));
+                        head_params[0] = beta;
+                        head_params[1] = sycl::native::exp(g_pre);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    float beta = head_params[0];
+                    float decay = head_params[1];
 
                     if (lid < head_dim) {
                         const int dv = lid;
@@ -728,7 +736,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                                    sv3 * k_local[j + 3];
                         }
 
-                        float dval = (v_local[dv] - acc) * beta;
+                        float dval = (v_reg - acc) * beta;
                         float out = 0.0f;
                         for (int j = 0; j < head_dim; j += 4) {
                             const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
@@ -758,7 +766,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
 
                     if (lid < head_dim) {
                         float n = out_local[lid] * out_scale * norm_w_ptr[lid];
-                        out_ptr[hv * head_dim + lid] = bf16(n * silu_dev(z_local[lid]));
+                        out_ptr[hv * head_dim + lid] = bf16(n * silu_dev(z_reg));
                     }
                 });
         });
