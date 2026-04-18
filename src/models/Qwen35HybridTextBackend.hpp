@@ -109,6 +109,8 @@ private:
                                      Tensor& qkv_src, Tensor& z_src,
                                      Tensor& a_src, Tensor& b_src,
                                      Tensor& out_dst);
+    void run_linear_delta_prefill_gpu_batched(Context& ctx, Layer& layer, LayerCache& cache,
+                                              Tensor& fused_all, Tensor& out_dst, int seq_len);
     void debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
                                            Layer& layer, LayerCache& cache,
                                            Tensor& qkv_src, Tensor& z_src,

@@ -914,6 +914,221 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     }
 }
 
+void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
+    Context& ctx, Layer& layer, LayerCache& cache,
+    Tensor& fused_all, Tensor& out_dst, int seq_len) {
+
+    const int qkv_dim = linear_qkv_dim_;
+    const int z_dim = linear_z_dim_;
+    const int q_dim = linear_q_dim_;
+    const int kv_dim = linear_kv_dim_;
+    const int num_heads = linear_kv_heads_;
+    const int q_heads = std::max(1, linear_q_heads_);
+    const int head_k_dim = linear_head_dim_;
+    const int head_v_dim = cfg_.linear_value_head_dim;
+    const int kernel = linear_conv_kernel_dim_;
+    const int conv_rows = std::max(0, kernel - 1);
+    int conv_head = (conv_rows > 0) ? (cache.linear_conv_head % conv_rows) : 0;
+    const float eps = cfg_.rms_norm_eps;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
+    const int all_dim = linear_all_dim_;
+
+    bf16* fused_ptr = static_cast<bf16*>(fused_all.data());
+    bf16* out_ptr = static_cast<bf16*>(out_dst.data());
+    float* state_ptr = static_cast<float*>(cache.linear_state.data());
+    float* conv_state_ptr = cache.linear_conv_state.valid()
+        ? static_cast<float*>(cache.linear_conv_state.data())
+        : nullptr;
+    bf16* conv_w_ptr = static_cast<bf16*>(layer.linear_conv1d_weight->data());
+    float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
+    float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
+    bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
+
+    if (q_heads == num_heads && head_k_dim == head_v_dim && head_k_dim == 128 && kernel == 4 && conv_rows == 3) {
+        constexpr int head_dim = 128;
+        constexpr int head_wg = 128;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
+            sycl::local_accessor<float, 1> head_params(sycl::range<1>(2), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
+                [=](sycl::nd_item<1> item) {
+                    auto softplus_dev = [](float x) {
+                        if (x > 20.0f) return x;
+                        if (x < -20.0f) return sycl::native::exp(x);
+                        return sycl::log1p(sycl::native::exp(x));
+                    };
+                    auto silu_dev = [](float x) {
+                        return x / (1.0f + sycl::native::exp(-x));
+                    };
+
+                    int hv = static_cast<int>(item.get_group(0));
+                    int hk = hv;
+                    int lid = static_cast<int>(item.get_local_id(0));
+                    int q_base = hk * head_dim;
+                    int k_base = q_dim + hk * head_dim;
+                    int v_base = q_dim + q_dim + hv * head_dim;
+                    int z_base_offset = qkv_dim + hv * head_dim;
+                    int a_offset = qkv_dim + z_dim;
+                    int b_offset = qkv_dim + z_dim + num_heads;
+                    float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
+
+                    int local_conv_head = conv_head;
+
+                    for (int t = 0; t < seq_len; ++t) {
+                        bf16* row = fused_ptr + static_cast<size_t>(t) * all_dim;
+                        bf16* out_row = out_ptr + static_cast<size_t>(t) * kv_dim;
+
+                        float v_reg = 0.0f;
+                        float z_reg = 0.0f;
+
+                        const int row0 = local_conv_head;
+                        const int row1 = (local_conv_head + 1) % conv_rows;
+                        const int row2 = (local_conv_head + 2) % conv_rows;
+
+                        if (lid < head_dim) {
+                            auto conv_channel = [&](int channel) {
+                                const size_t state0 = static_cast<size_t>(row0) * qkv_dim + channel;
+                                const size_t state1 = static_cast<size_t>(row1) * qkv_dim + channel;
+                                const size_t state2 = static_cast<size_t>(row2) * qkv_dim + channel;
+                                bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
+                                float v = conv_state_ptr[state0] * static_cast<float>(w[0]) +
+                                          conv_state_ptr[state1] * static_cast<float>(w[1]) +
+                                          conv_state_ptr[state2] * static_cast<float>(w[2]) +
+                                          static_cast<float>(row[channel]) * static_cast<float>(w[3]);
+                                return silu_dev(v);
+                            };
+
+                            q_local[lid] = conv_channel(q_base + lid);
+                            k_local[lid] = conv_channel(k_base + lid);
+                            v_reg = conv_channel(v_base + lid);
+                            z_reg = static_cast<float>(row[z_base_offset + lid]);
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        if (lid < head_dim) {
+                            size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
+                            conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
+                            conv_state_ptr[dst + k_base + lid] = static_cast<float>(row[k_base + lid]);
+                            conv_state_ptr[dst + v_base + lid] = static_cast<float>(row[v_base + lid]);
+                        }
+
+                        float q_sq = (lid < head_dim) ? (q_local[lid] * q_local[lid]) : 0.0f;
+                        float k_sq = (lid < head_dim) ? (k_local[lid] * k_local[lid]) : 0.0f;
+                        q_sq = sycl::reduce_over_group(item.get_group(), q_sq, sycl::plus<float>());
+                        k_sq = sycl::reduce_over_group(item.get_group(), k_sq, sycl::plus<float>());
+                        float q_scale = 1.0f / sycl::sqrt(q_sq + eps);
+                        float k_scale = 1.0f / sycl::sqrt(k_sq + eps);
+
+                        if (lid < head_dim) {
+                            q_local[lid] *= q_scale;
+                            k_local[lid] *= k_scale;
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        if (lid == 0) {
+                            float beta = 1.0f / (1.0f + sycl::native::exp(-static_cast<float>(row[b_offset + hv])));
+                            float alpha = static_cast<float>(row[a_offset + hv]);
+                            float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
+                                        * (-sycl::native::exp(a_log_ptr[hv]));
+                            head_params[0] = beta;
+                            head_params[1] = sycl::native::exp(g_pre);
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        float beta = head_params[0];
+                        float decay = head_params[1];
+
+                        if (lid < head_dim) {
+                            const int dv = lid;
+                            float acc = 0.0f;
+                            for (int j = 0; j < head_dim; j += 4) {
+                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
+                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
+                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
+                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
+                                float sv0 = S[off0] * decay;
+                                float sv1 = S[off1] * decay;
+                                float sv2 = S[off2] * decay;
+                                float sv3 = S[off3] * decay;
+                                S[off0] = sv0;
+                                S[off1] = sv1;
+                                S[off2] = sv2;
+                                S[off3] = sv3;
+                                acc += sv0 * k_local[j + 0] +
+                                       sv1 * k_local[j + 1] +
+                                       sv2 * k_local[j + 2] +
+                                       sv3 * k_local[j + 3];
+                            }
+
+                            float dval = (v_reg - acc) * beta;
+                            float out = 0.0f;
+                            for (int j = 0; j < head_dim; j += 4) {
+                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
+                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
+                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
+                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
+                                float sv0 = S[off0] + k_local[j + 0] * dval;
+                                float sv1 = S[off1] + k_local[j + 1] * dval;
+                                float sv2 = S[off2] + k_local[j + 2] * dval;
+                                float sv3 = S[off3] + k_local[j + 3] * dval;
+                                S[off0] = sv0;
+                                S[off1] = sv1;
+                                S[off2] = sv2;
+                                S[off3] = sv3;
+                                out += sv0 * q_local[j + 0] +
+                                       sv1 * q_local[j + 1] +
+                                       sv2 * q_local[j + 2] +
+                                       sv3 * q_local[j + 3];
+                            }
+                            out_local[dv] = out * scale;
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        float out_sq = (lid < head_dim) ? (out_local[lid] * out_local[lid]) : 0.0f;
+                        out_sq = sycl::reduce_over_group(item.get_group(), out_sq, sycl::plus<float>());
+                        float out_scale = 1.0f / sycl::sqrt(out_sq / static_cast<float>(head_dim) + eps);
+
+                        if (lid < head_dim) {
+                            float n = out_local[lid] * out_scale * norm_w_ptr[lid];
+                            out_row[hv * head_dim + lid] = bf16(n * silu_dev(z_reg));
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        local_conv_head = (local_conv_head + 1) % conv_rows;
+                    }
+                });
+        });
+
+        cache.device_state_dirty = true;
+        cache.linear_conv_head = (conv_head + seq_len) % conv_rows;
+        return;
+    }
+
+    // Fallback: per-token iteration for non-standard shapes
+    bf16* out_base = static_cast<bf16*>(out_dst.data());
+    const int64_t fused_stride = fused_all.shape(1);
+    const int64_t out_stride = out_dst.shape(1);
+    for (int t = 0; t < seq_len; ++t) {
+        bf16* row_ptr = fused_ptr + static_cast<size_t>(t) * fused_stride;
+        Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)qkv_dim});
+        Tensor z_view = Tensor::view(ctx, row_ptr + qkv_dim, {1, (int64_t)z_dim});
+        Tensor a_view = Tensor::view(ctx, row_ptr + qkv_dim + z_dim,
+                                     {1, (int64_t)num_heads});
+        Tensor b_view = Tensor::view(ctx, row_ptr + qkv_dim + z_dim + num_heads,
+                                     {1, (int64_t)num_heads});
+        Tensor out_view = Tensor::view(ctx,
+                                       out_base + static_cast<size_t>(t) * out_stride,
+                                       {1, (int64_t)kv_dim});
+        run_linear_delta_decode_gpu(ctx, layer, cache,
+                                    qkv_view, z_view, a_view, b_view, out_view);
+    }
+}
+
 void Qwen35HybridTextBackend::debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
                                                                 Layer& layer, LayerCache& cache,
                                                                 Tensor& qkv_src, Tensor& z_src,
@@ -1294,26 +1509,8 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     });
                 } else {
                     layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                    bf16* fused_base = static_cast<bf16*>(buf_.linear_all.data());
-                    bf16* out_base = static_cast<bf16*>(buf_.attn_out.data());
-                    const int64_t fused_stride = buf_.linear_all.shape(1);
-                    const int64_t out_stride = buf_.attn_out.shape(1);
-                    for (int t = 0; t < seq_len; ++t) {
-                        bf16* row_ptr = fused_base + static_cast<size_t>(t) * fused_stride;
-                        Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)linear_qkv_dim_});
-                        Tensor z_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_,
-                                                     {1, (int64_t)linear_z_dim_});
-                        Tensor a_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_ + linear_z_dim_,
-                                                     {1, (int64_t)linear_kv_heads_});
-                        Tensor b_view = Tensor::view(ctx,
-                                                     row_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
-                                                     {1, (int64_t)linear_kv_heads_});
-                        Tensor out_view = Tensor::view(ctx,
-                                                       out_base + static_cast<size_t>(t) * out_stride,
-                                                       {1, (int64_t)linear_kv_dim_});
-                        run_linear_delta_decode_gpu(ctx, layer, cache,
-                                                    qkv_view, z_view, a_view, b_view, out_view);
-                    }
+                    run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
+                                                         buf_.linear_all, buf_.attn_out, seq_len);
                 }
             } else {
                 layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
