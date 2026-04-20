@@ -16,7 +16,7 @@ int round_up_seq(int v, int granularity) {
     return ((v + granularity - 1) / granularity) * granularity;
 }
 
-enum class DecodeStage : int {
+enum class ProfileStage : int {
     EmbedNorm = 0,
     LinearProj,
     LinearDelta,
@@ -37,12 +37,14 @@ enum class DecodeStage : int {
     Count,
 };
 
-struct DecodeProfileTotals {
-    std::array<double, static_cast<size_t>(DecodeStage::Count)> stage_ms{};
+struct StageProfileTotals {
+    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
+    int calls = 0;
     int tokens = 0;
 
     void reset() {
         stage_ms.fill(0.0);
+        calls = 0;
         tokens = 0;
     }
 };
@@ -1614,11 +1616,15 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         throw std::runtime_error("Qwen35HybridTextBackend::forward: seq_len must be positive");
     }
     bool profile_decode = (seq_len == 1) && aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
-    int profile_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
-    std::array<double, static_cast<size_t>(DecodeStage::Count)> stage_ms{};
-    bool profile_host_only = profile_decode && aila::env::read_flag("AILA_PROFILE_Q35_HOST_ONLY", false);
-    auto time_stage = [&](DecodeStage stage, auto&& fn) {
-        if (!profile_decode) {
+    bool profile_prefill = (seq_len > 1) && aila::env::read_flag("AILA_PROFILE_Q35_PREFILL", false);
+    int profile_every = profile_decode
+        ? std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32))
+        : std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_PREFILL_EVERY", 1));
+    bool profile_enabled = profile_decode || profile_prefill;
+    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
+    bool profile_host_only = profile_enabled && aila::env::read_flag("AILA_PROFILE_Q35_HOST_ONLY", false);
+    auto time_stage = [&](ProfileStage stage, auto&& fn) {
+        if (!profile_enabled) {
             fn();
             return;
         }
@@ -1644,7 +1650,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
-    time_stage(DecodeStage::EmbedNorm, [&] {
+    time_stage(ProfileStage::EmbedNorm, [&] {
         ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, hidden_size_);
         if (!embed_override_positions_.empty() && embed_override_hidden_size_ == hidden_size_) {
             bf16* hidden_ptr = static_cast<bf16*>(buf_.hidden.data());
@@ -1705,7 +1711,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         if (layer.is_linear) {
             if (use_delta_linear_) {
                 if (seq_len == 1) {
-                    time_stage(DecodeStage::LinearProj, [&] {
+                    time_stage(ProfileStage::LinearProj, [&] {
                         if (use_decode_jm_custom_path(seq_len) && layer.linear_all_weight_jm != nullptr) {
                             run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.linear_all_weight_jm,
                                                         hidden_size_, linear_all_dim_, buf_.linear_all);
@@ -1713,7 +1719,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                             layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
                         }
                     });
-                    time_stage(DecodeStage::LinearDelta, [&] {
+                    time_stage(ProfileStage::LinearDelta, [&] {
                         bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
                         Tensor qkv_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)linear_qkv_dim_});
                         Tensor z_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_, {1, (int64_t)linear_z_dim_});
@@ -1724,16 +1730,24 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                         run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
                     });
                 } else {
-                    layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                    run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
-                                                         buf_.linear_all, buf_.attn_out, seq_len);
+                    time_stage(ProfileStage::LinearProj, [&] {
+                        layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
+                    });
+                    time_stage(ProfileStage::LinearDelta, [&] {
+                        run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
+                                                             buf_.linear_all, buf_.attn_out, seq_len);
+                    });
                 }
             } else {
-                layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
-                ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v,
-                               seq_len, linear_q_dim_, linear_q_dim_);
+                time_stage(ProfileStage::LinearProj, [&] {
+                    layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
+                });
+                time_stage(ProfileStage::FullSplit, [&] {
+                    ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v,
+                                   seq_len, linear_q_dim_, linear_q_dim_);
+                });
 
-                {
+                time_stage(ProfileStage::QkNormRope, [&] {
                     std::vector<bf16> hq((size_t)seq_len * linear_q_dim_);
                     std::vector<bf16> hk((size_t)seq_len * linear_q_dim_);
                     std::vector<float> fq((size_t)seq_len * linear_q_dim_);
@@ -1752,29 +1766,35 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     }
                     ctx.memcpy_h2d(buf_.q.data(), hq.data(), hq.size() * sizeof(bf16));
                     ctx.memcpy_h2d(buf_.k.data(), hk.data(), hk.size() * sizeof(bf16));
-                }
+                });
 
-                ops::copy_to_cache(ctx, buf_.k, cache.k, seq_len, start_pos,
-                                   linear_q_heads_, linear_head_dim_, max_seq_len_);
-                ops::copy_to_cache(ctx, buf_.v, cache.v, seq_len, start_pos,
-                                   linear_kv_heads_, cfg_.linear_value_head_dim, max_seq_len_);
+                time_stage(ProfileStage::KvCache, [&] {
+                    ops::copy_to_cache(ctx, buf_.k, cache.k, seq_len, start_pos,
+                                       linear_q_heads_, linear_head_dim_, max_seq_len_);
+                    ops::copy_to_cache(ctx, buf_.v, cache.v, seq_len, start_pos,
+                                       linear_kv_heads_, cfg_.linear_value_head_dim, max_seq_len_);
+                });
 
-                if (seq_len == 1) {
-                    ops::attention_decode(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
-                                          linear_q_heads_, linear_kv_heads_, linear_head_dim_, cached_len);
-                } else if (start_pos == 0) {
-                    ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,
-                                           seq_len, linear_q_heads_, linear_kv_heads_, linear_head_dim_);
-                } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores,
-                                                  seq_len, start_pos, linear_q_heads_, linear_kv_heads_,
-                                                  linear_head_dim_, max_seq_len_);
-                }
+                time_stage(ProfileStage::Attention, [&] {
+                    if (seq_len == 1) {
+                        ops::attention_decode(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
+                                              linear_q_heads_, linear_kv_heads_, linear_head_dim_, cached_len);
+                    } else if (start_pos == 0) {
+                        ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,
+                                               seq_len, linear_q_heads_, linear_kv_heads_, linear_head_dim_);
+                    } else {
+                        ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores,
+                                                      seq_len, start_pos, linear_q_heads_, linear_kv_heads_,
+                                                      linear_head_dim_, max_seq_len_);
+                    }
+                });
 
-                layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
-                ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * linear_kv_dim_);
+                time_stage(ProfileStage::AttnGate, [&] {
+                    layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
+                    ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * linear_kv_dim_);
+                });
             }
-            time_stage(DecodeStage::LinearOProj, [&] {
+            time_stage(ProfileStage::LinearOProj, [&] {
                 if (use_decode_jm_custom_path(seq_len) && layer.linear_o_weight_jm != nullptr) {
                     run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.linear_o_weight_jm,
                                                 linear_kv_dim_, hidden_size_, buf_.gate);
@@ -1792,7 +1812,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             Tensor* v_for_attn = &buf_.v;
 
             if (seq_len == 1) {
-                time_stage(DecodeStage::FullQkvProj, [&] {
+                time_stage(ProfileStage::FullQkvProj, [&] {
                     if (use_decode_jm_custom_path(seq_len) && layer.qkv_weight_jm != nullptr) {
                         run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.qkv_weight_jm,
                                                     hidden_size_, full_fused_qkv_dim_, buf_.full_qkv);
@@ -1800,7 +1820,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                         layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
                     }
                 });
-                time_stage(DecodeStage::FullSplit, [&] {
+                time_stage(ProfileStage::FullSplit, [&] {
                     bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
                     if (cfg_.attn_output_gate) {
                         q_gate_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
@@ -1815,15 +1835,19 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     v_for_attn = &v_decode_view;
                 });
             } else {
-                layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
-                ops::split_qkv(ctx, buf_.full_qkv, buf_.qkv, buf_.k, buf_.v,
-                               seq_len, full_q_proj_dim_, full_kv_dim_);
-                if (cfg_.attn_output_gate) {
-                    ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z,
-                                      seq_len, full_q_heads_, full_head_dim_);
-                } else {
-                    ops::copy_tensor(ctx, buf_.qkv, buf_.q, seq_len * full_q_dim_);
-                }
+                time_stage(ProfileStage::FullQkvProj, [&] {
+                    layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
+                });
+                time_stage(ProfileStage::FullSplit, [&] {
+                    ops::split_qkv(ctx, buf_.full_qkv, buf_.qkv, buf_.k, buf_.v,
+                                   seq_len, full_q_proj_dim_, full_kv_dim_);
+                    if (cfg_.attn_output_gate) {
+                        ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z,
+                                          seq_len, full_q_heads_, full_head_dim_);
+                    } else {
+                        ops::copy_tensor(ctx, buf_.qkv, buf_.q, seq_len * full_q_dim_);
+                    }
+                });
             }
             if (debug_this_layer && seq_len > 0 && cfg_.attn_output_gate) {
                 char tag[64];
@@ -1831,7 +1855,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 log_row_stats(tag, buf_.z, dbg_row, full_q_dim_);
             }
 
-            time_stage(DecodeStage::QkNormRope, [&] {
+            time_stage(ProfileStage::QkNormRope, [&] {
                 if (seq_len == 1) {
                     if (cfg_.attn_output_gate) {
                         ops::decode_prepare_qgkv_packed_partial(ctx, q_gate_decode_view, *k_for_attn, *v_for_attn,
@@ -1890,7 +1914,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 log_row_stats(tag_v, *v_for_attn, dbg_row, full_kv_dim_);
             }
 
-            time_stage(DecodeStage::KvCache, [&] {
+            time_stage(ProfileStage::KvCache, [&] {
                 if (seq_len > 1) {
                     ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
                                        full_kv_heads_, full_head_dim_, max_seq_len_);
@@ -1899,7 +1923,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 }
             });
 
-            time_stage(DecodeStage::Attention, [&] {
+            time_stage(ProfileStage::Attention, [&] {
                 if (seq_len == 1) {
                     ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
                                           full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
@@ -1920,7 +1944,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             }
 
             if (cfg_.attn_output_gate) {
-                time_stage(DecodeStage::AttnGate, [&] {
+                time_stage(ProfileStage::AttnGate, [&] {
                     ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * full_q_dim_);
                 });
                 if (debug_this_layer && seq_len > 0) {
@@ -1929,7 +1953,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                     log_row_stats(tag, buf_.attn_out, dbg_row, full_q_dim_);
                 }
             }
-            time_stage(DecodeStage::FullOProj, [&] {
+            time_stage(ProfileStage::FullOProj, [&] {
                 if (use_decode_jm_custom_path(seq_len) && layer.o_weight_jm != nullptr) {
                     run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.o_weight_jm,
                                                 full_q_dim_, hidden_size_, buf_.gate);
@@ -1944,7 +1968,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             log_row_stats(tag, buf_.gate, dbg_row, hidden_size_);
         }
 
-        time_stage(DecodeStage::PostAttnNorm, [&] {
+        time_stage(ProfileStage::PostAttnNorm, [&] {
             ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate, *layer.post_attn_ln_weight,
                                     cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
         });
@@ -1958,34 +1982,38 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
 
         if (use_decode_ffn_custom_path(seq_len)) {
-            time_stage(DecodeStage::FfnProj, [&] {
+            time_stage(ProfileStage::FfnProj, [&] {
                 run_decode_ffn_gate_up_swiglu_custom(ctx, layer, buf_.normed, buf_.gate);
             });
-            time_stage(DecodeStage::FfnAct, [&] {
+            time_stage(ProfileStage::FfnAct, [&] {
             });
-            time_stage(DecodeStage::DownProj, [&] {
+            time_stage(ProfileStage::DownProj, [&] {
                 run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
             });
         } else if (seq_len == 1) {
-            time_stage(DecodeStage::FfnProj, [&] {
+            time_stage(ProfileStage::FfnProj, [&] {
                 layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
             });
-            time_stage(DecodeStage::FfnAct, [&] {
+            time_stage(ProfileStage::FfnAct, [&] {
                 ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
             });
-            time_stage(DecodeStage::DownProj, [&] {
+            time_stage(ProfileStage::DownProj, [&] {
                 layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
             });
         } else {
-            layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
-            ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, ff_dim_);
-            ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
-            time_stage(DecodeStage::DownProj, [&] {
+            time_stage(ProfileStage::FfnProj, [&] {
+                layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
+            });
+            time_stage(ProfileStage::FfnAct, [&] {
+                ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, ff_dim_);
+                ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
+            });
+            time_stage(ProfileStage::DownProj, [&] {
                 layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
             });
         }
 
-        time_stage(DecodeStage::PostMlpNorm, [&] {
+        time_stage(ProfileStage::PostMlpNorm, [&] {
             if (i < cfg_.num_hidden_layers - 1) {
                 ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *layers_[i + 1].input_ln_weight,
                                         cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
@@ -2029,7 +2057,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
-    time_stage(DecodeStage::LmHead, [&] {
+    time_stage(ProfileStage::LmHead, [&] {
         if (seq_len > 1) {
             bf16* last_token_ptr = static_cast<bf16*>(buf_.normed.data()) + (seq_len - 1) * hidden_size_;
             Tensor last_hidden = Tensor::view(ctx, last_token_ptr, {1, (int64_t)hidden_size_});
@@ -2039,43 +2067,79 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
     });
 
-    if (profile_decode) {
-        static DecodeProfileTotals totals;
+    if (profile_enabled) {
+        static StageProfileTotals decode_totals;
+        static StageProfileTotals prefill_totals;
+        StageProfileTotals& totals = profile_decode ? decode_totals : prefill_totals;
         for (size_t i = 0; i < stage_ms.size(); ++i) {
             totals.stage_ms[i] += stage_ms[i];
         }
-        totals.tokens += 1;
+        totals.calls += 1;
+        totals.tokens += profile_decode ? 1 : seq_len;
 
-        if (totals.tokens >= profile_every) {
-            auto avg = [&](DecodeStage stage) {
+        if (totals.calls >= profile_every) {
+            auto avg = [&](ProfileStage stage) {
+                return totals.stage_ms[static_cast<size_t>(stage)] /
+                       static_cast<double>(std::max(1, totals.calls));
+            };
+            auto per_token = [&](ProfileStage stage) {
                 return totals.stage_ms[static_cast<size_t>(stage)] /
                        static_cast<double>(std::max(1, totals.tokens));
             };
             double total_ms = 0.0;
             for (double v : totals.stage_ms) total_ms += v;
-            AILA_LOG_INFO(
-                "[Q35DecodeProfile] tokens=%d total=%.3f embed=%.3f linear_proj=%.3f linear_delta=%.3f linear_o=%.3f "
-                "full_qkv=%.3f full_split=%.3f qk_rope=%.3f kv_copy=%.3f attn=%.3f attn_gate=%.3f full_o=%.3f "
-                "post_attn=%.3f ffn_proj=%.3f ffn_act=%.3f down=%.3f post_mlp=%.3f lm_head=%.3f",
-                totals.tokens,
-                total_ms / static_cast<double>(std::max(1, totals.tokens)),
-                avg(DecodeStage::EmbedNorm),
-                avg(DecodeStage::LinearProj),
-                avg(DecodeStage::LinearDelta),
-                avg(DecodeStage::LinearOProj),
-                avg(DecodeStage::FullQkvProj),
-                avg(DecodeStage::FullSplit),
-                avg(DecodeStage::QkNormRope),
-                avg(DecodeStage::KvCache),
-                avg(DecodeStage::Attention),
-                avg(DecodeStage::AttnGate),
-                avg(DecodeStage::FullOProj),
-                avg(DecodeStage::PostAttnNorm),
-                avg(DecodeStage::FfnProj),
-                avg(DecodeStage::FfnAct),
-                avg(DecodeStage::DownProj),
-                avg(DecodeStage::PostMlpNorm),
-                avg(DecodeStage::LmHead));
+            if (profile_decode) {
+                AILA_LOG_INFO(
+                    "[Q35DecodeProfile] tokens=%d total=%.3f embed=%.3f linear_proj=%.3f linear_delta=%.3f linear_o=%.3f "
+                    "full_qkv=%.3f full_split=%.3f qk_rope=%.3f kv_copy=%.3f attn=%.3f attn_gate=%.3f full_o=%.3f "
+                    "post_attn=%.3f ffn_proj=%.3f ffn_act=%.3f down=%.3f post_mlp=%.3f lm_head=%.3f",
+                    totals.tokens,
+                    total_ms / static_cast<double>(std::max(1, totals.tokens)),
+                    avg(ProfileStage::EmbedNorm),
+                    avg(ProfileStage::LinearProj),
+                    avg(ProfileStage::LinearDelta),
+                    avg(ProfileStage::LinearOProj),
+                    avg(ProfileStage::FullQkvProj),
+                    avg(ProfileStage::FullSplit),
+                    avg(ProfileStage::QkNormRope),
+                    avg(ProfileStage::KvCache),
+                    avg(ProfileStage::Attention),
+                    avg(ProfileStage::AttnGate),
+                    avg(ProfileStage::FullOProj),
+                    avg(ProfileStage::PostAttnNorm),
+                    avg(ProfileStage::FfnProj),
+                    avg(ProfileStage::FfnAct),
+                    avg(ProfileStage::DownProj),
+                    avg(ProfileStage::PostMlpNorm),
+                    avg(ProfileStage::LmHead));
+            } else {
+                AILA_LOG_INFO(
+                    "[Q35PrefillProfile] calls=%d tokens=%d total=%.3f total_tok=%.6f "
+                    "embed=%.6f linear_proj=%.6f linear_delta=%.6f linear_o=%.6f "
+                    "full_qkv=%.6f full_split=%.6f qk_rope=%.6f kv_copy=%.6f attn=%.6f attn_gate=%.6f full_o=%.6f "
+                    "post_attn=%.6f ffn_proj=%.6f ffn_act=%.6f down=%.6f post_mlp=%.6f lm_head=%.6f",
+                    totals.calls,
+                    totals.tokens,
+                    total_ms / static_cast<double>(std::max(1, totals.calls)),
+                    total_ms / static_cast<double>(std::max(1, totals.tokens)),
+                    per_token(ProfileStage::EmbedNorm),
+                    per_token(ProfileStage::LinearProj),
+                    per_token(ProfileStage::LinearDelta),
+                    per_token(ProfileStage::LinearOProj),
+                    per_token(ProfileStage::FullQkvProj),
+                    per_token(ProfileStage::FullSplit),
+                    per_token(ProfileStage::QkNormRope),
+                    per_token(ProfileStage::KvCache),
+                    per_token(ProfileStage::Attention),
+                    per_token(ProfileStage::AttnGate),
+                    per_token(ProfileStage::FullOProj),
+                    per_token(ProfileStage::PostAttnNorm),
+                    per_token(ProfileStage::FfnProj),
+                    per_token(ProfileStage::FfnAct),
+                    per_token(ProfileStage::DownProj),
+                    per_token(ProfileStage::PostMlpNorm),
+                    per_token(ProfileStage::LmHead));
+            }
             totals.reset();
         }
     }
