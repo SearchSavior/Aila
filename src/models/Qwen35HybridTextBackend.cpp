@@ -504,6 +504,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             fused_weights_.push_back(fuse_four_cols(*qkv_w, *z_w, *a_w, *b_w));
             layer.linear_all_proj.init(ctx, fused_weights_.back(), hidden_size_, linear_all_dim_, true);
             if (decode_ffn_custom_enabled_) {
+                Tensor linear_all_jm = Tensor::allocate(ctx,
+                                                        {(int64_t)linear_all_dim_, (int64_t)hidden_size_},
+                                                        fused_weights_.back().dtype());
+                ops::transpose(ctx, fused_weights_.back(), linear_all_jm);
+                fused_weights_.push_back(std::move(linear_all_jm));
+                layer.linear_all_weight_jm = &fused_weights_.back();
+
                 Tensor linear_o_jm = Tensor::allocate(ctx,
                                                       {(int64_t)hidden_size_, (int64_t)linear_kv_dim_},
                                                       o_w->dtype());
@@ -608,6 +615,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
             layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
             if (decode_ffn_custom_enabled_) {
+                Tensor qkv_jm = Tensor::allocate(ctx,
+                                                 {(int64_t)full_fused_qkv_dim_, (int64_t)hidden_size_},
+                                                 fused_weights_.back().dtype());
+                ops::transpose(ctx, fused_weights_.back(), qkv_jm);
+                fused_weights_.push_back(std::move(qkv_jm));
+                layer.qkv_weight_jm = &fused_weights_.back();
+
                 Tensor o_jm = Tensor::allocate(ctx,
                                                {(int64_t)hidden_size_, (int64_t)full_q_dim_},
                                                o_w->dtype());
@@ -1683,7 +1697,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             if (use_delta_linear_) {
                 if (seq_len == 1) {
                     time_stage(DecodeStage::LinearProj, [&] {
-                        layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
+                        if (use_decode_jm_custom_path(seq_len) && layer.linear_all_weight_jm != nullptr) {
+                            run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.linear_all_weight_jm,
+                                                        hidden_size_, linear_all_dim_, buf_.linear_all);
+                        } else {
+                            layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
+                        }
                     });
                     time_stage(DecodeStage::LinearDelta, [&] {
                         bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
@@ -1765,7 +1784,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
             if (seq_len == 1) {
                 time_stage(DecodeStage::FullQkvProj, [&] {
-                    layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
+                    if (use_decode_jm_custom_path(seq_len) && layer.qkv_weight_jm != nullptr) {
+                        run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.qkv_weight_jm,
+                                                    hidden_size_, full_fused_qkv_dim_, buf_.full_qkv);
+                    } else {
+                        layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
+                    }
                 });
                 time_stage(DecodeStage::FullSplit, [&] {
                     bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());

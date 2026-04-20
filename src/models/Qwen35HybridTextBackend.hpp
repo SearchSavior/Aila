@@ -43,6 +43,7 @@ private:
         // full attention branch
         Linear q_proj, k_proj, v_proj, o_proj;
         Linear qkv_proj;
+        Tensor* qkv_weight_jm = nullptr; // bf16 [full_fused_qkv_dim, hidden]
         Tensor* o_weight_jm = nullptr; // bf16 [hidden, full_q_dim]
         Tensor* q_norm_weight = nullptr;
         Tensor* k_norm_weight = nullptr;
@@ -50,6 +51,7 @@ private:
         // linear attention branch
         Linear linear_qkv_proj, linear_z_proj, linear_o_proj;
         Linear linear_all_proj;
+        Tensor* linear_all_weight_jm = nullptr; // bf16 [linear_all_dim, hidden]
         Tensor* linear_o_weight_jm = nullptr; // bf16 [hidden, linear_kv_dim]
         Linear linear_a_proj, linear_b_proj;
         Tensor* linear_norm_weight = nullptr; // f32
