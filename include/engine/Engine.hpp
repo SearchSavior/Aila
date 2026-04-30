@@ -227,7 +227,7 @@ public:
             run_init_warmup = false;
         } else if (init_warmup_mode == 1) {
             run_init_warmup = true;
-        } else if (model_spec_.family == ModelFamily::Qwen35Hybrid && !is_exact_q35_0p8b_spec) {
+        } else if (model_spec_.family == ModelFamily::Qwen35Hybrid && !is_supported_qwen35_hybrid_text_spec(model_spec_.qwen35_text)) {
             run_init_warmup = false;
         }
 
@@ -235,7 +235,9 @@ public:
             if (init_warmup_mode == 1) {
                 AILA_LOG_INFO("[Warmup] Running init warmup (forced via AILA_INIT_WARMUP=1)");
             } else if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
-                AILA_LOG_INFO("[Warmup] Running init warmup for exact Qwen3.5-0.8B hybrid spec");
+                AILA_LOG_INFO("[Warmup] Running init warmup for Qwen3.5 hybrid spec (hidden=%d layers=%d)",
+                              model_spec_.qwen35_text.hidden_size,
+                              model_spec_.qwen35_text.num_hidden_layers);
             } else {
                 AILA_LOG_INFO("[Warmup] Running init warmup");
             }
@@ -297,7 +299,7 @@ public:
                                   model_spec_.qwen35_text.num_attention_heads,
                                   model_spec_.qwen35_text.num_key_value_heads);
                 } else {
-                    AILA_LOG_INFO("[Warmup] Skipping init warmup for non-0.8B Qwen3.5 hybrid spec (hidden=%d layers=%d attn_heads=%d kv_heads=%d). Set AILA_INIT_WARMUP=1 to force.",
+                    AILA_LOG_INFO("[Warmup] Skipping init warmup for unsupported Qwen3.5 hybrid spec (hidden=%d layers=%d attn_heads=%d kv_heads=%d). Set AILA_INIT_WARMUP=1 to force.",
                                   model_spec_.qwen35_text.hidden_size,
                                   model_spec_.qwen35_text.num_hidden_layers,
                                   model_spec_.qwen35_text.num_attention_heads,

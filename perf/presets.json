@@ -16,10 +16,20 @@
       "maxSeqLen": 4096,
       "description": "Qwen3.5-0.8B bitsandbytes NF4 offline export"
     },
+    "q35_08_bnb_nf4_visiondense": {
+      "path": "./models/qwen3.5-0.8B-bnb-nf4-offline-visiondense",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-0.8B bitsandbytes NF4 offline vision-dense export"
+    },
     "q35_4_bnb_nf4": {
       "path": "./models/qwen3.5-4B-bnb-nf4-offline",
       "maxSeqLen": 4096,
       "description": "Qwen3.5-4B bitsandbytes NF4 offline export"
+    },
+    "q35_4_bnb_nf4_visiondense": {
+      "path": "./models/qwen3.5-4B-bnb-nf4-offline-visiondense",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-4B bitsandbytes NF4 offline vision-dense export"
     },
     "q3_06": {
       "path": "./models/Qwen3-0.6B",
@@ -384,6 +394,24 @@
           "name": "q35_4_rooster_small_smoke",
           "modelAlias": "q35_4",
           "messagesJson": "tmp/rooster_count_small.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_4_bnb_nf4_visiondense_ocr_smoke",
+          "modelAlias": "q35_4_bnb_nf4_visiondense",
+          "messagesJson": "tmp/ocr_test_messages.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "1\\s*\\+\\s*1\\s*=\\s*2"
+        },
+        {
+          "name": "q35_4_bnb_nf4_visiondense_rooster_big_smoke",
+          "modelAlias": "q35_4_bnb_nf4_visiondense",
+          "messagesJson": "tmp/rooster_count_big.json",
           "maxTokens": 24,
           "mode": "greedy",
           "expectNonEmpty": true,
