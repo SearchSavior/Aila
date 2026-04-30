@@ -5,6 +5,8 @@
 #include "../utils/SafeTensors.hpp"
 #include "engine/Types.hpp"
 #include <string>
+#include <vector>
+#include <sycl/sycl.hpp>
 
 class IModelBackend {
 public:
@@ -22,5 +24,28 @@ public:
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;
+
+    virtual bool supports_vision_embedding_override() const { return false; }
+    virtual void set_embedding_overrides(
+        const std::vector<int>& positions,
+        const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
+        int hidden_size) {
+        (void)positions;
+        (void)embeddings;
+        (void)hidden_size;
+    }
+    virtual void clear_embedding_overrides() {}
+    virtual void set_mrope_positions(Context& ctx,
+                                     const std::vector<int>& pos_t,
+                                     const std::vector<int>& pos_h,
+                                     const std::vector<int>& pos_w,
+                                     int text_pos_delta) {
+        (void)ctx;
+        (void)pos_t;
+        (void)pos_h;
+        (void)pos_w;
+        (void)text_pos_delta;
+    }
+    virtual void clear_mrope_positions() {}
 };
 

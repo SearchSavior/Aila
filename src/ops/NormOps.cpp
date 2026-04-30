@@ -73,6 +73,71 @@ void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
     });
 }
 
+void layer_norm(Context& ctx, Tensor& input, Tensor& weight, Tensor& bias,
+                float eps, Tensor& output, int rows, int cols) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+
+    const bool has_weight = weight.valid();
+    const bool has_bias = bias.valid();
+    bf16* w_bf16_ptr = nullptr;
+    float* w_f32_ptr = nullptr;
+    bf16* b_bf16_ptr = nullptr;
+    float* b_f32_ptr = nullptr;
+    if (has_weight) {
+        if (weight.dtype() == dnnl::memory::data_type::f32) {
+            w_f32_ptr = static_cast<float*>(weight.data());
+        } else {
+            w_bf16_ptr = static_cast<bf16*>(weight.data());
+        }
+    }
+    if (has_bias) {
+        if (bias.dtype() == dnnl::memory::data_type::f32) {
+            b_f32_ptr = static_cast<float*>(bias.data());
+        } else {
+            b_bf16_ptr = static_cast<bf16*>(bias.data());
+        }
+    }
+
+    int wg_size = (cols > 128 ? 256 : 128);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(rows * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int row = item.get_group(0);
+                int lid = item.get_local_id(0);
+                int wg = item.get_local_range(0);
+
+                float local_sum = 0.0f;
+                for (int c = lid; c < cols; c += wg) {
+                    local_sum += static_cast<float>(in_ptr[row * cols + c]);
+                }
+                float mean = sycl::reduce_over_group(item.get_group(), local_sum, sycl::plus<float>()) /
+                             static_cast<float>(cols);
+
+                float local_var = 0.0f;
+                for (int c = lid; c < cols; c += wg) {
+                    float diff = static_cast<float>(in_ptr[row * cols + c]) - mean;
+                    local_var += diff * diff;
+                }
+                float var = sycl::reduce_over_group(item.get_group(), local_var, sycl::plus<float>()) /
+                            static_cast<float>(cols);
+                float inv_std = sycl::rsqrt(var + eps);
+
+                for (int c = lid; c < cols; c += wg) {
+                    float x = static_cast<float>(in_ptr[row * cols + c]);
+                    float w = 1.0f;
+                    float b = 0.0f;
+                    if (w_f32_ptr) w = w_f32_ptr[c];
+                    else if (w_bf16_ptr) w = static_cast<float>(w_bf16_ptr[c]);
+                    if (b_f32_ptr) b = b_f32_ptr[c];
+                    else if (b_bf16_ptr) b = static_cast<float>(b_bf16_ptr[c]);
+                    out_ptr[row * cols + c] = bf16((x - mean) * inv_std * w + b);
+                }
+            });
+    });
+}
+
 void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
                          Tensor& weight, float eps, Tensor& output,
                          int seq_len, int hidden_size) {

@@ -91,6 +91,16 @@ bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,
            conv_rows == 3;
 }
 
+bool supports_default_grouped_linear_delta_fastpath(int q_heads, int kv_heads,
+                                                    int head_k_dim, int head_v_dim,
+                                                    int kernel, int conv_rows) {
+    return kv_heads > q_heads &&
+           supports_linear_delta_gqa_fastpath(q_heads, kv_heads,
+                                              head_k_dim, head_v_dim,
+                                              kernel, conv_rows,
+                                              true);
+}
+
 int linear_delta_gqa_group_size(int q_heads, int kv_heads) {
     if (q_heads <= 0 || kv_heads <= 0 || (kv_heads % q_heads) != 0) {
         return 0;
@@ -379,6 +389,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     bool allow_unsupported_legacy_linear = aila::env::read_flag("AILA_Q35_ALLOW_UNSUPPORTED_LEGACY_LINEAR", false);
     bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
     bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
+    bool force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
     decode_ffn_custom_enabled_ = (hidden_size_ == kDecodeFfnHidden &&
                                   ff_dim_ == kDecodeFfnIntermediate &&
                                   supports_jm_bf16_f32(ctx.queue().get_device(), 1, kDecodeFfnTile, kDecodeFfnK));
@@ -390,6 +401,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     }
 
     int linear_conv_rows = std::max(0, linear_conv_kernel_dim_ - 1);
+    bool default_grouped_linear_fastpath = supports_default_grouped_linear_delta_fastpath(
+        linear_q_heads_,
+        linear_kv_heads_,
+        linear_head_dim_,
+        cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_,
+        linear_conv_rows);
     bool linear_fastpath_eligible = supports_linear_delta_gqa_fastpath(
         linear_q_heads_,
         linear_kv_heads_,
@@ -397,7 +415,10 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         cfg_.linear_value_head_dim,
         linear_conv_kernel_dim_,
         linear_conv_rows,
-        experimental_gqa_fastpath);
+        experimental_gqa_fastpath || default_grouped_linear_fastpath);
+    bool use_grouped_linear_gpu_default = !force_host_grouped_linear && default_grouped_linear_fastpath;
+    bool use_grouped_linear_gpu_experimental =
+        !use_grouped_linear_gpu_default && !force_host_grouped_linear && experimental_grouped_linear_gpu;
     int linear_gqa_group_size = linear_delta_gqa_group_size(linear_q_heads_, linear_kv_heads_);
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
@@ -429,6 +450,11 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         ctx.memcpy_h2d(dst.data(), host.data(), n * sizeof(bf16));
         weights.replace(name, std::move(dst));
         return &weights.get(name);
+    };
+    auto erase_language_weight = [&](const std::string& name) {
+        if (name.rfind("model.language_model.", 0) == 0 && weights.has(name)) {
+            weights.erase(name);
+        }
     };
 
     embed_weight_ = &weights.get("model.language_model.embed_tokens.weight");
@@ -537,6 +563,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         auto& layer = layers_[i];
         auto& cache = layer_caches_[i];
         std::string prefix = "model.language_model.layers." + std::to_string(i) + ".";
+        std::vector<std::string> weights_to_erase;
 
         // Qwen3.5 RMSNorm uses (1 + weight) instead of direct weight multiply.
         layer.input_ln_weight = plus_one_norm_weight(prefix + "input_layernorm.weight");
@@ -551,75 +578,96 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         layer.is_linear = is_linear;
 
         if (is_linear) {
-            Tensor* qkv_w = transpose_weight(prefix + "linear_attn.in_proj_qkv.weight");
-            Tensor* z_w = transpose_weight(prefix + "linear_attn.in_proj_z.weight");
             Tensor* o_w = transpose_weight(prefix + "linear_attn.out_proj.weight");
-            Tensor* a_w = transpose_weight(prefix + "linear_attn.in_proj_a.weight");
-            Tensor* b_w = transpose_weight(prefix + "linear_attn.in_proj_b.weight");
-            layer.linear_qkv_proj.init(ctx, *qkv_w, hidden_size_, linear_qkv_dim_, true);
-            layer.linear_z_proj.init(ctx, *z_w, hidden_size_, linear_z_dim_, true);
             layer.linear_o_proj.init(ctx, *o_w, linear_kv_dim_, hidden_size_, true);
-            layer.linear_a_proj.init(ctx, *a_w, hidden_size_, linear_kv_heads_, true);
-            layer.linear_b_proj.init(ctx, *b_w, hidden_size_, linear_kv_heads_, true);
-            fused_weights_.push_back(fuse_four_cols(*qkv_w, *z_w, *a_w, *b_w));
-            layer.linear_all_proj.init(ctx, fused_weights_.back(), hidden_size_, linear_all_dim_, true);
-            if (decode_ffn_custom_enabled_) {
-                Tensor linear_all_jm = Tensor::allocate(ctx,
-                                                        {(int64_t)linear_all_dim_, (int64_t)hidden_size_},
-                                                        fused_weights_.back().dtype());
-                ops::transpose(ctx, fused_weights_.back(), linear_all_jm);
-                fused_weights_.push_back(std::move(linear_all_jm));
-                layer.linear_all_weight_jm = &fused_weights_.back();
 
+            if (use_delta_linear_) {
+                Tensor* qkv_w = transpose_weight(prefix + "linear_attn.in_proj_qkv.weight");
+                Tensor* z_w = transpose_weight(prefix + "linear_attn.in_proj_z.weight");
+                Tensor* a_w = transpose_weight(prefix + "linear_attn.in_proj_a.weight");
+                Tensor* b_w = transpose_weight(prefix + "linear_attn.in_proj_b.weight");
+                fused_weights_.push_back(fuse_four_cols(*qkv_w, *z_w, *a_w, *b_w));
+                layer.linear_all_proj.init(ctx, fused_weights_.back(), hidden_size_, linear_all_dim_, true);
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_qkv.weight");
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_z.weight");
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_a.weight");
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_b.weight");
+
+                if (decode_ffn_custom_enabled_) {
+                    Tensor linear_all_jm = Tensor::allocate(ctx,
+                                                            {(int64_t)linear_all_dim_, (int64_t)hidden_size_},
+                                                            fused_weights_.back().dtype());
+                    ops::transpose(ctx, fused_weights_.back(), linear_all_jm);
+                    fused_weights_.push_back(std::move(linear_all_jm));
+                    layer.linear_all_weight_jm = &fused_weights_.back();
+                }
+
+                layer.linear_norm_weight = &weights.get(prefix + "linear_attn.norm.weight");
+                layer.linear_A_log = &weights.get(prefix + "linear_attn.A_log");
+                layer.linear_dt_bias = &weights.get(prefix + "linear_attn.dt_bias");
+                layer.linear_conv1d_weight = &weights.get(prefix + "linear_attn.conv1d.weight");
+
+                layer.host_linear_A_negexp.resize((size_t)linear_kv_heads_);
+                layer.host_linear_dt_bias.resize((size_t)linear_kv_heads_);
+                layer.host_linear_norm.resize((size_t)cfg_.linear_value_head_dim);
+                layer.host_linear_conv.resize((size_t)linear_conv_channels_ * linear_conv_kernel_dim_);
+
+                std::vector<float> host_a((size_t)linear_kv_heads_);
+                ctx.memcpy_d2h(host_a.data(), layer.linear_A_log->data(),
+                               host_a.size() * sizeof(float));
+                for (int h = 0; h < linear_kv_heads_; ++h) {
+                    layer.host_linear_A_negexp[(size_t)h] = -std::exp(host_a[(size_t)h]);
+                }
+
+                {
+                    std::vector<bf16> host_dt((size_t)linear_kv_heads_);
+                    ctx.memcpy_d2h(host_dt.data(), layer.linear_dt_bias->data(),
+                                   host_dt.size() * sizeof(bf16));
+                    for (int h = 0; h < linear_kv_heads_; ++h) {
+                        layer.host_linear_dt_bias[(size_t)h] = static_cast<float>(host_dt[(size_t)h]);
+                    }
+                }
+
+                {
+                    std::vector<float> host_norm((size_t)cfg_.linear_value_head_dim);
+                    ctx.memcpy_d2h(host_norm.data(), layer.linear_norm_weight->data(),
+                                   host_norm.size() * sizeof(float));
+                    layer.host_linear_norm = std::move(host_norm);
+                }
+
+                {
+                    size_t n_conv = (size_t)linear_conv_channels_ * (size_t)linear_conv_kernel_dim_;
+                    std::vector<bf16> conv_raw(n_conv);
+                    ctx.memcpy_d2h(conv_raw.data(), layer.linear_conv1d_weight->data(),
+                                   n_conv * sizeof(bf16));
+                    for (size_t idx = 0; idx < n_conv; ++idx) {
+                        layer.host_linear_conv[idx] = static_cast<float>(conv_raw[idx]);
+                    }
+                }
+            } else {
+                Tensor* qkv_w = transpose_weight(prefix + "linear_attn.in_proj_qkv.weight");
+                Tensor* z_w = transpose_weight(prefix + "linear_attn.in_proj_z.weight");
+                layer.linear_qkv_proj.init(ctx, *qkv_w, hidden_size_, linear_qkv_dim_, true);
+                layer.linear_z_proj.init(ctx, *z_w, hidden_size_, linear_z_dim_, true);
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_a.weight");
+                weights_to_erase.push_back(prefix + "linear_attn.in_proj_b.weight");
+                layer.linear_norm_weight = nullptr;
+                layer.linear_A_log = nullptr;
+                layer.linear_dt_bias = nullptr;
+                layer.linear_conv1d_weight = nullptr;
+                layer.host_linear_A_negexp.clear();
+                layer.host_linear_dt_bias.clear();
+                layer.host_linear_norm.clear();
+                layer.host_linear_conv.clear();
+            }
+
+            if (decode_ffn_custom_enabled_) {
                 Tensor linear_o_jm = Tensor::allocate(ctx,
                                                       {(int64_t)hidden_size_, (int64_t)linear_kv_dim_},
                                                       o_w->dtype());
                 ops::transpose(ctx, *o_w, linear_o_jm);
                 fused_weights_.push_back(std::move(linear_o_jm));
                 layer.linear_o_weight_jm = &fused_weights_.back();
-            }
-
-            layer.linear_norm_weight = &weights.get(prefix + "linear_attn.norm.weight");
-            layer.linear_A_log = &weights.get(prefix + "linear_attn.A_log");
-            layer.linear_dt_bias = &weights.get(prefix + "linear_attn.dt_bias");
-            layer.linear_conv1d_weight = &weights.get(prefix + "linear_attn.conv1d.weight");
-
-            layer.host_linear_A_negexp.resize((size_t)linear_kv_heads_);
-            layer.host_linear_dt_bias.resize((size_t)linear_kv_heads_);
-            layer.host_linear_norm.resize((size_t)cfg_.linear_value_head_dim);
-            layer.host_linear_conv.resize((size_t)linear_conv_channels_ * linear_conv_kernel_dim_);
-
-            std::vector<float> host_a((size_t)linear_kv_heads_);
-            ctx.memcpy_d2h(host_a.data(), layer.linear_A_log->data(),
-                           host_a.size() * sizeof(float));
-            for (int h = 0; h < linear_kv_heads_; ++h) {
-                layer.host_linear_A_negexp[(size_t)h] = -std::exp(host_a[(size_t)h]);
-            }
-
-            {
-                std::vector<bf16> host_dt((size_t)linear_kv_heads_);
-                ctx.memcpy_d2h(host_dt.data(), layer.linear_dt_bias->data(),
-                               host_dt.size() * sizeof(bf16));
-                for (int h = 0; h < linear_kv_heads_; ++h) {
-                    layer.host_linear_dt_bias[(size_t)h] = static_cast<float>(host_dt[(size_t)h]);
-                }
-            }
-
-            {
-                std::vector<float> host_norm((size_t)cfg_.linear_value_head_dim);
-                ctx.memcpy_d2h(host_norm.data(), layer.linear_norm_weight->data(),
-                               host_norm.size() * sizeof(float));
-                layer.host_linear_norm = std::move(host_norm);
-            }
-
-            {
-                size_t n_conv = (size_t)linear_conv_channels_ * (size_t)linear_conv_kernel_dim_;
-                std::vector<bf16> conv_raw(n_conv);
-                ctx.memcpy_d2h(conv_raw.data(), layer.linear_conv1d_weight->data(),
-                               n_conv * sizeof(bf16));
-                for (size_t idx = 0; idx < n_conv; ++idx) {
-                    layer.host_linear_conv[idx] = static_cast<float>(conv_raw[idx]);
-                }
             }
 
             if (use_delta_linear_) {
@@ -668,12 +716,12 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             Tensor* k_w = transpose_weight(prefix + "self_attn.k_proj.weight");
             Tensor* v_w = transpose_weight(prefix + "self_attn.v_proj.weight");
             Tensor* o_w = transpose_weight(prefix + "self_attn.o_proj.weight");
-            layer.q_proj.init(ctx, *q_w, hidden_size_, full_q_proj_dim_, true);
-            layer.k_proj.init(ctx, *k_w, hidden_size_, full_kv_dim_, true);
-            layer.v_proj.init(ctx, *v_w, hidden_size_, full_kv_dim_, true);
             fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
             layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
             layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
+            weights_to_erase.push_back(prefix + "self_attn.q_proj.weight");
+            weights_to_erase.push_back(prefix + "self_attn.k_proj.weight");
+            weights_to_erase.push_back(prefix + "self_attn.v_proj.weight");
             if (decode_ffn_custom_enabled_) {
                 Tensor qkv_jm = Tensor::allocate(ctx,
                                                  {(int64_t)full_fused_qkv_dim_, (int64_t)hidden_size_},
@@ -708,13 +756,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
         Tensor* up_w = transpose_weight(prefix + "mlp.up_proj.weight");
         Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
-        layer.gate_proj.init(ctx, *gate_w, hidden_size_, ff_dim_, true);
-        layer.up_proj.init(ctx, *up_w, hidden_size_, ff_dim_, true);
         fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
         layer.gate_up_weight = &fused_weights_.back();
         layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
         layer.down_weight = down_w;
         layer.down_proj.init(ctx, *down_w, ff_dim_, hidden_size_, true);
+        weights_to_erase.push_back(prefix + "mlp.gate_proj.weight");
+        weights_to_erase.push_back(prefix + "mlp.up_proj.weight");
 
         if (decode_ffn_custom_enabled_) {
             Tensor gate_up_jm = Tensor::allocate(ctx,
@@ -731,10 +779,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             fused_weights_.push_back(std::move(down_jm));
             layer.down_weight_jm = &fused_weights_.back();
         }
-    }
 
-    if (decode_ffn_custom_enabled_) {
-        ctx.synchronize();
+        if (!weights_to_erase.empty()) {
+            ctx.synchronize();
+            for (const auto& name : weights_to_erase) {
+                erase_language_weight(name);
+            }
+        }
     }
 
     final_norm_weight_ = plus_one_norm_weight("model.language_model.norm.weight");
@@ -745,7 +796,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         AILA_LOG_INFO("[Qwen3.5] lm_head loaded (standalone)");
     } else {
         bool tied_lm_head_ready = false;
-        if (!force_direct_tied_lm_head) {
+        bool prefer_preprocessed_tied_lm_head = is_exact_q35_0p8b_spec && !force_direct_tied_lm_head;
+        if (prefer_preprocessed_tied_lm_head) {
             try {
                 Tensor& src = *embed_weight_;
                 Tensor dst = Tensor::allocate(ctx, {src.shape(1), src.shape(0)}, src.dtype());
@@ -755,11 +807,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 lm_head_.init(ctx, weights.get("model.language_model.lm_head.weight_preprocessed"),
                               hidden_size_, cfg_.vocab_size, true);
                 tied_lm_head_ready = true;
-                if (is_exact_q35_0p8b_spec) {
-                    AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
-                } else {
-                    AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy for hybrid spec)");
-                }
+                AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
             } catch (const std::exception& e) {
                 AILA_LOG_WARN("[Qwen3.5] Failed to preprocess tied lm_head, falling back to direct embed weight: %s",
                               e.what());
@@ -769,8 +817,10 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             lm_head_.init(ctx, *embed_weight_, hidden_size_, cfg_.vocab_size, false);
             if (force_direct_tied_lm_head) {
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight forced via AILA_Q35_DIRECT_TIED_LM_HEAD=1)");
-            } else {
+            } else if (prefer_preprocessed_tied_lm_head) {
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight fallback)");
+            } else {
+                AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight for hybrid spec)");
             }
         }
     }
@@ -805,7 +855,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     AILA_LOG_INFO("[Qwen3.5] Linear attention: q_heads=%d kv_heads=%d key_dim=%d value_dim=%d conv_kernel=%d exact_0p8b=%d",
                   linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
                   linear_conv_kernel_dim_, is_exact_q35_0p8b_spec ? 1 : 0);
-    AILA_LOG_INFO("[Qwen3.5] Linear fast path: eligible=%d gqa_group=%d head_dims_match=%d key_dim=%d value_dim=%d kernel=%d conv_rows=%d experimental_gqa=%d",
+    AILA_LOG_INFO("[Qwen3.5] Linear fast path: eligible=%d gqa_group=%d head_dims_match=%d key_dim=%d value_dim=%d kernel=%d conv_rows=%d experimental_gqa=%d default_grouped=%d force_host=%d",
                   linear_fastpath_eligible ? 1 : 0,
                   linear_gqa_group_size,
                   (linear_head_dim_ == cfg_.linear_value_head_dim) ? 1 : 0,
@@ -813,10 +863,22 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                   cfg_.linear_value_head_dim,
                   linear_conv_kernel_dim_,
                   linear_conv_rows,
-                  experimental_gqa_fastpath ? 1 : 0);
+                  experimental_gqa_fastpath ? 1 : 0,
+                  default_grouped_linear_fastpath ? 1 : 0,
+                  force_host_grouped_linear ? 1 : 0);
     if (linear_kv_heads_ > linear_q_heads_) {
-        AILA_LOG_INFO("[Qwen3.5] Grouped linear delta backend: %s (set AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU=1 to try GPU path)",
-                      experimental_grouped_linear_gpu ? "gpu" : "host-reference");
+        const char* grouped_backend = "host-reference";
+        if (use_grouped_linear_gpu_default) {
+            grouped_backend = "gpu-fastpath-default";
+        } else if (use_grouped_linear_gpu_experimental) {
+            grouped_backend = "gpu-experimental";
+        }
+        AILA_LOG_INFO("[Qwen3.5] Grouped linear delta backend: %s", grouped_backend);
+        if (force_host_grouped_linear) {
+            AILA_LOG_INFO("[Qwen3.5] Grouped linear host fallback forced by AILA_Q35_FORCE_HOST_GROUPED_LINEAR=1");
+        } else if (!default_grouped_linear_fastpath) {
+            AILA_LOG_INFO("[Qwen3.5] Set AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU=1 to try the generic grouped GPU path");
+        }
     }
     AILA_LOG_INFO("[Qwen3.5] Decode FFN custom path: enabled=%d (hidden=%d ff=%d)",
                   decode_ffn_custom_enabled_ ? 1 : 0,
@@ -942,9 +1004,12 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
     bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
+        q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
+    bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
 
     if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
-                                           experimental_gqa_fastpath)) {
+                                           allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
         const int row0 = conv_head;
@@ -1266,9 +1331,12 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
     bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
+        q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
+    bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
 
     if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
-                                           experimental_gqa_fastpath)) {
+                                           allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
 
@@ -1791,8 +1859,15 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     bool debug_linear_compare = aila::env::read_flag("AILA_DEBUG_Q35_LINEAR_COMPARE", false);
     int debug_linear_compare_layer = aila::env::read_int_raw("AILA_DEBUG_Q35_LINEAR_COMPARE_LAYER", -1);
     bool grouped_linear_heads = linear_kv_heads_ > linear_q_heads_;
+    int linear_conv_rows = std::max(0, linear_conv_kernel_dim_ - 1);
+    bool default_grouped_linear_fastpath = supports_default_grouped_linear_delta_fastpath(
+        linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_, linear_conv_rows);
     bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
-    bool use_host_grouped_linear = grouped_linear_heads && !experimental_grouped_linear_gpu;
+    bool force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
+    bool use_grouped_linear_gpu = grouped_linear_heads && !force_host_grouped_linear &&
+                                  (default_grouped_linear_fastpath || experimental_grouped_linear_gpu);
+    bool use_host_grouped_linear = grouped_linear_heads && !use_grouped_linear_gpu;
     auto log_row_stats = [&](const char* tag, Tensor& t, int row, int width) {
         if (row < 0) return;
         bf16* ptr = static_cast<bf16*>(t.data()) + (size_t)row * width;

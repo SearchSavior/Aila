@@ -40,6 +40,10 @@ void ModelWeights::replace(const std::string& name, Tensor tensor) {
     tensors_.emplace(name, std::move(tensor));
 }
 
+void ModelWeights::erase(const std::string& name) {
+    tensors_.erase(name);
+}
+
 std::vector<std::string> ModelWeights::names() const {
     std::vector<std::string> result;
     result.reserve(tensors_.size());
@@ -228,6 +232,107 @@ std::string read_text_file(const std::string& path) {
                        std::istreambuf_iterator<char>());
 }
 
+void set_error(std::string* error_message, const std::string& message) {
+    if (error_message) {
+        *error_message = message;
+    }
+}
+
+bool read_json_int64(simdjson::dom::element root, const char* key, int64_t& out) {
+    simdjson::dom::element elem;
+    if (root.at_key(key).get(elem) != simdjson::SUCCESS) {
+        return false;
+    }
+    return elem.get_int64().get(out) == simdjson::SUCCESS;
+}
+
+bool read_json_float(simdjson::dom::element root, const char* key, float& out) {
+    simdjson::dom::element elem;
+    if (root.at_key(key).get(elem) != simdjson::SUCCESS) {
+        return false;
+    }
+
+    double value = 0.0;
+    if (elem.get_double().get(value) == simdjson::SUCCESS) {
+        out = static_cast<float>(value);
+        return true;
+    }
+
+    int64_t int_value = 0;
+    if (elem.get_int64().get(int_value) == simdjson::SUCCESS) {
+        out = static_cast<float>(int_value);
+        return true;
+    }
+    return false;
+}
+
+std::string read_json_string(simdjson::dom::element root, const char* key) {
+    simdjson::dom::element elem;
+    if (root.at_key(key).get(elem) != simdjson::SUCCESS) {
+        return "";
+    }
+    std::string_view sv;
+    if (elem.get_string().get(sv) != simdjson::SUCCESS) {
+        return "";
+    }
+    return std::string(sv);
+}
+
+bool parse_bnb_4bit_quant_state_json(const std::string& json_text,
+                                     Bnb4BitQuantState& out,
+                                     std::string* error_message) {
+    out = {};
+    try {
+        simdjson::dom::parser parser;
+        simdjson::dom::element root = parser.parse(json_text);
+
+        out.quant_type = read_json_string(root, "quant_type");
+        out.dtype = read_json_string(root, "dtype");
+
+        int64_t blocksize = 0;
+        if (!read_json_int64(root, "blocksize", blocksize)) {
+            set_error(error_message, "bitsandbytes quant_state is missing blocksize");
+            return false;
+        }
+        out.blocksize = static_cast<int>(blocksize);
+
+        simdjson::dom::element shape_elem;
+        if (root.at_key("shape").get(shape_elem) != simdjson::SUCCESS) {
+            set_error(error_message, "bitsandbytes quant_state is missing shape");
+            return false;
+        }
+        out.shape.clear();
+        for (auto value : shape_elem.get_array()) {
+            int64_t dim = 0;
+            if (value.get_int64().get(dim) != simdjson::SUCCESS) {
+                set_error(error_message, "bitsandbytes quant_state shape contains a non-integer value");
+                return false;
+            }
+            out.shape.push_back(dim);
+        }
+
+        int64_t nested_blocksize = 0;
+        if (read_json_int64(root, "nested_blocksize", nested_blocksize)) {
+            out.nested = true;
+            out.nested_blocksize = static_cast<int>(nested_blocksize);
+        }
+        std::string nested_dtype = read_json_string(root, "nested_dtype");
+        if (!nested_dtype.empty()) {
+            out.nested = true;
+            out.nested_dtype = nested_dtype;
+        }
+        float nested_offset = 0.0f;
+        if (read_json_float(root, "nested_offset", nested_offset)) {
+            out.nested = true;
+            out.nested_offset = nested_offset;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        set_error(error_message, std::string("parse bitsandbytes quant_state failed: ") + e.what());
+        return false;
+    }
+}
+
 std::vector<std::string> parse_sharded_safetensors_index(const std::string& index_path) {
     std::string text = read_text_file(index_path);
     if (text.empty()) {
@@ -261,6 +366,127 @@ std::vector<std::string> parse_sharded_safetensors_index(const std::string& inde
 }
 
 } // namespace
+
+bool LoadBnb4BitWeightRef(Context& ctx,
+                          ModelWeights& weights,
+                          const std::string& name,
+                          Bnb4BitWeightRef& out,
+                          std::string* error_message) {
+    out = {};
+    out.name = name;
+
+    if (!weights.has(name)) {
+        set_error(error_message, "Missing bitsandbytes packed weight tensor: " + name);
+        return false;
+    }
+
+    const std::string absmax_name = name + ".absmax";
+    const std::string quant_map_name = name + ".quant_map";
+    const std::string nested_absmax_name = name + ".nested_absmax";
+    const std::string nested_quant_map_name = name + ".nested_quant_map";
+    const std::string packed_quant_state_name = name + ".quant_state.bitsandbytes__nf4";
+
+    if (!weights.has(absmax_name) || !weights.has(quant_map_name) || !weights.has(packed_quant_state_name)) {
+        set_error(error_message,
+                  "Missing required bitsandbytes side tensors for weight: " + name);
+        return false;
+    }
+
+    out.packed_weight = &weights.get(name);
+    out.absmax = &weights.get(absmax_name);
+    out.quant_map = &weights.get(quant_map_name);
+    out.packed_quant_state = &weights.get(packed_quant_state_name);
+    if (weights.has(nested_absmax_name)) {
+        out.nested_absmax = &weights.get(nested_absmax_name);
+    }
+    if (weights.has(nested_quant_map_name)) {
+        out.nested_quant_map = &weights.get(nested_quant_map_name);
+    }
+
+    if (out.packed_weight->dtype() != dnnl::memory::data_type::u8) {
+        set_error(error_message, "bitsandbytes packed weight must be uint8: " + name);
+        return false;
+    }
+    if (out.quant_map->dtype() != dnnl::memory::data_type::f32) {
+        set_error(error_message, "bitsandbytes quant_map must be float32: " + quant_map_name);
+        return false;
+    }
+    if (out.packed_quant_state->dtype() != dnnl::memory::data_type::u8) {
+        set_error(error_message, "bitsandbytes packed quant_state must be uint8: " + packed_quant_state_name);
+        return false;
+    }
+    if (out.absmax->dtype() != dnnl::memory::data_type::u8 &&
+        out.absmax->dtype() != dnnl::memory::data_type::f32) {
+        set_error(error_message, "bitsandbytes absmax must be uint8 or float32: " + absmax_name);
+        return false;
+    }
+
+    std::string packed_state_json(static_cast<size_t>(out.packed_quant_state->numel()), '\0');
+    ctx.memcpy_d2h(packed_state_json.data(), out.packed_quant_state->data(), packed_state_json.size());
+    if (!parse_bnb_4bit_quant_state_json(packed_state_json, out.quant_state, error_message)) {
+        return false;
+    }
+
+    if (!out.valid()) {
+        set_error(error_message, "Invalid bitsandbytes weight view: " + name);
+        return false;
+    }
+    if (out.quant_state.quant_type != "nf4") {
+        set_error(error_message, "Only NF4 bitsandbytes weights are supported: " + name);
+        return false;
+    }
+    if (out.quant_state.blocksize <= 0) {
+        set_error(error_message, "bitsandbytes blocksize must be positive: " + name);
+        return false;
+    }
+
+    const int64_t logical_numel = out.logical_numel();
+    if (logical_numel <= 0) {
+        set_error(error_message, "bitsandbytes logical weight shape is invalid: " + name);
+        return false;
+    }
+    if (out.packed_num_bytes() * 2 != logical_numel) {
+        set_error(error_message, "bitsandbytes packed weight size does not match logical shape: " + name);
+        return false;
+    }
+
+    const int64_t block_count = (logical_numel + out.quant_state.blocksize - 1) / out.quant_state.blocksize;
+    if (out.absmax->numel() != block_count) {
+        set_error(error_message, "bitsandbytes absmax length does not match block count: " + name);
+        return false;
+    }
+    if (out.quant_map->numel() < 16) {
+        set_error(error_message, "bitsandbytes quant_map must contain at least 16 entries: " + name);
+        return false;
+    }
+
+    if (out.quant_state.nested) {
+        if (out.nested_absmax == nullptr || out.nested_quant_map == nullptr) {
+            set_error(error_message, "bitsandbytes nested quantization tensors are missing: " + name);
+            return false;
+        }
+        if (out.nested_absmax->dtype() != dnnl::memory::data_type::f32 ||
+            out.nested_quant_map->dtype() != dnnl::memory::data_type::f32) {
+            set_error(error_message, "bitsandbytes nested tensors must be float32: " + name);
+            return false;
+        }
+        if (out.quant_state.nested_blocksize <= 0) {
+            set_error(error_message, "bitsandbytes nested blocksize must be positive: " + name);
+            return false;
+        }
+        const int64_t nested_block_count =
+            (block_count + out.quant_state.nested_blocksize - 1) / out.quant_state.nested_blocksize;
+        if (out.nested_absmax->numel() != nested_block_count) {
+            set_error(error_message, "bitsandbytes nested_absmax length does not match nested block count: " + name);
+            return false;
+        }
+    } else if (out.absmax->dtype() != dnnl::memory::data_type::f32) {
+        set_error(error_message, "Non-nested bitsandbytes absmax must be float32: " + name);
+        return false;
+    }
+
+    return true;
+}
 
 ModelWeights LoadModelWeightsFromDir(const std::string& model_dir, Context& ctx) {
     namespace fs = std::filesystem;

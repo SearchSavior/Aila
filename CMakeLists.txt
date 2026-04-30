@@ -35,15 +35,20 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsycl")
 # Core library sources (everything except main.cpp and CLI)
 set(LIB_SOURCES
     src/ops/Linear.cpp
+    src/ops/Bnb4BitLinear.cpp
     src/ops/NormOps.cpp
     src/ops/AttentionOps.cpp
     src/ops/ElementwiseOps.cpp
+    src/ops/VisionOps.cpp
     src/ops/SamplingOps.cpp
     src/ops/Transpose.cpp
     src/memory/KVCache.cpp
     src/models/Qwen3.cpp
+    src/models/Qwen3Bnb4.cpp
     src/models/Qwen3DenseBackend.cpp
+    src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp
+    src/models/Qwen35HybridBnb4Backend.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp

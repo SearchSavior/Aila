@@ -24,7 +24,6 @@ void Qwen3Model::ensure_runtime_buffers(Context& ctx, int seq_len) {
     int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
 
     buf_.hidden   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
-    buf_.residual = Tensor::allocate(ctx, {(int64_t)new_cap, H});
     buf_.normed   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
     buf_.qkv      = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(QD + 2 * KVD)});
     buf_.q        = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)QD});
@@ -34,7 +33,6 @@ void Qwen3Model::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.gate_up  = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * FF)});
     buf_.gate     = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)FF});
     buf_.up       = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)FF});
-    buf_.ffn_out  = Tensor::allocate(ctx, {(int64_t)new_cap, H});
 
     runtime_seq_capacity_ = new_cap;
     AILA_LOG_INFO("[Qwen3] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);

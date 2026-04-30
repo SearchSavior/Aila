@@ -3,7 +3,7 @@ param(
     [string]$PresetsFile = 'perf\presets.json',
     [string]$Preset = '',
     [string]$ModelAlias = '',
-    [string]$ModelDir = '..\Qwen3.5-0.8B',
+    [string]$ModelDir = '',
     [string]$OutputDir = '',
     [string]$Phase = 'manual',
     [string[]]$CaseNames = @(),

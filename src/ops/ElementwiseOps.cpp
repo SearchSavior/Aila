@@ -293,6 +293,37 @@ void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_
         });
 }
 
+void gelu_tanh_inplace(Context& ctx, Tensor& input, int n) {
+    bf16* ptr = static_cast<bf16*>(input.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            int i = idx[0];
+            float x = static_cast<float>(ptr[i]);
+            float u = kAlpha * (x + 0.044715f * x * x * x);
+            ptr[i] = bf16(0.5f * x * (1.0f + sycl::tanh(u)));
+        });
+}
+
+void bias_add_inplace(Context& ctx, Tensor& input, Tensor& bias, int rows, int cols) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    bf16* bias_bf16_ptr = nullptr;
+    float* bias_f32_ptr = nullptr;
+    if (bias.dtype() == dnnl::memory::data_type::f32) {
+        bias_f32_ptr = static_cast<float*>(bias.data());
+    } else {
+        bias_bf16_ptr = static_cast<bf16*>(bias.data());
+    }
+
+    ctx.queue().parallel_for(sycl::range<2>(rows, cols),
+        [=](sycl::id<2> idx) {
+            int row = idx[0];
+            int col = idx[1];
+            float b = bias_f32_ptr ? bias_f32_ptr[col] : static_cast<float>(bias_bf16_ptr[col]);
+            int offset = row * cols + col;
+            in_ptr[offset] = bf16(static_cast<float>(in_ptr[offset]) + b);
+        });
+}
 
 // ============================================================
 // SYCL Kernel: Residual Add (a += b, in-place)

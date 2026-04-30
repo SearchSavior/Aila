@@ -101,6 +101,25 @@ inline bool is_exact_qwen35_hybrid_0p8b_spec(const Qwen35TextConfig& cfg) {
            cfg.linear_conv_kernel_dim == 4;
 }
 
+inline bool is_exact_qwen35_hybrid_4b_spec(const Qwen35TextConfig& cfg) {
+    return cfg.hidden_size == 2560 &&
+           cfg.num_attention_heads == 16 &&
+           cfg.num_key_value_heads == 4 &&
+           cfg.head_dim == 256 &&
+           cfg.num_hidden_layers == 32 &&
+           cfg.intermediate_size == 9216 &&
+           cfg.linear_num_key_heads == 16 &&
+           cfg.linear_num_value_heads == 32 &&
+           cfg.linear_key_head_dim == 128 &&
+           cfg.linear_value_head_dim == 128 &&
+           cfg.linear_conv_kernel_dim == 4;
+}
+
+inline bool is_supported_qwen35_hybrid_text_spec(const Qwen35TextConfig& cfg) {
+    return is_exact_qwen35_hybrid_0p8b_spec(cfg) ||
+           is_exact_qwen35_hybrid_4b_spec(cfg);
+}
+
 inline bool is_supported_qwen35_hybrid_0p8b_spec(const Qwen35TextConfig& cfg) {
     return is_exact_qwen35_hybrid_0p8b_spec(cfg);
 }
@@ -122,6 +141,24 @@ struct VisionConfig {
     int spatial_merge_size = 0;
 };
 
+struct QuantizationConfig {
+    std::string quant_method;
+    bool load_in_4bit = false;
+    bool load_in_8bit = false;
+    std::string bnb_4bit_quant_type;
+    std::string bnb_4bit_compute_dtype;
+    std::string bnb_4bit_quant_storage;
+    bool bnb_4bit_use_double_quant = false;
+
+    bool enabled() const {
+        return !quant_method.empty() || load_in_4bit || load_in_8bit;
+    }
+
+    bool is_bitsandbytes_4bit() const {
+        return quant_method == "bitsandbytes" && load_in_4bit;
+    }
+};
+
 struct ModelSpec {
     ModelFamily family = ModelFamily::Qwen3Dense;
     std::string model_type;
@@ -133,7 +170,12 @@ struct ModelSpec {
     Qwen35TextConfig qwen35_text{};
     VisionConfig vision{};
 
+    // Model-level quantization metadata
+    QuantizationConfig quantization{};
+
     bool has_vision() const { return vision.enabled; }
+    bool is_quantized() const { return quantization.enabled(); }
+    bool is_bitsandbytes_4bit() const { return quantization.is_bitsandbytes_4bit(); }
 };
 
 enum class EngineErrorCode {

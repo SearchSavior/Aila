@@ -3,6 +3,8 @@
 #include "../src/core/Context.hpp"
 #include "../src/models/IModelBackend.hpp"
 #include "../src/models/Qwen3DenseBackend.hpp"
+#include "../src/models/Qwen3Bnb4Backend.hpp"
+#include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/utils/Tokenizer.hpp"
@@ -42,17 +44,67 @@ public:
         ctx_ = std::make_unique<Context>();
 
         // 2. Load tokenizer
-        AILA_LOG_INFO("[2/3] Loading tokenizer...");
+        AILA_LOG_INFO("[2/4] Loading tokenizer...");
         if (!tokenizer_.load(model_dir)) {
             AILA_LOG_ERROR("Failed to load tokenizer");
             return false;
         }
 
-        // 3. Load model weights
-        AILA_LOG_INFO("[3/3] Loading model weights...");
-        weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
+        auto validate_quantization = [&](const ModelSpec& spec, std::string* error_message) -> bool {
+            if (!spec.is_quantized()) {
+                return true;
+            }
+            const auto& quant = spec.quantization;
+            if (!spec.is_bitsandbytes_4bit()) {
+                if (error_message) {
+                    *error_message = "Only bitsandbytes 4-bit checkpoints are supported in the quantized path";
+                }
+                return false;
+            }
+            if (quant.bnb_4bit_quant_type != "nf4") {
+                if (error_message) {
+                    *error_message = "Only bitsandbytes NF4 checkpoints are supported";
+                }
+                return false;
+            }
+            if (quant.bnb_4bit_quant_storage != "uint8") {
+                if (error_message) {
+                    *error_message = "Only bitsandbytes uint8 packed storage is supported";
+                }
+                return false;
+            }
+            if (quant.bnb_4bit_compute_dtype != "float16") {
+                if (error_message) {
+                    *error_message = "On XPU, quantized bitsandbytes checkpoints must use bnb_4bit_compute_dtype=float16";
+                }
+                return false;
+            }
+            if (spec.family == ModelFamily::Qwen3Dense) {
+                return true;
+            }
+            if (spec.family == ModelFamily::Qwen35Hybrid) {
+                if (!is_supported_qwen35_hybrid_text_spec(spec.qwen35_text)) {
+                    if (error_message) {
+                        *error_message = "Qwen3.5 bitsandbytes v1 currently supports only the exact supported hybrid specs";
+                    }
+                    return false;
+                }
+                if (!aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true)) {
+                    if (error_message) {
+                        *error_message = "Qwen3.5 bitsandbytes v1 requires AILA_Q35_LINEAR_DELTA=1";
+                    }
+                    return false;
+                }
+                return true;
+            }
+            if (error_message) {
+                *error_message = "bitsandbytes quantized inference is currently supported only for Qwen3 dense and Qwen3.5 hybrid text models";
+            }
+            return false;
+        };
 
-        // 3.5 Load unified model spec
+        // 3. Load unified model spec
+        AILA_LOG_INFO("[3/4] Loading model metadata...");
         {
             std::string spec_error;
             if (!aila::modelspec::load_from_dir(model_dir, model_spec_, &spec_error)) {
@@ -83,8 +135,6 @@ public:
                     AILA_LOG_INFO("[ModelSpec] vision encoder found");
                 }
 
-                // Qwen3.5-0.8B is a VL-capable model. In text-only phase, a stronger
-                // default system prompt avoids drifting to image-assumption replies.
                 if (!model_spec_.vision.enabled && system_prompt_ == "You are a helpful assistant.") {
                     system_prompt_ =
                         "You are a helpful text assistant. "
@@ -98,6 +148,21 @@ public:
                               model_spec_.model_type.empty() ? "qwen3" : model_spec_.model_type.c_str(),
                               config_.hidden_size, config_.num_hidden_layers, config_.vocab_size);
             }
+
+            if (model_spec_.is_quantized()) {
+                AILA_LOG_INFO("[ModelSpec] quantization method=%s 4bit=%s type=%s compute_dtype=%s storage=%s double_quant=%s",
+                              model_spec_.quantization.quant_method.c_str(),
+                              model_spec_.quantization.load_in_4bit ? "true" : "false",
+                              model_spec_.quantization.bnb_4bit_quant_type.c_str(),
+                              model_spec_.quantization.bnb_4bit_compute_dtype.c_str(),
+                              model_spec_.quantization.bnb_4bit_quant_storage.c_str(),
+                              model_spec_.quantization.bnb_4bit_use_double_quant ? "true" : "false");
+                std::string quant_error;
+                if (!validate_quantization(model_spec_, &quant_error)) {
+                    AILA_LOG_ERROR("[ModelSpec] %s", quant_error.c_str());
+                    return false;
+                }
+            }
         }
 
         if (max_seq_len > config_.max_position_embeddings) {
@@ -106,8 +171,18 @@ public:
             max_seq_len = config_.max_position_embeddings;
         }
 
-        // 4. Initialize backend
-        if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+        // 4. Load model weights
+        AILA_LOG_INFO("[4/4] Loading model weights...");
+        weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
+
+        // 5. Initialize backend
+        if (model_spec_.is_bitsandbytes_4bit()) {
+            if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+                backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
+            } else {
+                backend_ = std::make_unique<Qwen3Bnb4Backend>();
+            }
+        } else if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
             backend_ = std::make_unique<Qwen35HybridTextBackend>();
         } else {
             backend_ = std::make_unique<Qwen3DenseBackend>();
@@ -754,9 +829,59 @@ public:
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
         }
-        if (auto* q35_backend = dynamic_cast<Qwen35HybridTextBackend*>(backend_.get())) {
-            q35_backend->clear_embedding_overrides();
-            q35_backend->clear_mrope_positions();
+        if (backend_->supports_vision_embedding_override()) {
+            backend_->clear_embedding_overrides();
+            backend_->clear_mrope_positions();
+        }
+
+        auto trim_copy = [](const std::string& s) -> std::string {
+            std::string out = s;
+            while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
+                out.pop_back();
+            }
+            return out;
+        };
+        auto ends_with_no_think = [&](const std::string& s) -> bool {
+            const std::string cmd = "/no_think";
+            std::string t = trim_copy(s);
+            if (t.size() < cmd.size()) return false;
+            size_t pos = t.size() - cmd.size();
+            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
+            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
+        };
+        auto strip_leading_think_artifacts = [](std::string& text) {
+            auto ltrim = [](std::string& x) {
+                size_t i = 0;
+                while (i < x.size() && std::isspace(static_cast<unsigned char>(x[i]))) ++i;
+                if (i > 0) x.erase(0, i);
+            };
+
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                ltrim(text);
+                if (text.rfind("<think>", 0) == 0) {
+                    text.erase(0, 7);
+                    changed = true;
+                    continue;
+                }
+                if (text.rfind("</think>", 0) == 0) {
+                    text.erase(0, 8);
+                    changed = true;
+                    continue;
+                }
+            }
+            ltrim(text);
+        };
+        bool no_think_requested = false;
+        if (!messages.empty() && messages.back().role == "user") {
+            std::string merged_user_text;
+            for (const auto& part : messages.back().content) {
+                if (part.type == ContentType::Text) {
+                    merged_user_text += part.text;
+                }
+            }
+            no_think_requested = ends_with_no_think(merged_user_text);
         }
 
         GenerationConfig tuned_cfg = gen_config;
@@ -887,10 +1012,9 @@ public:
         }
 
         if (total_vision_tokens > 0) {
-            auto* q35_backend = dynamic_cast<Qwen35HybridTextBackend*>(backend_.get());
-            if (!q35_backend) {
+            if (!backend_->supports_vision_embedding_override()) {
                 set_error(EngineErrorCode::RuntimeError,
-                          "Vision embedding override requires Qwen35 backend");
+                          "Vision embedding override requires a backend with multimodal injection support");
                 return "";
             }
 
@@ -918,7 +1042,7 @@ public:
                 return "";
             }
 
-            q35_backend->set_embedding_overrides(image_positions, vision_embeddings_flat, config_.hidden_size);
+            backend_->set_embedding_overrides(image_positions, vision_embeddings_flat, config_.hidden_size);
             std::vector<int> pos_t(full_ids.size(), 0);
             std::vector<int> pos_h(full_ids.size(), 0);
             std::vector<int> pos_w(full_ids.size(), 0);
@@ -975,7 +1099,7 @@ public:
                 max_pos = std::max(max_pos, std::max({pos_t[i], pos_h[i], pos_w[i]}));
             }
             const int text_pos_delta = max_pos + 1 - static_cast<int>(full_ids.size());
-            q35_backend->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, text_pos_delta);
+            backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, text_pos_delta);
             AILA_LOG_INFO("[Vision] Injecting %zu image embeddings into prompt", total_vision_tokens);
             AILA_LOG_INFO("[Vision] Applied multimodal text RoPE positions (delta=%d)", text_pos_delta);
         }
@@ -1093,6 +1217,27 @@ public:
 
         std::string output_text;
         bool streaming = (token_callback != nullptr);
+        bool suppress_leading_think = no_think_requested;
+        auto emit_stream_piece = [&](const std::string& piece) {
+            if (no_think_requested && suppress_leading_think) {
+                if (piece == "<think>" || piece == "</think>") {
+                    return;
+                }
+                bool all_ws = true;
+                for (unsigned char c : piece) {
+                    if (!std::isspace(c)) {
+                        all_ws = false;
+                        break;
+                    }
+                }
+                if (all_ws) {
+                    return;
+                }
+                suppress_leading_think = false;
+            }
+            output_text += piece;
+            token_callback(piece);
+        };
         int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
                                              : std::max(1, tuned_cfg.decode_chunk_size);
         bool use_chunked_fast_decode = (!tuned_cfg.has_penalties()) &&
@@ -1168,8 +1313,7 @@ public:
                     }
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(current_token);
-                        output_text += token_text;
-                        token_callback(token_text);
+                        emit_stream_piece(token_text);
                     }
                 }
             }
@@ -1229,6 +1373,9 @@ public:
 
         if (!streaming && !generated_token_ids.empty()) {
             output_text = tokenizer_.decode(generated_token_ids);
+        }
+        if (no_think_requested) {
+            strip_leading_think_artifacts(output_text);
         }
 
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();

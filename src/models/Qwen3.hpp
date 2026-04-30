@@ -71,7 +71,6 @@ private:
     // Pre-allocated activation buffers
     struct Buffers {
         Tensor hidden;       // [max_seq, hidden_size]
-        Tensor residual;     // [max_seq, hidden_size]
         Tensor normed;       // [max_seq, hidden_size]
         Tensor qkv;          // [max_seq, q_dim + kv_dim + kv_dim]
         Tensor q;            // [max_seq, num_heads * head_dim]
@@ -81,7 +80,6 @@ private:
         Tensor gate_up;      // [max_seq, 2 * intermediate_size]
         Tensor gate;         // [max_seq, intermediate_size]
         Tensor up;           // [max_seq, intermediate_size]
-        Tensor ffn_out;      // [max_seq, hidden_size]
         Tensor logits;       // [1, vocab_size]
         Tensor decode_scores;// [num_heads, max_seq] for decode attention
         Tensor scores;       // [num_heads, max_seq, max_seq] for prefill attention

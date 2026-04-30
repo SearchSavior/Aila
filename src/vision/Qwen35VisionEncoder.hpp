@@ -2,8 +2,10 @@
 
 #include "engine/Types.hpp"
 #include "utils/SafeTensors.hpp"
+#include "../ops/Ops.hpp"
 #include <string>
 #include <vector>
+#include <deque>
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
@@ -24,6 +26,8 @@ struct VisionEncodeResult {
 
 class Qwen35VisionEncoder {
 public:
+    ~Qwen35VisionEncoder();
+
     bool load(Context& ctx,
               ModelWeights& weights,
               const ModelSpec& spec,
@@ -35,25 +39,44 @@ public:
 
     bool encode_image(const std::string& uri,
                       VisionEncodeResult& out,
-                      std::string* error_message) const;
+                      std::string* error_message);
 
 private:
     struct BlockWeights {
-        std::vector<float> ln1_w;
-        std::vector<float> ln1_b;
-        std::vector<float> qkv_w;
-        std::vector<float> qkv_b;
-        std::vector<float> proj_w;
-        std::vector<float> proj_b;
-        std::vector<float> ln2_w;
-        std::vector<float> ln2_b;
-        std::vector<float> fc1_w;
-        std::vector<float> fc1_b;
-        std::vector<float> fc2_w;
-        std::vector<float> fc2_b;
+        Tensor* ln1_weight = nullptr;
+        Tensor* ln1_bias = nullptr;
+        Linear qkv;
+        Tensor* qkv_bias = nullptr;
+        Linear proj;
+        Tensor* proj_bias = nullptr;
+        Tensor* ln2_weight = nullptr;
+        Tensor* ln2_bias = nullptr;
+        Linear fc1;
+        Tensor* fc1_bias = nullptr;
+        Linear fc2;
+        Tensor* fc2_bias = nullptr;
+    };
+
+    struct RuntimeBuffers {
+        Tensor image_rgb;      // u8 [bytes]
+        Tensor patch_rows;     // bf16 [patch_cap, patch_dim]
+        Tensor hidden_a;       // bf16 [patch_cap, hidden]
+        Tensor hidden_b;       // bf16 [patch_cap, hidden]
+        Tensor normed;         // bf16 [patch_cap, hidden]
+        Tensor qkv;            // bf16 [patch_cap, 3 * hidden]
+        Tensor q;              // bf16 [patch_cap, hidden]
+        Tensor k;              // bf16 [patch_cap, hidden]
+        Tensor v;              // bf16 [patch_cap, hidden]
+        Tensor attn_out;       // bf16 [patch_cap, hidden]
+        Tensor ffn;            // bf16 [patch_cap, intermediate]
+        Tensor merger_normed;  // bf16 [out_cap, merger_in_dim]
+        Tensor merger_hidden;  // bf16 [out_cap, merger_fc1_out]
+        Tensor merger_out;     // bf16 [out_cap, out_hidden]
+        Tensor scores;         // f32 [num_heads, patch_cap, patch_cap]
     };
 
     bool loaded_ = false;
+    Context* ctx_ = nullptr;
 
     int depth_ = 0;
     int hidden_size_ = 0;
@@ -64,26 +87,43 @@ private:
     int patch_size_ = 16;
     int merge_size_ = 2;
 
-    int min_tokens_ = 8;
-    int max_tokens_ = 64;
+    int min_tokens_ = 1;
+    int max_tokens_ = 1024;
     int min_pixels_ = 256 * 256;
     int max_pixels_ = 1024 * 1024;
 
     float image_mean_[3] = {0.5f, 0.5f, 0.5f};
     float image_std_[3] = {0.5f, 0.5f, 0.5f};
 
-    std::vector<float> patch_kernel_fused_; // [hidden, 3, patch, patch]
-    std::vector<float> patch_bias_;          // [hidden]
-    std::vector<float> pos_embed_;           // [pos_len, hidden]
+    Tensor* patch_weight_ = nullptr;
+    Tensor* patch_bias_ = nullptr;
+    Linear patch_proj_;
+    Tensor* pos_embed_ = nullptr;
+    int pos_embed_len_ = 0;
 
     std::vector<BlockWeights> blocks_;
 
-    std::vector<float> merger_norm_w_;       // optional [hidden]
-    std::vector<float> merger_norm_b_;       // optional [hidden]
-    std::vector<float> merger_fc1_w_;        // [3072, 3072]
-    std::vector<float> merger_fc1_b_;        // [3072]
-    std::vector<float> merger_fc2_w_;        // [out_hidden, 3072]
-    std::vector<float> merger_fc2_b_;        // [out_hidden]
+    Tensor* merger_norm_weight_ = nullptr;
+    Tensor* merger_norm_bias_ = nullptr;
+    Linear merger_fc1_;
+    Tensor* merger_fc1_bias_ = nullptr;
+    int merger_fc1_out_ = 0;
+    Linear merger_fc2_;
+    Tensor* merger_fc2_bias_ = nullptr;
+
+    RuntimeBuffers buf_;
+    Tensor empty_tensor_;
+    std::deque<Tensor> owned_weights_;
+
+    int image_bytes_capacity_ = 0;
+    int patch_capacity_ = 0;
+    int out_token_capacity_ = 0;
+
+    std::vector<int> pos_y_host_;
+    std::vector<int> pos_x_host_;
+    int* pos_y_device_ = nullptr;
+    int* pos_x_device_ = nullptr;
+    int pos_capacity_ = 0;
 
     static bool read_image_rgb(const std::string& uri,
                                int& width,
@@ -106,32 +146,26 @@ private:
                                    int& out_w,
                                    int& out_h);
 
-    static void layer_norm_affine(const std::vector<float>& in,
-                                  int rows,
-                                  int cols,
-                                  const std::vector<float>& gamma,
-                                  const std::vector<float>& beta,
-                                  float eps,
-                                  std::vector<float>& out);
+    Tensor* get_tensor(ModelWeights& weights,
+                       const std::string& name,
+                       std::string* error_message,
+                       bool required = true);
+    Tensor* ensure_bf16_weight(Context& ctx,
+                               ModelWeights& weights,
+                               const std::string& name,
+                               std::string* error_message,
+                               bool required = true);
+    bool prepare_patch_weight(Context& ctx,
+                              ModelWeights& weights,
+                              std::string* error_message);
 
-    static void linear_rowmajor(const std::vector<float>& in,
-                                int rows,
-                                int in_dim,
-                                const std::vector<float>& weight,
-                                const std::vector<float>& bias,
-                                int out_dim,
-                                std::vector<float>& out);
-
-    static void gelu_tanh_inplace(std::vector<float>& x);
-
-    static void softmax_inplace(std::vector<float>& x);
-
-    static bool read_tensor_as_float(Context& ctx,
-                                     ModelWeights& weights,
-                                     const std::string& name,
-                                     std::vector<float>& out,
-                                     std::string* error_message,
-                                     bool required = true);
+    void ensure_runtime_buffers(int image_bytes,
+                                int num_patches,
+                                int out_tokens,
+                                int merger_in_dim);
+    void ensure_position_buffers(int num_patches);
+    void release_runtime_buffers();
+    void fill_merge_block_positions(int grid_w, int grid_h);
 
     bool read_preprocessor(const std::string& model_dir, std::string* error_message);
 };

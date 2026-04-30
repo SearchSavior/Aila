@@ -1,25 +1,50 @@
 {
   "schemaVersion": 1,
   "models": {
-    "q35_text": {
-      "path": "Qwen3.5-0.8B",
+    "q35_08": {
+      "path": "./models/Qwen3.5-0.8B",
       "maxSeqLen": 4096,
       "description": "Qwen3.5-0.8B text anchor"
     },
+    "q35_4": {
+      "path": "./models/Qwen3.5-4B",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-4B text anchor"
+    },
+    "q35_08_bnb_nf4": {
+      "path": "./models/qwen3.5-0.8B-bnb-nf4-offline",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-0.8B bitsandbytes NF4 offline export"
+    },
+    "q35_4_bnb_nf4": {
+      "path": "./models/qwen3.5-4B-bnb-nf4-offline",
+      "maxSeqLen": 4096,
+      "description": "Qwen3.5-4B bitsandbytes NF4 offline export"
+    },
     "q3_06": {
-      "path": "Qwen3-0.6B",
+      "path": "./models/Qwen3-0.6B",
       "maxSeqLen": 4096,
       "description": "Qwen3-0.6B smoke regression"
     },
     "q3_4": {
-      "path": "Qwen3-4B",
+      "path": "./models/Qwen3-4B",
       "maxSeqLen": 4096,
       "description": "Qwen3-4B smoke regression"
+    },
+    "q3_4_bnb_nf4": {
+      "path": "./models/qwen3-4B-bnb-nf4-offline",
+      "maxSeqLen": 4096,
+      "description": "Qwen3-4B bitsandbytes NF4 offline export"
+    },
+    "q3_06_bnb_nf4": {
+      "path": "./models/qwen3-0.6B-bnb-nf4-offline",
+      "maxSeqLen": 4096,
+      "description": "Qwen3-0.6B bitsandbytes NF4 offline export"
     }
   },
   "presets": {
     "phase_gate_q35_text": {
-      "anchorModel": "q35_text",
+      "anchorModel": "q35_08",
       "build": {
         "buildDir": "build",
         "config": "Release",
@@ -53,8 +78,8 @@
         },
         {
           "name": "sample_main",
-          "promptTokens": 256,
-          "genTokens": 256,
+          "promptTokens": 2048,
+          "genTokens": 1024,
           "benchIters": 2,
           "warmupIters": 1,
           "mode": "sample",
@@ -80,7 +105,7 @@
       "smokes": [
         {
           "name": "q35_text_smoke",
-          "modelAlias": "q35_text",
+          "modelAlias": "q35_08",
           "messagesJson": "perf/fixtures/smoke_text_qa.json",
           "maxTokens": 16,
           "mode": "greedy",
@@ -89,7 +114,7 @@
         },
         {
           "name": "q35_multiturn_smoke",
-          "modelAlias": "q35_text",
+          "modelAlias": "q35_08",
           "messagesJson": "perf/fixtures/smoke_multi_turn.json",
           "maxTokens": 24,
           "mode": "sample",
@@ -101,8 +126,41 @@
           "expectContainsAny": ["Alice", "alice", "爱丽丝"]
         },
         {
+          "name": "q35_08_bnb_nf4_smoke",
+          "modelAlias": "q35_08_bnb_nf4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectContainsAny": ["2", "二", "两"]
+        },
+        {
+          "name": "q35_4_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        },
+        {
+          "name": "q35_4_bnb_nf4_smoke",
+          "modelAlias": "q35_4_bnb_nf4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        },
+        {
           "name": "q3_06_smoke",
           "modelAlias": "q3_06",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        },
+        {
+          "name": "q3_06_bnb_nf4_smoke",
+          "modelAlias": "q3_06_bnb_nf4",
           "messagesJson": "perf/fixtures/smoke_text_qa.json",
           "maxTokens": 16,
           "mode": "greedy",
@@ -115,11 +173,226 @@
           "maxTokens": 16,
           "mode": "greedy",
           "expectNonEmpty": true
+        },
+        {
+          "name": "q3_4_bnb_nf4_smoke",
+          "modelAlias": "q3_4_bnb_nf4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
         }
       ],
       "autotune": {
         "enabled": false,
         "benchmarkCase": "greedy_main",
+        "objective": "decodeTokPerSec"
+      }
+    },
+    "phase_gate_q3_bnb4": {
+      "anchorModel": "q3_06_bnb_nf4",
+      "build": {
+        "buildDir": "build",
+        "config": "Release",
+        "jobs": 36,
+        "clean": false
+      },
+      "benchmarks": [
+        {
+          "name": "bnb4_greedy_short",
+          "promptTokens": 64,
+          "genTokens": 64,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "greedy",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        },
+        {
+          "name": "bnb4_greedy_main",
+          "promptTokens": 128,
+          "genTokens": 128,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "greedy",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        },
+        {
+          "name": "bnb4_prefill_512",
+          "promptTokens": 512,
+          "genTokens": 16,
+          "benchIters": 2,
+          "warmupIters": 1,
+          "mode": "greedy",
+          "temperature": 0.7,
+          "topK": 15,
+          "topP": 0.95,
+          "seed": 42
+        }
+      ],
+      "decodeProfile": {
+        "name": "bnb4_decode_profile",
+        "promptTokens": 128,
+        "genTokens": 128,
+        "benchIters": 1,
+        "warmupIters": 1,
+        "mode": "greedy",
+        "temperature": 0.7,
+        "topK": 15,
+        "topP": 0.95,
+        "seed": 42,
+        "profileEvery": 32
+      },
+      "smokes": [
+        {
+          "name": "q3_06_bnb_nf4_smoke",
+          "modelAlias": "q3_06_bnb_nf4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        },
+        {
+          "name": "q3_4_bnb_nf4_smoke",
+          "modelAlias": "q3_4_bnb_nf4",
+          "messagesJson": "perf/fixtures/smoke_text_qa.json",
+          "maxTokens": 16,
+          "mode": "greedy",
+          "expectNonEmpty": true
+        }
+      ],
+      "autotune": {
+        "enabled": false,
+        "benchmarkCase": "bnb4_greedy_main",
+        "objective": "decodeTokPerSec"
+      }
+    },
+    "phase_gate_q35_vision": {
+      "anchorModel": "q35_08",
+      "build": {
+        "buildDir": "build",
+        "config": "Release",
+        "jobs": 36,
+        "clean": false
+      },
+      "smokes": [
+        {
+          "name": "q35_08_ocr_test_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/ocr_test_messages.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "1\\s*\\+\\s*1\\s*=\\s*2"
+        },
+        {
+          "name": "q35_08_ocr_test_2_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/ocr_test_2_messages.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "This\\s+is(\\s+a)?\\s+OCR\\s+Test"
+        },
+        {
+          "name": "q35_08_crane_count_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/crane_count.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(2|二|两)(\\s*只)?(\\s*(成鸟|鸟))?\\s*$"
+        },
+        {
+          "name": "q35_08_rooster_big_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/rooster_count_big.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_08_rooster_medium_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/rooster_count_medium.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_08_rooster_small_smoke",
+          "modelAlias": "q35_08",
+          "messagesJson": "tmp/rooster_count_small.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_4_ocr_test_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/ocr_test_messages.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "1\\s*\\+\\s*1\\s*=\\s*2"
+        },
+        {
+          "name": "q35_4_ocr_test_2_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/ocr_test_2_messages.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "This\\s+is(\\s+a)?\\s+OCR\\s+Test"
+        },
+        {
+          "name": "q35_4_crane_count_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/crane_count.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(2|二|两)(\\s*只)?(\\s*(成鸟|鸟))?\\s*$"
+        },
+        {
+          "name": "q35_4_rooster_big_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/rooster_count_big.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_4_rooster_medium_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/rooster_count_medium.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        },
+        {
+          "name": "q35_4_rooster_small_smoke",
+          "modelAlias": "q35_4",
+          "messagesJson": "tmp/rooster_count_small.json",
+          "maxTokens": 24,
+          "mode": "greedy",
+          "expectNonEmpty": true,
+          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+        }
+      ],
+      "autotune": {
+        "enabled": false,
+        "benchmarkCase": "",
         "objective": "decodeTokPerSec"
       }
     }

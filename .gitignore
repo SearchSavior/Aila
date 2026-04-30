@@ -1,6 +1,7 @@
 llama.cpp/
 oneDNN/
 build/
+bitsandbytes/
+models/
 *.txt
 tmp/
-Qwen3*/

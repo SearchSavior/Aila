@@ -21,17 +21,18 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+    bool supports_vision_embedding_override() const override { return true; }
 
     void set_embedding_overrides(const std::vector<int>& positions,
                                  const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
-                                 int hidden_size);
-    void clear_embedding_overrides();
+                                 int hidden_size) override;
+    void clear_embedding_overrides() override;
     void set_mrope_positions(Context& ctx,
                              const std::vector<int>& pos_t,
                              const std::vector<int>& pos_h,
                              const std::vector<int>& pos_w,
-                             int text_pos_delta);
-    void clear_mrope_positions();
+                             int text_pos_delta) override;
+    void clear_mrope_positions() override;
 
 private:
     struct Layer {

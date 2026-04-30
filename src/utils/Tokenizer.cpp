@@ -193,93 +193,24 @@ std::unordered_map<std::string, uint8_t> Tokenizer::unicode_to_byte() {
 // ============================================================
 
 bool Tokenizer::load(const std::string& model_dir) {
-    std::string vocab_path = model_dir + "/vocab.json";
-    std::string merges_path = model_dir + "/merges.txt";
+    const std::string vocab_path = model_dir + "/vocab.json";
+    const std::string merges_path = model_dir + "/merges.txt";
+    const std::string tokenizer_json_path = model_dir + "/tokenizer.json";
 
-    // --- Load vocab.json ---
-    try {
-        std::ifstream vf(vocab_path, std::ios::binary);
-        if (!vf.is_open()) {
-            AILA_LOG_ERROR("[Tokenizer] Cannot open %s", vocab_path.c_str());
-            return false;
-        }
-        std::string vocab_str((std::istreambuf_iterator<char>(vf)),
-                               std::istreambuf_iterator<char>());
-        vf.close();
+    token_to_id_.clear();
+    id_to_token_.clear();
+    merges_.clear();
+    merge_rank_.clear();
+    special_tokens_.clear();
+    special_token_order_.clear();
 
-        simdjson::padded_string padded(vocab_str);
-        simdjson::ondemand::parser parser;
-        simdjson::ondemand::document doc = parser.iterate(padded);
-
-        int max_id = 0;
-        {
-            simdjson::padded_string padded2(vocab_str);
-            simdjson::ondemand::parser parser2;
-            simdjson::ondemand::document doc2 = parser2.iterate(padded2);
-            for (auto field : doc2.get_object()) {
-                int64_t id = field.value().get_int64();
-                if (id > max_id) max_id = static_cast<int>(id);
+    auto load_special_tokens_from_tokenizer_json = [&]() {
+        try {
+            std::ifstream tf(tokenizer_json_path, std::ios::binary);
+            if (!tf.is_open()) {
+                return;
             }
-        }
 
-        id_to_token_.resize(max_id + 1);
-
-        for (auto field : doc.get_object()) {
-            std::string_view key = field.unescaped_key();
-            int64_t id = field.value().get_int64();
-            std::string token_str(key);
-            token_to_id_[token_str] = static_cast<int>(id);
-            if (id >= 0 && id < static_cast<int64_t>(id_to_token_.size())) {
-                id_to_token_[static_cast<int>(id)] = token_str;
-            }
-        }
-
-        AILA_LOG_INFO("[Tokenizer] Loaded vocab: %zu tokens (max_id=%d)",
-                      token_to_id_.size(), max_id);
-
-    } catch (const std::exception& e) {
-        AILA_LOG_ERROR("[Tokenizer] Failed to load vocab: %s", e.what());
-        return false;
-    }
-
-    // --- Load merges.txt ---
-    try {
-        std::ifstream mf(merges_path);
-        if (!mf.is_open()) {
-            AILA_LOG_ERROR("[Tokenizer] Cannot open %s", merges_path.c_str());
-            return false;
-        }
-
-        std::string line;
-        int rank = 0;
-        while (std::getline(mf, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            auto space_pos = line.find(' ');
-            if (space_pos == std::string::npos) continue;
-
-            MergeRule rule;
-            rule.a = line.substr(0, space_pos);
-            rule.b = line.substr(space_pos + 1);
-            rule.merged = rule.a + rule.b;
-
-            merges_.push_back(rule);
-            merge_rank_[rule.a + " " + rule.b] = rank;
-            rank++;
-        }
-        mf.close();
-
-        AILA_LOG_INFO("[Tokenizer] Loaded %zu merge rules", merges_.size());
-
-    } catch (const std::exception& e) {
-        AILA_LOG_ERROR("[Tokenizer] Failed to load merges: %s", e.what());
-        return false;
-    }
-
-    // --- Load special tokens from tokenizer.json ---
-    try {
-        std::string tokenizer_json_path = model_dir + "/tokenizer.json";
-        std::ifstream tf(tokenizer_json_path, std::ios::binary);
-        if (tf.is_open()) {
             std::string tj_str((std::istreambuf_iterator<char>(tf)),
                                 std::istreambuf_iterator<char>());
             tf.close();
@@ -294,7 +225,6 @@ bool Tokenizer::load(const std::string& model_dir) {
                 int64_t id = token_obj["id"].get_int64();
                 std::string tok_str(content);
 
-                // Add to vocab maps
                 token_to_id_[tok_str] = static_cast<int>(id);
                 if (id >= static_cast<int64_t>(id_to_token_.size())) {
                     id_to_token_.resize(static_cast<size_t>(id) + 1);
@@ -305,12 +235,150 @@ bool Tokenizer::load(const std::string& model_dir) {
 
             AILA_LOG_INFO("[Tokenizer] Loaded %zu special tokens from tokenizer.json",
                           special_tokens_.size());
+        } catch (const std::exception& e) {
+            AILA_LOG_WARN("[Tokenizer] Could not load tokenizer.json special tokens: %s", e.what());
+        }
+    };
+
+    bool loaded_base_tokenizer = false;
+
+    try {
+        std::ifstream vf(vocab_path, std::ios::binary);
+        std::ifstream mf(merges_path);
+        if (vf.is_open() && mf.is_open()) {
+            std::string vocab_str((std::istreambuf_iterator<char>(vf)),
+                                   std::istreambuf_iterator<char>());
+            vf.close();
+
+            simdjson::padded_string padded(vocab_str);
+            simdjson::ondemand::parser parser;
+            simdjson::ondemand::document doc = parser.iterate(padded);
+
+            int max_id = 0;
+            {
+                simdjson::padded_string padded2(vocab_str);
+                simdjson::ondemand::parser parser2;
+                simdjson::ondemand::document doc2 = parser2.iterate(padded2);
+                for (auto field : doc2.get_object()) {
+                    int64_t id = field.value().get_int64();
+                    if (id > max_id) max_id = static_cast<int>(id);
+                }
+            }
+
+            id_to_token_.resize(max_id + 1);
+            for (auto field : doc.get_object()) {
+                std::string_view key = field.unescaped_key();
+                int64_t id = field.value().get_int64();
+                std::string token_str(key);
+                token_to_id_[token_str] = static_cast<int>(id);
+                if (id >= 0 && id < static_cast<int64_t>(id_to_token_.size())) {
+                    id_to_token_[static_cast<int>(id)] = token_str;
+                }
+            }
+            AILA_LOG_INFO("[Tokenizer] Loaded vocab: %zu tokens (max_id=%d)",
+                          token_to_id_.size(), max_id);
+
+            std::string line;
+            int rank = 0;
+            while (std::getline(mf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                auto space_pos = line.find(' ');
+                if (space_pos == std::string::npos) continue;
+
+                MergeRule rule;
+                rule.a = line.substr(0, space_pos);
+                rule.b = line.substr(space_pos + 1);
+                rule.merged = rule.a + rule.b;
+
+                merges_.push_back(rule);
+                merge_rank_[rule.a + " " + rule.b] = rank;
+                rank++;
+            }
+            mf.close();
+
+            AILA_LOG_INFO("[Tokenizer] Loaded %zu merge rules", merges_.size());
+            loaded_base_tokenizer = true;
         }
     } catch (const std::exception& e) {
-        AILA_LOG_WARN("[Tokenizer] Could not load tokenizer.json: %s", e.what());
+        AILA_LOG_ERROR("[Tokenizer] Failed to load legacy vocab/merges: %s", e.what());
+        return false;
     }
 
-    special_token_order_.clear();
+    if (!loaded_base_tokenizer) {
+        try {
+            std::ifstream tf(tokenizer_json_path, std::ios::binary);
+            if (!tf.is_open()) {
+                AILA_LOG_ERROR("[Tokenizer] Cannot open %s (legacy vocab.json/merges.txt also missing)",
+                               tokenizer_json_path.c_str());
+                return false;
+            }
+
+            std::string tj_str((std::istreambuf_iterator<char>(tf)),
+                                std::istreambuf_iterator<char>());
+            tf.close();
+
+            simdjson::padded_string tj_padded(tj_str);
+            simdjson::ondemand::parser tj_parser;
+            simdjson::ondemand::document tj_doc = tj_parser.iterate(tj_padded);
+            auto model = tj_doc["model"].get_object();
+
+            std::vector<std::pair<std::string, int>> vocab_entries;
+            int max_id = 0;
+            for (auto field : model["vocab"].get_object()) {
+                std::string_view key = field.unescaped_key();
+                int64_t id = field.value().get_int64();
+                vocab_entries.emplace_back(std::string(key), static_cast<int>(id));
+                if (id > max_id) {
+                    max_id = static_cast<int>(id);
+                }
+            }
+
+            id_to_token_.resize(max_id + 1);
+            for (const auto& [token, id] : vocab_entries) {
+                token_to_id_[token] = id;
+                if (id >= 0 && id < static_cast<int>(id_to_token_.size())) {
+                    id_to_token_[id] = token;
+                }
+            }
+
+            int rank = 0;
+            for (auto merge_entry : model["merges"].get_array()) {
+                std::string first;
+                std::string second;
+                int parts = 0;
+                for (auto item : merge_entry.get_array()) {
+                    std::string_view piece = item.get_string();
+                    if (parts == 0) {
+                        first = std::string(piece);
+                    } else if (parts == 1) {
+                        second = std::string(piece);
+                    }
+                    parts++;
+                }
+                if (parts != 2) {
+                    continue;
+                }
+
+                MergeRule rule;
+                rule.a = std::move(first);
+                rule.b = std::move(second);
+                rule.merged = rule.a + rule.b;
+                merges_.push_back(rule);
+                merge_rank_[rule.a + " " + rule.b] = rank;
+                rank++;
+            }
+
+            AILA_LOG_INFO("[Tokenizer] Loaded vocab from tokenizer.json: %zu tokens (max_id=%d)",
+                          token_to_id_.size(), max_id);
+            AILA_LOG_INFO("[Tokenizer] Loaded %zu merge rules from tokenizer.json", merges_.size());
+        } catch (const std::exception& e) {
+            AILA_LOG_ERROR("[Tokenizer] Failed to load tokenizer.json model: %s", e.what());
+            return false;
+        }
+    }
+
+    load_special_tokens_from_tokenizer_json();
+
     special_token_order_.reserve(special_tokens_.size());
     for (const auto& [token, _] : special_tokens_) {
         special_token_order_.push_back(token);
@@ -321,7 +389,6 @@ bool Tokenizer::load(const std::string& model_dir) {
                   return a < b;
               });
 
-    // Set key special token IDs
     auto find_special = [&](const std::string& token) -> int {
         auto it = special_tokens_.find(token);
         return (it != special_tokens_.end()) ? it->second : -1;

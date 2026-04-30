@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -84,119 +83,6 @@ std::string read_file_text(const std::string& path) {
                        std::istreambuf_iterator<char>());
 }
 
-float gelu_tanh_scalar(float x) {
-    constexpr float kAlpha = 0.7978845608028654f;
-    return 0.5f * x * (1.0f + std::tanh(kAlpha * (x + 0.044715f * x * x * x)));
-}
-
-void reorder_qwen_block_sequence(const std::vector<float>& src,
-                                 int grid_w,
-                                 int grid_h,
-                                 int hidden,
-                                 int merge_size,
-                                 std::vector<float>& dst,
-                                 std::vector<int>* pos_y = nullptr,
-                                 std::vector<int>* pos_x = nullptr) {
-    const int num_tokens = grid_w * grid_h;
-    dst.resize(static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden));
-    if (pos_y) pos_y->resize(static_cast<size_t>(num_tokens));
-    if (pos_x) pos_x->resize(static_cast<size_t>(num_tokens));
-
-    int out_idx = 0;
-    for (int by = 0; by < grid_h; by += merge_size) {
-        for (int bx = 0; bx < grid_w; bx += merge_size) {
-            for (int dy = 0; dy < merge_size; ++dy) {
-                for (int dx = 0; dx < merge_size; ++dx) {
-                    const int sy = by + dy;
-                    const int sx = bx + dx;
-                    const int src_idx = sy * grid_w + sx;
-                    std::memcpy(
-                        dst.data() + static_cast<size_t>(out_idx) * static_cast<size_t>(hidden),
-                        src.data() + static_cast<size_t>(src_idx) * static_cast<size_t>(hidden),
-                        static_cast<size_t>(hidden) * sizeof(float));
-                    if (pos_y) (*pos_y)[static_cast<size_t>(out_idx)] = sy;
-                    if (pos_x) (*pos_x)[static_cast<size_t>(out_idx)] = sx;
-                    ++out_idx;
-                }
-            }
-        }
-    }
-}
-
-void apply_qwen_vision_mrope_inplace(std::vector<float>& x,
-                                     int num_tokens,
-                                     int num_heads,
-                                     int head_dim,
-                                     const std::vector<int>& pos_y,
-                                     const std::vector<int>& pos_x) {
-    if (num_tokens <= 0 || num_heads <= 0 || head_dim <= 0) return;
-    if (static_cast<int>(pos_y.size()) != num_tokens || static_cast<int>(pos_x.size()) != num_tokens) return;
-
-    const int n_dims = head_dim / 2;
-    if (n_dims <= 0) return;
-
-    // Match ggml GGML_ROPE_TYPE_VISION:
-    // - rotate first/second half pairs
-    // - cache index advances over pair index
-    // - section sizes are expressed in head-dim units, not n_dims units
-    const int sections[4] = {
-        head_dim / 4,
-        head_dim / 4,
-        head_dim / 4,
-        head_dim - 3 * (head_dim / 4)
-    };
-    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
-    const int sec_w = sections[0] + sections[1];
-    const int sec_e = sec_w + sections[2];
-    const float theta_scale = std::pow(10000.0f, -2.0f / static_cast<float>(n_dims));
-
-    for (int t = 0; t < num_tokens; ++t) {
-        for (int h = 0; h < num_heads; ++h) {
-            float* v = x.data() +
-                       static_cast<size_t>(t) * static_cast<size_t>(num_heads * head_dim) +
-                       static_cast<size_t>(h) * static_cast<size_t>(head_dim);
-
-            float theta_t = static_cast<float>(pos_y[static_cast<size_t>(t)]);
-            float theta_h = static_cast<float>(pos_x[static_cast<size_t>(t)]);
-            float theta_w = static_cast<float>(pos_y[static_cast<size_t>(t)]);
-            float theta_e = static_cast<float>(pos_x[static_cast<size_t>(t)]);
-
-            for (int p = 0; p < n_dims; ++p) {
-                const int sector = sect_dims > 0 ? (p % sect_dims) : 0;
-                if (sector == 0) {
-                    theta_t = static_cast<float>(pos_y[static_cast<size_t>(t)]);
-                } else if (sector == sections[0]) {
-                    theta_h = static_cast<float>(pos_x[static_cast<size_t>(t)]);
-                } else if (sector == sec_w) {
-                    theta_w = static_cast<float>(pos_y[static_cast<size_t>(t)]);
-                } else if (sector == sec_e) {
-                    theta_e = static_cast<float>(pos_x[static_cast<size_t>(t)]);
-                }
-
-                float angle = theta_t;
-                if (sector >= sections[0] && sector < sec_w) {
-                    angle = theta_h;
-                } else if (sector >= sec_w && sector < sec_e) {
-                    angle = theta_w;
-                } else if (sector >= sec_e) {
-                    angle = theta_e;
-                }
-                const float c = std::cos(angle);
-                const float s = std::sin(angle);
-                const float x0 = v[p];
-                const float x1 = v[p + n_dims];
-                v[p] = x0 * c - x1 * s;
-                v[p + n_dims] = x0 * s + x1 * c;
-
-                theta_t *= theta_scale;
-                theta_h *= theta_scale;
-                theta_w *= theta_scale;
-                theta_e *= theta_scale;
-            }
-        }
-    }
-}
-
 int64_t read_int64_fallback(simdjson::dom::element root, const char* key, int64_t fallback) {
     simdjson::dom::element v;
     if (root.at_key(key).get(v) != simdjson::SUCCESS) return fallback;
@@ -262,107 +148,169 @@ std::wstring utf8_to_wide(const std::string& s) {
 
 } // namespace
 
-bool Qwen35VisionEncoder::read_tensor_as_float(Context& ctx,
-                                               ModelWeights& weights,
-                                               const std::string& name,
-                                               std::vector<float>& out,
-                                               std::string* error_message,
-                                               bool required) {
+Qwen35VisionEncoder::~Qwen35VisionEncoder() {
+    release_runtime_buffers();
+}
+
+Tensor* Qwen35VisionEncoder::get_tensor(ModelWeights& weights,
+                                        const std::string& name,
+                                        std::string* error_message,
+                                        bool required) {
     if (!weights.has(name)) {
         if (required) {
             set_error(error_message, "Missing tensor: " + name);
-            return false;
         }
-        out.clear();
-        return true;
+        return nullptr;
+    }
+    return &weights.get(name);
+}
+
+Tensor* Qwen35VisionEncoder::ensure_bf16_weight(Context& ctx,
+                                                ModelWeights& weights,
+                                                const std::string& name,
+                                                std::string* error_message,
+                                                bool required) {
+    Tensor* src = get_tensor(weights, name, error_message, required);
+    if (!src) return nullptr;
+    if (src->dtype() == dnnl::memory::data_type::bf16) {
+        return src;
+    }
+    if (src->dtype() != dnnl::memory::data_type::f32) {
+        set_error(error_message, "Unsupported tensor dtype for " + name + ": expected bf16/f32");
+        return nullptr;
     }
 
-    Tensor& t = weights.get(name);
-    size_t n = static_cast<size_t>(t.numel());
-    out.resize(n);
+    owned_weights_.emplace_back(Tensor::allocate(ctx, src->shape(), dnnl::memory::data_type::bf16));
+    Tensor& dst = owned_weights_.back();
+    const float* src_ptr = static_cast<const float*>(src->data());
+    bf16* dst_ptr = static_cast<bf16*>(dst.data());
+    const size_t n = static_cast<size_t>(src->numel());
+    ctx.queue().parallel_for(sycl::range<1>(n), [=](sycl::id<1> idx) {
+        const size_t i = idx[0];
+        dst_ptr[i] = bf16(src_ptr[i]);
+    });
+    return &dst;
+}
 
-    if (t.dtype() == dnnl::memory::data_type::f32) {
-        ctx.memcpy_d2h(out.data(), t.data(), n * sizeof(float));
-        return true;
+bool Qwen35VisionEncoder::prepare_patch_weight(Context& ctx,
+                                               ModelWeights& weights,
+                                               std::string* error_message) {
+    constexpr const char* kName = "model.visual.patch_embed.proj.weight";
+    Tensor* src = get_tensor(weights, kName, error_message);
+    if (!src) return false;
+
+    const int p2 = patch_size_ * patch_size_;
+    const int patch_dim = 3 * p2;
+    const int64_t expect_temporal2 = static_cast<int64_t>(hidden_size_) * 3 * 2 * p2;
+    const int64_t expect_spatial2d = static_cast<int64_t>(hidden_size_) * 3 * p2;
+    const int64_t numel = src->numel();
+
+    if (numel != expect_temporal2 && numel != expect_spatial2d) {
+        std::ostringstream oss;
+        oss << "Unexpected patch_embed.proj.weight size: got " << numel
+            << ", expected " << expect_temporal2 << " or " << expect_spatial2d;
+        set_error(error_message, oss.str());
+        return false;
     }
 
-    if (t.dtype() == dnnl::memory::data_type::bf16) {
-        std::vector<bf16> tmp(n);
-        ctx.memcpy_d2h(tmp.data(), t.data(), n * sizeof(bf16));
-        for (size_t i = 0; i < n; ++i) {
-            out[i] = static_cast<float>(tmp[i]);
-        }
-        return true;
+    if (numel == expect_spatial2d) {
+        patch_weight_ = (src->dtype() == dnnl::memory::data_type::bf16)
+                            ? src
+                            : ensure_bf16_weight(ctx, weights, kName, error_message);
+        return patch_weight_ != nullptr;
     }
 
-    set_error(error_message, "Unsupported tensor dtype for " + name);
-    return false;
+    if (src->dtype() != dnnl::memory::data_type::bf16 &&
+        src->dtype() != dnnl::memory::data_type::f32) {
+        set_error(error_message, "Unsupported patch_embed.proj.weight dtype: expected bf16/f32");
+        return false;
+    }
+
+    owned_weights_.emplace_back(Tensor::allocate(ctx,
+                                                 {hidden_size_, patch_dim},
+                                                 dnnl::memory::data_type::bf16));
+    Tensor& fused = owned_weights_.back();
+    bf16* dst_ptr = static_cast<bf16*>(fused.data());
+    const int total = hidden_size_ * patch_dim;
+
+    if (src->dtype() == dnnl::memory::data_type::f32) {
+        const float* src_ptr = static_cast<const float*>(src->data());
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)), [=](sycl::id<1> idx) {
+            const int flat = static_cast<int>(idx[0]);
+            const int oc = flat / patch_dim;
+            const int rem = flat % patch_dim;
+            const int c = rem / p2;
+            const int inner = rem % p2;
+            const int base = oc * 3 * 2 * p2 + c * 2 * p2 + inner;
+            dst_ptr[flat] = bf16(src_ptr[base] + src_ptr[base + p2]);
+        });
+    } else {
+        const bf16* src_ptr = static_cast<const bf16*>(src->data());
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)), [=](sycl::id<1> idx) {
+            const int flat = static_cast<int>(idx[0]);
+            const int oc = flat / patch_dim;
+            const int rem = flat % patch_dim;
+            const int c = rem / p2;
+            const int inner = rem % p2;
+            const int base = oc * 3 * 2 * p2 + c * 2 * p2 + inner;
+            dst_ptr[flat] = bf16(static_cast<float>(src_ptr[base]) +
+                                 static_cast<float>(src_ptr[base + p2]));
+        });
+    }
+
+    patch_weight_ = &fused;
+    return true;
 }
 
 bool Qwen35VisionEncoder::read_preprocessor(const std::string& model_dir, std::string* error_message) {
-    // Keep vision token count dynamic by default. Qwen's official processor
-    // derives placeholder count from the resized image grid directly instead of
-    // clamping to a narrow token range.
-    min_tokens_ = 1;
-    max_tokens_ = std::numeric_limits<int>::max() / 4;
-
-    min_pixels_ = 256 * 256;
-    max_pixels_ = 1024 * 1024;
-    if (min_pixels_ < 1024) min_pixels_ = 256 * 256;
-    if (max_pixels_ < min_pixels_) max_pixels_ = min_pixels_;
-
     std::string p = model_dir + "/preprocessor_config.json";
     std::string text = read_file_text(p);
-    if (text.empty()) return true;
+    if (!text.empty()) {
+        try {
+            simdjson::dom::parser parser;
+            simdjson::dom::element root = parser.parse(text);
 
-    try {
-        simdjson::dom::parser parser;
-        simdjson::dom::element root = parser.parse(text);
-
-        simdjson::dom::element mean_elem;
-        if (root.at_key("image_mean").get(mean_elem) == simdjson::SUCCESS) {
-            auto arr = mean_elem.get_array();
-            size_t i = 0;
-            for (auto v : arr) {
-                if (i >= 3) break;
-                double x = 0.5;
-                if (v.get_double().get(x) == simdjson::SUCCESS) {
-                    image_mean_[i] = static_cast<float>(x);
+            simdjson::dom::element mean_elem;
+            if (root.at_key("image_mean").get(mean_elem) == simdjson::SUCCESS) {
+                auto arr = mean_elem.get_array();
+                size_t i = 0;
+                for (auto v : arr) {
+                    if (i >= 3) break;
+                    double x = 0.5;
+                    if (v.get_double().get(x) == simdjson::SUCCESS) {
+                        image_mean_[i] = static_cast<float>(x);
+                    }
+                    ++i;
                 }
-                ++i;
             }
-        }
 
-        simdjson::dom::element std_elem;
-        if (root.at_key("image_std").get(std_elem) == simdjson::SUCCESS) {
-            auto arr = std_elem.get_array();
-            size_t i = 0;
-            for (auto v : arr) {
-                if (i >= 3) break;
-                double x = 0.5;
-                if (v.get_double().get(x) == simdjson::SUCCESS) {
-                    image_std_[i] = static_cast<float>(x);
+            simdjson::dom::element std_elem;
+            if (root.at_key("image_std").get(std_elem) == simdjson::SUCCESS) {
+                auto arr = std_elem.get_array();
+                size_t i = 0;
+                for (auto v : arr) {
+                    if (i >= 3) break;
+                    double x = 0.5;
+                    if (v.get_double().get(x) == simdjson::SUCCESS) {
+                        image_std_[i] = static_cast<float>(x);
+                    }
+                    ++i;
                 }
-                ++i;
             }
+
+            simdjson::dom::element size_elem;
+            if (root.at_key("size").get(size_elem) == simdjson::SUCCESS) {
+                int64_t min_p = read_int64_fallback(size_elem, "shortest_edge", min_pixels_);
+                int64_t max_p = read_int64_fallback(size_elem, "longest_edge", max_pixels_);
+                if (min_p > 0) min_pixels_ = static_cast<int>(std::min<int64_t>(min_p, std::numeric_limits<int>::max()));
+                if (max_p > 0) max_pixels_ = static_cast<int>(std::min<int64_t>(max_p, std::numeric_limits<int>::max()));
+                if (max_pixels_ < min_pixels_) max_pixels_ = min_pixels_;
+            }
+        } catch (const std::exception& e) {
+            set_error(error_message, std::string("preprocessor_config parse warning: ") + e.what());
         }
-
-        simdjson::dom::element size_elem;
-        if (root.at_key("size").get(size_elem) == simdjson::SUCCESS) {
-            int64_t min_p = read_int64_fallback(size_elem, "shortest_edge", min_pixels_);
-            int64_t max_p = read_int64_fallback(size_elem, "longest_edge", max_pixels_);
-            if (min_p > 0) min_pixels_ = static_cast<int>(std::min<int64_t>(min_p, std::numeric_limits<int>::max()));
-            if (max_p > 0) max_pixels_ = static_cast<int>(std::min<int64_t>(max_p, std::numeric_limits<int>::max()));
-            if (max_pixels_ < min_pixels_) max_pixels_ = min_pixels_;
-
-        }
-
-        // fall through to env override stage below
-    } catch (const std::exception& e) {
-        set_error(error_message, std::string("preprocessor_config parse warning: ") + e.what());
     }
 
-    // Environment overrides are applied last so experiments always take effect.
     min_tokens_ = aila::env::read_int_raw("AILA_Q35_VISION_MIN_TOKENS", min_tokens_);
     max_tokens_ = aila::env::read_int_raw("AILA_Q35_VISION_MAX_TOKENS", max_tokens_);
     min_pixels_ = aila::env::read_int_raw("AILA_Q35_VISION_MIN_PIXELS", min_pixels_);
@@ -383,16 +331,23 @@ bool Qwen35VisionEncoder::load(Context& ctx,
                                const std::string& model_dir,
                                std::string* error_message) {
     loaded_ = false;
+    release_runtime_buffers();
+
+    owned_weights_.clear();
     blocks_.clear();
-    patch_kernel_fused_.clear();
-    patch_bias_.clear();
-    pos_embed_.clear();
-    merger_norm_w_.clear();
-    merger_norm_b_.clear();
-    merger_fc1_w_.clear();
-    merger_fc1_b_.clear();
-    merger_fc2_w_.clear();
-    merger_fc2_b_.clear();
+    patch_weight_ = nullptr;
+    patch_bias_ = nullptr;
+    pos_embed_ = nullptr;
+    pos_embed_len_ = 0;
+    merger_norm_weight_ = nullptr;
+    merger_norm_bias_ = nullptr;
+    merger_fc1_bias_ = nullptr;
+    merger_fc1_out_ = 0;
+    merger_fc2_bias_ = nullptr;
+    patch_proj_ = Linear();
+    merger_fc1_ = Linear();
+    merger_fc2_ = Linear();
+    ctx_ = &ctx;
 
     if (spec.family != ModelFamily::Qwen35Hybrid || !spec.vision.enabled) {
         set_error(error_message, "Qwen35VisionEncoder requires qwen3_5 vision config");
@@ -404,68 +359,60 @@ bool Qwen35VisionEncoder::load(Context& ctx,
     intermediate_size_ = spec.vision.intermediate_size;
     out_hidden_size_ = spec.vision.out_hidden_size;
     num_heads_ = spec.vision.num_heads;
+    head_dim_ = 0;
+
     patch_size_ = std::max(1, spec.vision.patch_size);
     merge_size_ = std::max(1, spec.vision.spatial_merge_size);
+    min_tokens_ = 1;
+    max_tokens_ = 1024;
+    min_pixels_ = 256 * 256;
+    max_pixels_ = 1024 * 1024;
+    image_mean_[0] = image_mean_[1] = image_mean_[2] = 0.5f;
+    image_std_[0] = image_std_[1] = image_std_[2] = 0.5f;
 
     if (depth_ <= 0 || hidden_size_ <= 0 || intermediate_size_ <= 0 || out_hidden_size_ <= 0 ||
         num_heads_ <= 0 || hidden_size_ % num_heads_ != 0) {
         set_error(error_message, "Invalid vision config dimensions");
         return false;
     }
-
     head_dim_ = hidden_size_ / num_heads_;
 
     std::string pp_warn;
     read_preprocessor(model_dir, &pp_warn);
-
-    std::vector<float> patch_w;
-    if (!read_tensor_as_float(ctx, weights, "model.visual.patch_embed.proj.weight", patch_w, error_message)) {
-        return false;
-    }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.patch_embed.proj.bias", patch_bias_, error_message)) {
-        return false;
+    if (!pp_warn.empty()) {
+        AILA_LOG_WARN("[Vision] %s", pp_warn.c_str());
     }
 
-    const int p2 = patch_size_ * patch_size_;
-    const size_t expect_temporal2 = static_cast<size_t>(hidden_size_) * 3u * 2u * static_cast<size_t>(p2);
-    const size_t expect_spatial2d = static_cast<size_t>(hidden_size_) * 3u * static_cast<size_t>(p2);
-    if (patch_w.size() != expect_temporal2 && patch_w.size() != expect_spatial2d) {
-        std::ostringstream oss;
-        oss << "Unexpected patch_embed.proj.weight size: got " << patch_w.size()
-            << ", expected " << expect_temporal2 << " or " << expect_spatial2d;
-        set_error(error_message, oss.str());
-        return false;
-    }
-    if (patch_bias_.size() != static_cast<size_t>(hidden_size_)) {
+    auto require_floatish = [&](Tensor* t, const std::string& name) -> bool {
+        if (!t) return false;
+        if (t->dtype() != dnnl::memory::data_type::bf16 &&
+            t->dtype() != dnnl::memory::data_type::f32) {
+            set_error(error_message, "Unsupported tensor dtype for " + name + ": expected bf16/f32");
+            return false;
+        }
+        return true;
+    };
+
+    patch_bias_ = get_tensor(weights, "model.visual.patch_embed.proj.bias", error_message);
+    if (!patch_bias_) return false;
+    if (!require_floatish(patch_bias_, "model.visual.patch_embed.proj.bias")) return false;
+    if (patch_bias_->numel() != hidden_size_) {
         set_error(error_message, "Unexpected patch_embed.proj.bias shape");
         return false;
     }
+    if (!prepare_patch_weight(ctx, weights, error_message)) return false;
+    patch_proj_.init(ctx, *patch_weight_, 3 * patch_size_ * patch_size_, hidden_size_);
 
-    patch_kernel_fused_.resize(expect_spatial2d);
-    if (patch_w.size() == expect_temporal2) {
-        for (int oc = 0; oc < hidden_size_; ++oc) {
-            for (int c = 0; c < 3; ++c) {
-                for (int i = 0; i < p2; ++i) {
-                    size_t base = static_cast<size_t>(oc) * 3u * 2u * static_cast<size_t>(p2) +
-                                  static_cast<size_t>(c) * 2u * static_cast<size_t>(p2) +
-                                  static_cast<size_t>(i);
-                    float w0 = patch_w[base + 0 * static_cast<size_t>(p2)];
-                    float w1 = patch_w[base + 1 * static_cast<size_t>(p2)];
-                    patch_kernel_fused_[static_cast<size_t>(oc) * 3u * static_cast<size_t>(p2) +
-                                        static_cast<size_t>(c) * static_cast<size_t>(p2) +
-                                        static_cast<size_t>(i)] = w0 + w1;
-                }
-            }
-        }
-    } else {
-        patch_kernel_fused_ = std::move(patch_w);
-    }
-
-    if (!read_tensor_as_float(ctx, weights, "model.visual.pos_embed.weight", pos_embed_, error_message)) {
+    pos_embed_ = get_tensor(weights, "model.visual.pos_embed.weight", error_message);
+    if (!pos_embed_) return false;
+    if (!require_floatish(pos_embed_, "model.visual.pos_embed.weight")) return false;
+    if (pos_embed_->numel() % hidden_size_ != 0) {
+        set_error(error_message, "Unexpected model.visual.pos_embed.weight shape");
         return false;
     }
-    if (pos_embed_.size() % static_cast<size_t>(hidden_size_) != 0) {
-        set_error(error_message, "Unexpected model.visual.pos_embed.weight shape");
+    pos_embed_len_ = static_cast<int>(pos_embed_->numel() / hidden_size_);
+    if (pos_embed_len_ <= 0) {
+        set_error(error_message, "Invalid model.visual.pos_embed.weight shape");
         return false;
     }
 
@@ -474,94 +421,123 @@ bool Qwen35VisionEncoder::load(Context& ctx,
         BlockWeights& b = blocks_[static_cast<size_t>(i)];
         const std::string p = "model.visual.blocks." + std::to_string(i) + ".";
 
-        if (!read_tensor_as_float(ctx, weights, p + "norm1.weight", b.ln1_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "norm1.bias", b.ln1_b, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "attn.qkv.weight", b.qkv_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "attn.qkv.bias", b.qkv_b, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "attn.proj.weight", b.proj_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "attn.proj.bias", b.proj_b, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "norm2.weight", b.ln2_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "norm2.bias", b.ln2_b, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "mlp.linear_fc1.weight", b.fc1_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "mlp.linear_fc1.bias", b.fc1_b, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "mlp.linear_fc2.weight", b.fc2_w, error_message)) return false;
-        if (!read_tensor_as_float(ctx, weights, p + "mlp.linear_fc2.bias", b.fc2_b, error_message)) return false;
+        b.ln1_weight = get_tensor(weights, p + "norm1.weight", error_message);
+        b.ln1_bias = get_tensor(weights, p + "norm1.bias", error_message);
+        Tensor* qkv_weight = ensure_bf16_weight(ctx, weights, p + "attn.qkv.weight", error_message);
+        b.qkv_bias = get_tensor(weights, p + "attn.qkv.bias", error_message);
+        Tensor* proj_weight = ensure_bf16_weight(ctx, weights, p + "attn.proj.weight", error_message);
+        b.proj_bias = get_tensor(weights, p + "attn.proj.bias", error_message);
+        b.ln2_weight = get_tensor(weights, p + "norm2.weight", error_message);
+        b.ln2_bias = get_tensor(weights, p + "norm2.bias", error_message);
+        Tensor* fc1_weight = ensure_bf16_weight(ctx, weights, p + "mlp.linear_fc1.weight", error_message);
+        b.fc1_bias = get_tensor(weights, p + "mlp.linear_fc1.bias", error_message);
+        Tensor* fc2_weight = ensure_bf16_weight(ctx, weights, p + "mlp.linear_fc2.weight", error_message);
+        b.fc2_bias = get_tensor(weights, p + "mlp.linear_fc2.bias", error_message);
 
-        if (b.ln1_w.size() != static_cast<size_t>(hidden_size_) ||
-            b.ln1_b.size() != static_cast<size_t>(hidden_size_) ||
-            b.ln2_w.size() != static_cast<size_t>(hidden_size_) ||
-            b.ln2_b.size() != static_cast<size_t>(hidden_size_)) {
+        if (!b.ln1_weight || !b.ln1_bias || !qkv_weight || !b.qkv_bias || !proj_weight || !b.proj_bias ||
+            !b.ln2_weight || !b.ln2_bias || !fc1_weight || !b.fc1_bias || !fc2_weight || !b.fc2_bias) {
+            return false;
+        }
+
+        if (!require_floatish(b.ln1_weight, p + "norm1.weight") ||
+            !require_floatish(b.ln1_bias, p + "norm1.bias") ||
+            !require_floatish(b.qkv_bias, p + "attn.qkv.bias") ||
+            !require_floatish(b.proj_bias, p + "attn.proj.bias") ||
+            !require_floatish(b.ln2_weight, p + "norm2.weight") ||
+            !require_floatish(b.ln2_bias, p + "norm2.bias") ||
+            !require_floatish(b.fc1_bias, p + "mlp.linear_fc1.bias") ||
+            !require_floatish(b.fc2_bias, p + "mlp.linear_fc2.bias")) {
+            return false;
+        }
+
+        if (b.ln1_weight->numel() != hidden_size_ ||
+            b.ln1_bias->numel() != hidden_size_ ||
+            b.ln2_weight->numel() != hidden_size_ ||
+            b.ln2_bias->numel() != hidden_size_) {
             set_error(error_message, "Vision layer norm shape mismatch");
             return false;
         }
 
-        if (b.qkv_w.size() != static_cast<size_t>(3 * hidden_size_ * hidden_size_) ||
-            b.qkv_b.size() != static_cast<size_t>(3 * hidden_size_)) {
+        if (qkv_weight->numel() != static_cast<int64_t>(3 * hidden_size_) * hidden_size_ ||
+            b.qkv_bias->numel() != static_cast<int64_t>(3 * hidden_size_)) {
             set_error(error_message, "Vision attn.qkv shape mismatch");
             return false;
         }
-        if (b.proj_w.size() != static_cast<size_t>(hidden_size_ * hidden_size_) ||
-            b.proj_b.size() != static_cast<size_t>(hidden_size_)) {
+        if (proj_weight->numel() != static_cast<int64_t>(hidden_size_) * hidden_size_ ||
+            b.proj_bias->numel() != hidden_size_) {
             set_error(error_message, "Vision attn.proj shape mismatch");
             return false;
         }
-        if (b.fc1_w.size() != static_cast<size_t>(intermediate_size_ * hidden_size_) ||
-            b.fc1_b.size() != static_cast<size_t>(intermediate_size_)) {
+        if (fc1_weight->numel() != static_cast<int64_t>(intermediate_size_) * hidden_size_ ||
+            b.fc1_bias->numel() != intermediate_size_) {
             set_error(error_message, "Vision mlp.linear_fc1 shape mismatch");
             return false;
         }
-        if (b.fc2_w.size() != static_cast<size_t>(hidden_size_ * intermediate_size_) ||
-            b.fc2_b.size() != static_cast<size_t>(hidden_size_)) {
+        if (fc2_weight->numel() != static_cast<int64_t>(hidden_size_) * intermediate_size_ ||
+            b.fc2_bias->numel() != hidden_size_) {
             set_error(error_message, "Vision mlp.linear_fc2 shape mismatch");
             return false;
         }
+
+        b.qkv = Linear();
+        b.qkv.init(ctx, *qkv_weight, hidden_size_, 3 * hidden_size_);
+        b.proj = Linear();
+        b.proj.init(ctx, *proj_weight, hidden_size_, hidden_size_);
+        b.fc1 = Linear();
+        b.fc1.init(ctx, *fc1_weight, hidden_size_, intermediate_size_);
+        b.fc2 = Linear();
+        b.fc2.init(ctx, *fc2_weight, intermediate_size_, hidden_size_);
     }
 
     const int merger_in_dim = hidden_size_ * merge_size_ * merge_size_;
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.norm.weight", merger_norm_w_, error_message, false)) {
+    merger_norm_weight_ = get_tensor(weights, "model.visual.merger.norm.weight", nullptr, false);
+    merger_norm_bias_ = get_tensor(weights, "model.visual.merger.norm.bias", nullptr, false);
+    if ((merger_norm_weight_ == nullptr) != (merger_norm_bias_ == nullptr)) {
+        set_error(error_message, "Vision merger.norm weight/bias presence mismatch");
         return false;
     }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.norm.bias", merger_norm_b_, error_message, false)) {
-        return false;
-    }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.linear_fc1.weight", merger_fc1_w_, error_message)) {
-        return false;
-    }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.linear_fc1.bias", merger_fc1_b_, error_message)) {
-        return false;
-    }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.linear_fc2.weight", merger_fc2_w_, error_message)) {
-        return false;
-    }
-    if (!read_tensor_as_float(ctx, weights, "model.visual.merger.linear_fc2.bias", merger_fc2_b_, error_message)) {
-        return false;
-    }
-
-    if (!merger_norm_w_.empty()) {
-        bool per_hidden = (merger_norm_w_.size() == static_cast<size_t>(hidden_size_) &&
-                           merger_norm_b_.size() == static_cast<size_t>(hidden_size_));
-        bool per_merged = (merger_norm_w_.size() == static_cast<size_t>(merger_in_dim) &&
-                           merger_norm_b_.size() == static_cast<size_t>(merger_in_dim));
+    if (merger_norm_weight_) {
+        if (!require_floatish(merger_norm_weight_, "model.visual.merger.norm.weight") ||
+            !require_floatish(merger_norm_bias_, "model.visual.merger.norm.bias")) {
+            return false;
+        }
+        const bool per_hidden = merger_norm_weight_->numel() == hidden_size_ &&
+                                merger_norm_bias_->numel() == hidden_size_;
+        const bool per_merged = merger_norm_weight_->numel() == merger_in_dim &&
+                                merger_norm_bias_->numel() == merger_in_dim;
         if (!per_hidden && !per_merged) {
             set_error(error_message, "Vision merger.norm shape mismatch");
             return false;
         }
     }
-    if (merger_fc1_w_.size() % static_cast<size_t>(merger_in_dim) != 0) {
+
+    Tensor* merger_fc1_weight = ensure_bf16_weight(ctx, weights, "model.visual.merger.linear_fc1.weight", error_message);
+    merger_fc1_bias_ = get_tensor(weights, "model.visual.merger.linear_fc1.bias", error_message);
+    Tensor* merger_fc2_weight = ensure_bf16_weight(ctx, weights, "model.visual.merger.linear_fc2.weight", error_message);
+    merger_fc2_bias_ = get_tensor(weights, "model.visual.merger.linear_fc2.bias", error_message);
+    if (!merger_fc1_weight || !merger_fc1_bias_ || !merger_fc2_weight || !merger_fc2_bias_) {
+        return false;
+    }
+    if (!require_floatish(merger_fc1_bias_, "model.visual.merger.linear_fc1.bias") ||
+        !require_floatish(merger_fc2_bias_, "model.visual.merger.linear_fc2.bias")) {
+        return false;
+    }
+
+    if (merger_fc1_weight->numel() % merger_in_dim != 0) {
         set_error(error_message, "Vision merger.linear_fc1 weight shape mismatch");
         return false;
     }
-    int merger_fc1_out = static_cast<int>(merger_fc1_w_.size() / static_cast<size_t>(merger_in_dim));
-    if (!merger_fc1_b_.empty() && merger_fc1_b_.size() != static_cast<size_t>(merger_fc1_out)) {
+    merger_fc1_out_ = static_cast<int>(merger_fc1_weight->numel() / merger_in_dim);
+    if (merger_fc1_out_ <= 0 || merger_fc1_bias_->numel() != merger_fc1_out_) {
         set_error(error_message, "Vision merger.linear_fc1 bias shape mismatch");
         return false;
     }
 
-    if (merger_fc2_w_.size() % static_cast<size_t>(merger_fc1_out) != 0) {
+    if (merger_fc2_weight->numel() % merger_fc1_out_ != 0) {
         set_error(error_message, "Vision merger.linear_fc2 weight shape mismatch");
         return false;
     }
-    int merger_fc2_out = static_cast<int>(merger_fc2_w_.size() / static_cast<size_t>(merger_fc1_out));
+    const int merger_fc2_out = static_cast<int>(merger_fc2_weight->numel() / merger_fc1_out_);
     if (merger_fc2_out != out_hidden_size_) {
         std::ostringstream oss;
         oss << "Vision merger output mismatch: config out_hidden_size=" << out_hidden_size_
@@ -569,13 +545,117 @@ bool Qwen35VisionEncoder::load(Context& ctx,
         set_error(error_message, oss.str());
         return false;
     }
-    if (merger_fc2_b_.size() != static_cast<size_t>(out_hidden_size_)) {
+    if (merger_fc2_bias_->numel() != out_hidden_size_) {
         set_error(error_message, "Vision merger.linear_fc2 bias shape mismatch");
         return false;
     }
 
+    merger_fc1_.init(ctx, *merger_fc1_weight, merger_in_dim, merger_fc1_out_);
+    merger_fc2_.init(ctx, *merger_fc2_weight, merger_fc1_out_, out_hidden_size_);
+
+    ctx.synchronize();
     loaded_ = true;
     return true;
+}
+
+void Qwen35VisionEncoder::ensure_runtime_buffers(int image_bytes,
+                                                 int num_patches,
+                                                 int out_tokens,
+                                                 int merger_in_dim) {
+    if (!ctx_) return;
+
+    if (image_bytes > image_bytes_capacity_) {
+        buf_.image_rgb = Tensor::allocate(*ctx_, {image_bytes}, dnnl::memory::data_type::u8);
+        image_bytes_capacity_ = image_bytes;
+    }
+
+    if (num_patches > patch_capacity_) {
+        const int patch_dim = 3 * patch_size_ * patch_size_;
+        buf_.patch_rows = Tensor::allocate(*ctx_, {num_patches, patch_dim}, dnnl::memory::data_type::bf16);
+        buf_.hidden_a = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.hidden_b = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.normed = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.qkv = Tensor::allocate(*ctx_, {num_patches, 3 * hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.q = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.k = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.v = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.attn_out = Tensor::allocate(*ctx_, {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+        buf_.ffn = Tensor::allocate(*ctx_, {num_patches, intermediate_size_}, dnnl::memory::data_type::bf16);
+        buf_.scores = Tensor::allocate(*ctx_, {num_heads_, num_patches, num_patches}, dnnl::memory::data_type::f32);
+        patch_capacity_ = num_patches;
+    }
+
+    if (out_tokens > out_token_capacity_) {
+        buf_.merger_normed = Tensor::allocate(*ctx_, {out_tokens, merger_in_dim}, dnnl::memory::data_type::bf16);
+        buf_.merger_hidden = Tensor::allocate(*ctx_, {out_tokens, merger_fc1_out_}, dnnl::memory::data_type::bf16);
+        buf_.merger_out = Tensor::allocate(*ctx_, {out_tokens, out_hidden_size_}, dnnl::memory::data_type::bf16);
+        out_token_capacity_ = out_tokens;
+    }
+}
+
+void Qwen35VisionEncoder::ensure_position_buffers(int num_patches) {
+    if (!ctx_) return;
+    if (num_patches > pos_capacity_) {
+        if (pos_y_device_) ctx_->free_device(pos_y_device_);
+        if (pos_x_device_) ctx_->free_device(pos_x_device_);
+        const size_t bytes = static_cast<size_t>(num_patches) * sizeof(int);
+        pos_y_device_ = static_cast<int*>(ctx_->alloc_device(bytes));
+        pos_x_device_ = static_cast<int*>(ctx_->alloc_device(bytes));
+        pos_capacity_ = num_patches;
+    }
+    pos_y_host_.resize(static_cast<size_t>(num_patches));
+    pos_x_host_.resize(static_cast<size_t>(num_patches));
+}
+
+void Qwen35VisionEncoder::release_runtime_buffers() {
+    buf_.image_rgb = Tensor();
+    buf_.patch_rows = Tensor();
+    buf_.hidden_a = Tensor();
+    buf_.hidden_b = Tensor();
+    buf_.normed = Tensor();
+    buf_.qkv = Tensor();
+    buf_.q = Tensor();
+    buf_.k = Tensor();
+    buf_.v = Tensor();
+    buf_.attn_out = Tensor();
+    buf_.ffn = Tensor();
+    buf_.merger_normed = Tensor();
+    buf_.merger_hidden = Tensor();
+    buf_.merger_out = Tensor();
+    buf_.scores = Tensor();
+
+    if (ctx_) {
+        if (pos_y_device_) ctx_->free_device(pos_y_device_);
+        if (pos_x_device_) ctx_->free_device(pos_x_device_);
+    }
+    pos_y_device_ = nullptr;
+    pos_x_device_ = nullptr;
+    pos_y_host_.clear();
+    pos_x_host_.clear();
+
+    image_bytes_capacity_ = 0;
+    patch_capacity_ = 0;
+    out_token_capacity_ = 0;
+    pos_capacity_ = 0;
+}
+
+void Qwen35VisionEncoder::fill_merge_block_positions(int grid_w, int grid_h) {
+    const int num_tokens = grid_w * grid_h;
+    pos_y_host_.resize(static_cast<size_t>(num_tokens));
+    pos_x_host_.resize(static_cast<size_t>(num_tokens));
+
+    int out_idx = 0;
+    for (int by = 0; by < grid_h; by += merge_size_) {
+        for (int bx = 0; bx < grid_w; bx += merge_size_) {
+            for (int dy = 0; dy < merge_size_; ++dy) {
+                for (int dx = 0; dx < merge_size_; ++dx) {
+                    pos_y_host_[static_cast<size_t>(out_idx)] = by + dy;
+                    pos_x_host_[static_cast<size_t>(out_idx)] = bx + dx;
+                    ++out_idx;
+                }
+            }
+        }
+    }
 }
 
 bool Qwen35VisionEncoder::read_image_rgb(const std::string& uri,
@@ -810,87 +890,9 @@ void Qwen35VisionEncoder::choose_target_size(int src_w,
     out_h = h;
 }
 
-void Qwen35VisionEncoder::layer_norm_affine(const std::vector<float>& in,
-                                            int rows,
-                                            int cols,
-                                            const std::vector<float>& gamma,
-                                            const std::vector<float>& beta,
-                                            float eps,
-                                            std::vector<float>& out) {
-    out.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
-    parallel_for_1d(0, rows, 4, [&](int r) {
-        const float* x = in.data() + static_cast<size_t>(r) * static_cast<size_t>(cols);
-        float mean = 0.0f;
-        for (int c = 0; c < cols; ++c) mean += x[c];
-        mean /= static_cast<float>(cols);
-
-        float var = 0.0f;
-        for (int c = 0; c < cols; ++c) {
-            float d = x[c] - mean;
-            var += d * d;
-        }
-        var /= static_cast<float>(cols);
-        float inv = 1.0f / std::sqrt(var + eps);
-
-        float* y = out.data() + static_cast<size_t>(r) * static_cast<size_t>(cols);
-        for (int c = 0; c < cols; ++c) {
-            float g = (gamma.size() == static_cast<size_t>(cols)) ? gamma[static_cast<size_t>(c)] : 1.0f;
-            float b = (beta.size() == static_cast<size_t>(cols)) ? beta[static_cast<size_t>(c)] : 0.0f;
-            y[c] = (x[c] - mean) * inv * g + b;
-        }
-    });
-}
-
-void Qwen35VisionEncoder::linear_rowmajor(const std::vector<float>& in,
-                                          int rows,
-                                          int in_dim,
-                                          const std::vector<float>& weight,
-                                          const std::vector<float>& bias,
-                                          int out_dim,
-                                          std::vector<float>& out) {
-    out.assign(static_cast<size_t>(rows) * static_cast<size_t>(out_dim), 0.0f);
-    parallel_for_1d(0, rows, 1, [&](int r) {
-        const float* x = in.data() + static_cast<size_t>(r) * static_cast<size_t>(in_dim);
-        float* y = out.data() + static_cast<size_t>(r) * static_cast<size_t>(out_dim);
-        for (int od = 0; od < out_dim; ++od) {
-            const float* w = weight.data() + static_cast<size_t>(od) * static_cast<size_t>(in_dim);
-            float acc = 0.0f;
-            for (int id = 0; id < in_dim; ++id) {
-                acc += x[id] * w[id];
-            }
-            if (!bias.empty()) acc += bias[static_cast<size_t>(od)];
-            y[od] = acc;
-        }
-    });
-}
-
-void Qwen35VisionEncoder::gelu_tanh_inplace(std::vector<float>& x) {
-    for (float& v : x) {
-        v = gelu_tanh_scalar(v);
-    }
-}
-
-void Qwen35VisionEncoder::softmax_inplace(std::vector<float>& x) {
-    if (x.empty()) return;
-    float m = -std::numeric_limits<float>::max();
-    for (float v : x) m = std::max(m, v);
-    float s = 0.0f;
-    for (float& v : x) {
-        v = std::exp(v - m);
-        s += v;
-    }
-    if (s <= 0.0f) {
-        float u = 1.0f / static_cast<float>(x.size());
-        for (float& v : x) v = u;
-        return;
-    }
-    float inv = 1.0f / s;
-    for (float& v : x) v *= inv;
-}
-
 bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                                        VisionEncodeResult& out,
-                                       std::string* error_message) const {
+                                       std::string* error_message) {
     using clock = std::chrono::high_resolution_clock;
     auto t_total_start = clock::now();
     auto stage_start = t_total_start;
@@ -898,9 +900,14 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     auto stage_ms = [&](clock::time_point from) -> double {
         return std::chrono::duration<double, std::milli>(clock::now() - from).count();
     };
+    auto gpu_stage_ms = [&](clock::time_point from) -> double {
+        if (profile && ctx_) ctx_->synchronize();
+        return stage_ms(from);
+    };
 
     out = VisionEncodeResult{};
-    if (!loaded_) {
+
+    if (!loaded_ || !ctx_) {
         set_error(error_message, "Vision encoder is not loaded");
         return false;
     }
@@ -919,8 +926,8 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     choose_target_size(src_w, src_h, align, min_pixels_, max_pixels_, target_w, target_h);
 
     auto merged_tokens = [&](int w, int h) -> int {
-        int g_w = std::max(1, w / align);
-        int g_h = std::max(1, h / align);
+        const int g_w = std::max(1, w / align);
+        const int g_h = std::max(1, h / align);
         return g_w * g_h;
     };
     auto clamp_dims = [&](int& w, int& h) {
@@ -935,8 +942,8 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     clamp_dims(target_w, target_h);
     int m_tok = merged_tokens(target_w, target_h);
     if (m_tok > max_tokens_ || m_tok < min_tokens_) {
-        int desired = std::clamp(m_tok, min_tokens_, max_tokens_);
-        float scale = std::sqrt(static_cast<float>(desired) / static_cast<float>(std::max(1, m_tok)));
+        const int desired = std::clamp(m_tok, min_tokens_, max_tokens_);
+        const float scale = std::sqrt(static_cast<float>(desired) / static_cast<float>(std::max(1, m_tok)));
         target_w = static_cast<int>(std::round(target_w * scale));
         target_h = static_cast<int>(std::round(target_h * scale));
         clamp_dims(target_w, target_h);
@@ -956,291 +963,155 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
         if (target_w > 4096 || target_h > 4096) break;
     }
 
-    std::vector<uint8_t> resized_rgb;
     stage_start = clock::now();
+    std::vector<uint8_t> resized_rgb;
     resize_rgb_bicubic(src_rgb, src_w, src_h, target_w, target_h, resized_rgb);
     const double resize_ms = stage_ms(stage_start);
-
-    stage_start = clock::now();
-    std::vector<float> chw(static_cast<size_t>(3) * static_cast<size_t>(target_h) * static_cast<size_t>(target_w));
-    parallel_for_1d(0, target_h, 8, [&](int y) {
-        for (int x = 0; x < target_w; ++x) {
-            const uint8_t* p = resized_rgb.data() + (static_cast<size_t>(y) * static_cast<size_t>(target_w) + static_cast<size_t>(x)) * 3u;
-            float r = static_cast<float>(p[0]) / 255.0f;
-            float g = static_cast<float>(p[1]) / 255.0f;
-            float b = static_cast<float>(p[2]) / 255.0f;
-            chw[(0 * target_h + y) * target_w + x] = (r - image_mean_[0]) / image_std_[0];
-            chw[(1 * target_h + y) * target_w + x] = (g - image_mean_[1]) / image_std_[1];
-            chw[(2 * target_h + y) * target_w + x] = (b - image_mean_[2]) / image_std_[2];
-        }
-    });
 
     const int patch_grid_w = target_w / patch_size_;
     const int patch_grid_h = target_h / patch_size_;
     const int num_patches = patch_grid_w * patch_grid_h;
     const int patch_dim = 3 * patch_size_ * patch_size_;
+    const int merged_w = patch_grid_w / merge_size_;
+    const int merged_h = patch_grid_h / merge_size_;
+    const int out_tokens = merged_w * merged_h;
+    const int merger_in_dim = hidden_size_ * merge_size_ * merge_size_;
+    const int image_bytes = target_w * target_h * 3;
 
     if (num_patches <= 0) {
         set_error(error_message, "Invalid patch grid after resize");
         return false;
     }
-
-    std::vector<float> patch_rows(static_cast<size_t>(num_patches) * static_cast<size_t>(patch_dim));
-    parallel_for_1d(0, num_patches, 4, [&](int row) {
-        const int py = row / patch_grid_w;
-        const int px = row % patch_grid_w;
-        float* dst = patch_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(patch_dim);
-        int t = 0;
-        for (int c = 0; c < 3; ++c) {
-            for (int ky = 0; ky < patch_size_; ++ky) {
-                int iy = py * patch_size_ + ky;
-                for (int kx = 0; kx < patch_size_; ++kx) {
-                    int ix = px * patch_size_ + kx;
-                    dst[t++] = chw[(c * target_h + iy) * target_w + ix];
-                }
-            }
-        }
-    });
-    const double prep_ms = stage_ms(stage_start);
-
-    stage_start = clock::now();
-    std::vector<float> tokens;
-    linear_rowmajor(patch_rows, num_patches, patch_dim,
-                    patch_kernel_fused_, patch_bias_, hidden_size_, tokens);
-    const double patch_proj_ms = stage_ms(stage_start);
-
-    const int pos_len = static_cast<int>(pos_embed_.size() / static_cast<size_t>(hidden_size_));
-    if (pos_len <= 0) {
-        set_error(error_message, "Invalid vision position embedding");
-        return false;
-    }
-
-    if (pos_len == num_patches) {
-        for (int i = 0; i < num_patches * hidden_size_; ++i) {
-            tokens[static_cast<size_t>(i)] += pos_embed_[static_cast<size_t>(i)];
-        }
-    } else {
-        int base_side = static_cast<int>(std::round(std::sqrt(static_cast<float>(pos_len))));
-        if (base_side * base_side != pos_len) {
-            int n = std::min(pos_len, num_patches);
-            for (int i = 0; i < n; ++i) {
-                float* row = tokens.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden_size_);
-                const float* pe = pos_embed_.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden_size_);
-                for (int d = 0; d < hidden_size_; ++d) row[d] += pe[d];
-            }
-        } else {
-            parallel_for_1d(0, patch_grid_h, 2, [&](int y) {
-                float fy = 0.0f;
-                if (patch_grid_h > 1) {
-                    fy = static_cast<float>(y) * static_cast<float>(base_side - 1) /
-                         static_cast<float>(patch_grid_h - 1);
-                }
-                int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, base_side - 1);
-                int y1 = std::clamp(y0 + 1, 0, base_side - 1);
-                float wy1 = fy - static_cast<float>(y0);
-                float wy0 = 1.0f - wy1;
-
-                for (int x = 0; x < patch_grid_w; ++x) {
-                    float fx = 0.0f;
-                    if (patch_grid_w > 1) {
-                        fx = static_cast<float>(x) * static_cast<float>(base_side - 1) /
-                             static_cast<float>(patch_grid_w - 1);
-                    }
-                    int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, base_side - 1);
-                    int x1 = std::clamp(x0 + 1, 0, base_side - 1);
-                    float wx1 = fx - static_cast<float>(x0);
-                    float wx0 = 1.0f - wx1;
-
-                    int id00 = y0 * base_side + x0;
-                    int id01 = y0 * base_side + x1;
-                    int id10 = y1 * base_side + x0;
-                    int id11 = y1 * base_side + x1;
-
-                    float* row = tokens.data() +
-                                 static_cast<size_t>(y * patch_grid_w + x) * static_cast<size_t>(hidden_size_);
-                    const float* pe00 = pos_embed_.data() + static_cast<size_t>(id00) * static_cast<size_t>(hidden_size_);
-                    const float* pe01 = pos_embed_.data() + static_cast<size_t>(id01) * static_cast<size_t>(hidden_size_);
-                    const float* pe10 = pos_embed_.data() + static_cast<size_t>(id10) * static_cast<size_t>(hidden_size_);
-                    const float* pe11 = pos_embed_.data() + static_cast<size_t>(id11) * static_cast<size_t>(hidden_size_);
-
-                    for (int d = 0; d < hidden_size_; ++d) {
-                        float v = wy0 * (wx0 * pe00[d] + wx1 * pe01[d]) +
-                                  wy1 * (wx0 * pe10[d] + wx1 * pe11[d]);
-                        row[d] += v;
-                    }
-                }
-            });
-        }
-    }
-    const double pos_embed_ms = stage_ms(stage_start);
-
-    stage_start = clock::now();
-    std::vector<float> grouped_tokens;
-    std::vector<int> pos_y;
-    std::vector<int> pos_x;
-    reorder_qwen_block_sequence(tokens, patch_grid_w, patch_grid_h, hidden_size_, merge_size_,
-                                grouped_tokens, &pos_y, &pos_x);
-    tokens = std::move(grouped_tokens);
-
-    std::vector<float> ln1;
-    std::vector<float> qkv;
-    std::vector<float> q;
-    std::vector<float> k;
-    std::vector<float> v;
-    std::vector<float> attn_out;
-    std::vector<float> proj_out;
-    std::vector<float> ln2;
-    std::vector<float> ffn1;
-    std::vector<float> ffn2;
-
-    for (const auto& b : blocks_) {
-        layer_norm_affine(tokens, num_patches, hidden_size_,
-                          b.ln1_w, b.ln1_b, 1e-6f, ln1);
-
-        linear_rowmajor(ln1, num_patches, hidden_size_,
-                        b.qkv_w, b.qkv_b, hidden_size_ * 3, qkv);
-
-        q.resize(static_cast<size_t>(num_patches) * static_cast<size_t>(hidden_size_));
-        k.resize(static_cast<size_t>(num_patches) * static_cast<size_t>(hidden_size_));
-        v.resize(static_cast<size_t>(num_patches) * static_cast<size_t>(hidden_size_));
-        for (int t = 0; t < num_patches; ++t) {
-            const float* src = qkv.data() + static_cast<size_t>(t) * static_cast<size_t>(hidden_size_ * 3);
-            std::memcpy(q.data() + static_cast<size_t>(t) * static_cast<size_t>(hidden_size_),
-                        src, static_cast<size_t>(hidden_size_) * sizeof(float));
-            std::memcpy(k.data() + static_cast<size_t>(t) * static_cast<size_t>(hidden_size_),
-                        src + hidden_size_, static_cast<size_t>(hidden_size_) * sizeof(float));
-            std::memcpy(v.data() + static_cast<size_t>(t) * static_cast<size_t>(hidden_size_),
-                        src + hidden_size_ * 2, static_cast<size_t>(hidden_size_) * sizeof(float));
-        }
-
-        apply_qwen_vision_mrope_inplace(q, num_patches, num_heads_, head_dim_, pos_y, pos_x);
-        apply_qwen_vision_mrope_inplace(k, num_patches, num_heads_, head_dim_, pos_y, pos_x);
-
-        attn_out.assign(static_cast<size_t>(num_patches) * static_cast<size_t>(hidden_size_), 0.0f);
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-        parallel_for_1d(0, num_heads_, 1, [&](int h) {
-            int hd_off = h * head_dim_;
-            std::vector<float> probs(static_cast<size_t>(num_patches));
-            for (int qi = 0; qi < num_patches; ++qi) {
-                float max_s = -std::numeric_limits<float>::max();
-                const float* qv = q.data() + static_cast<size_t>(qi) * static_cast<size_t>(hidden_size_) + hd_off;
-                for (int kj = 0; kj < num_patches; ++kj) {
-                    const float* kv = k.data() + static_cast<size_t>(kj) * static_cast<size_t>(hidden_size_) + hd_off;
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim_; ++d) dot += qv[d] * kv[d];
-                    float s = dot * scale;
-                    probs[static_cast<size_t>(kj)] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_e = 0.0f;
-                for (int kj = 0; kj < num_patches; ++kj) {
-                    float e = std::exp(probs[static_cast<size_t>(kj)] - max_s);
-                    probs[static_cast<size_t>(kj)] = e;
-                    sum_e += e;
-                }
-                float inv = (sum_e > 0.0f) ? (1.0f / sum_e) : 0.0f;
-
-                float* outv = attn_out.data() + static_cast<size_t>(qi) * static_cast<size_t>(hidden_size_) + hd_off;
-                for (int d = 0; d < head_dim_; ++d) {
-                    float acc = 0.0f;
-                    for (int kj = 0; kj < num_patches; ++kj) {
-                        const float* vv = v.data() + static_cast<size_t>(kj) * static_cast<size_t>(hidden_size_) + hd_off;
-                        acc += probs[static_cast<size_t>(kj)] * inv * vv[d];
-                    }
-                    outv[d] = acc;
-                }
-            }
-        });
-
-        linear_rowmajor(attn_out, num_patches, hidden_size_,
-                        b.proj_w, b.proj_b, hidden_size_, proj_out);
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            tokens[i] += proj_out[i];
-        }
-
-        layer_norm_affine(tokens, num_patches, hidden_size_,
-                          b.ln2_w, b.ln2_b, 1e-6f, ln2);
-        linear_rowmajor(ln2, num_patches, hidden_size_,
-                        b.fc1_w, b.fc1_b, intermediate_size_, ffn1);
-        gelu_tanh_inplace(ffn1);
-        linear_rowmajor(ffn1, num_patches, intermediate_size_,
-                        b.fc2_w, b.fc2_b, hidden_size_, ffn2);
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            tokens[i] += ffn2[i];
-        }
-    }
-    const double blocks_ms = stage_ms(stage_start);
-
-    stage_start = clock::now();
-    std::vector<float> tokens_for_merge;
-    if (!merger_norm_w_.empty() && merger_norm_w_.size() == static_cast<size_t>(hidden_size_)) {
-        layer_norm_affine(tokens, num_patches, hidden_size_,
-                          merger_norm_w_, merger_norm_b_, 1e-6f, tokens_for_merge);
-    } else {
-        tokens_for_merge = tokens;
-    }
-
-    const int merged_w = patch_grid_w / merge_size_;
-    const int merged_h = patch_grid_h / merge_size_;
-    const int out_tokens = merged_w * merged_h;
-    const int merger_in_dim = hidden_size_ * merge_size_ * merge_size_;
-
     if (out_tokens <= 0) {
         set_error(error_message, "Invalid merged vision token count");
         return false;
     }
 
-    std::vector<float> merged(static_cast<size_t>(out_tokens) * static_cast<size_t>(merger_in_dim));
-    parallel_for_1d(0, out_tokens, 2, [&](int out_row) {
-        float* dst = merged.data() + static_cast<size_t>(out_row) * static_cast<size_t>(merger_in_dim);
-        const int block_size = merge_size_ * merge_size_;
-        for (int block = 0; block < block_size; ++block) {
-            const int src_row = out_row * block_size + block;
-            const float* src = tokens_for_merge.data() + static_cast<size_t>(src_row) * static_cast<size_t>(hidden_size_);
-            std::memcpy(dst + static_cast<size_t>(block) * static_cast<size_t>(hidden_size_),
-                        src, static_cast<size_t>(hidden_size_) * sizeof(float));
-        }
-    });
+    ensure_runtime_buffers(image_bytes, num_patches, out_tokens, merger_in_dim);
+    ensure_position_buffers(num_patches);
 
-    std::vector<float> merger_normed;
-    if (!merger_norm_w_.empty() && merger_norm_w_.size() == static_cast<size_t>(merger_in_dim)) {
-        layer_norm_affine(merged, out_tokens, merger_in_dim,
-                          merger_norm_w_, merger_norm_b_, 1e-6f, merger_normed);
-    } else {
-        merger_normed = std::move(merged);
+    Tensor image_rgb = Tensor::view(*ctx_, buf_.image_rgb.data(), {image_bytes}, dnnl::memory::data_type::u8);
+    Tensor patch_rows = Tensor::view(*ctx_, buf_.patch_rows.data(), {num_patches, patch_dim}, dnnl::memory::data_type::bf16);
+    Tensor tokens_a = Tensor::view(*ctx_, buf_.hidden_a.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor tokens_b = Tensor::view(*ctx_, buf_.hidden_b.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor normed = Tensor::view(*ctx_, buf_.normed.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor qkv = Tensor::view(*ctx_, buf_.qkv.data(), {num_patches, 3 * hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor q = Tensor::view(*ctx_, buf_.q.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor k = Tensor::view(*ctx_, buf_.k.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor v = Tensor::view(*ctx_, buf_.v.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor attn_out = Tensor::view(*ctx_, buf_.attn_out.data(), {num_patches, hidden_size_}, dnnl::memory::data_type::bf16);
+    Tensor ffn = Tensor::view(*ctx_, buf_.ffn.data(), {num_patches, intermediate_size_}, dnnl::memory::data_type::bf16);
+    Tensor scores = Tensor::view(*ctx_, buf_.scores.data(), {num_heads_, num_patches, num_patches}, dnnl::memory::data_type::f32);
+    Tensor merger_normed = Tensor::view(*ctx_, buf_.merger_normed.data(), {out_tokens, merger_in_dim}, dnnl::memory::data_type::bf16);
+    Tensor merger_hidden = Tensor::view(*ctx_, buf_.merger_hidden.data(), {out_tokens, merger_fc1_out_}, dnnl::memory::data_type::bf16);
+    Tensor merger_out = Tensor::view(*ctx_, buf_.merger_out.data(), {out_tokens, out_hidden_size_}, dnnl::memory::data_type::bf16);
+
+    stage_start = clock::now();
+    ctx_->memcpy_h2d(image_rgb.data(), resized_rgb.data(), static_cast<size_t>(image_bytes));
+    ops::vision_patchify_rgb_u8(*ctx_, static_cast<const uint8_t*>(image_rgb.data()), patch_rows,
+                                target_w, target_h, patch_size_,
+                                image_mean_[0], image_mean_[1], image_mean_[2],
+                                image_std_[0], image_std_[1], image_std_[2]);
+    const double prep_ms = gpu_stage_ms(stage_start);
+
+    stage_start = clock::now();
+    patch_proj_.forward(*ctx_, patch_rows, tokens_a, num_patches);
+    if (patch_bias_) {
+        ops::bias_add_inplace(*ctx_, tokens_a, *patch_bias_, num_patches, hidden_size_);
+    }
+    const double patch_proj_ms = gpu_stage_ms(stage_start);
+
+    stage_start = clock::now();
+    ops::vision_add_position_embedding(*ctx_, tokens_a, *pos_embed_, patch_grid_w, patch_grid_h, hidden_size_);
+    ops::vision_reorder_merge_blocks(*ctx_, tokens_a, tokens_b, patch_grid_w, patch_grid_h, hidden_size_, merge_size_);
+    fill_merge_block_positions(patch_grid_w, patch_grid_h);
+    const size_t pos_bytes = static_cast<size_t>(num_patches) * sizeof(int);
+    ctx_->memcpy_h2d(pos_y_device_, pos_y_host_.data(), pos_bytes);
+    ctx_->memcpy_h2d(pos_x_device_, pos_x_host_.data(), pos_bytes);
+    const double pos_embed_ms = gpu_stage_ms(stage_start);
+
+    stage_start = clock::now();
+    Tensor* current = &tokens_b;
+    Tensor* scratch = &tokens_a;
+
+    for (auto& b : blocks_) {
+        ops::layer_norm(*ctx_, *current, *b.ln1_weight, *b.ln1_bias, 1e-6f, normed, num_patches, hidden_size_);
+
+        b.qkv.forward(*ctx_, normed, qkv, num_patches);
+        if (b.qkv_bias) {
+            ops::bias_add_inplace(*ctx_, qkv, *b.qkv_bias, num_patches, 3 * hidden_size_);
+        }
+        ops::split_qkv(*ctx_, qkv, q, k, v, num_patches, hidden_size_, hidden_size_);
+        ops::vision_mrope_inplace(*ctx_, q, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
+        ops::vision_mrope_inplace(*ctx_, k, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
+        ops::attention_bidi(*ctx_, q, k, v, attn_out, scores, num_patches, num_heads_, head_dim_);
+
+        b.proj.forward(*ctx_, attn_out, *scratch, num_patches);
+        if (b.proj_bias) {
+            ops::bias_add_inplace(*ctx_, *scratch, *b.proj_bias, num_patches, hidden_size_);
+        }
+        ops::residual_add(*ctx_, *current, *scratch, num_patches * hidden_size_);
+
+        ops::layer_norm(*ctx_, *current, *b.ln2_weight, *b.ln2_bias, 1e-6f, normed, num_patches, hidden_size_);
+        b.fc1.forward(*ctx_, normed, ffn, num_patches);
+        if (b.fc1_bias) {
+            ops::bias_add_inplace(*ctx_, ffn, *b.fc1_bias, num_patches, intermediate_size_);
+        }
+        ops::gelu_tanh_inplace(*ctx_, ffn, num_patches * intermediate_size_);
+        b.fc2.forward(*ctx_, ffn, *scratch, num_patches);
+        if (b.fc2_bias) {
+            ops::bias_add_inplace(*ctx_, *scratch, *b.fc2_bias, num_patches, hidden_size_);
+        }
+        ops::residual_add(*ctx_, *current, *scratch, num_patches * hidden_size_);
+    }
+    const double blocks_ms = gpu_stage_ms(stage_start);
+
+    stage_start = clock::now();
+    Tensor* merged_source_tokens = current;
+    if (merger_norm_weight_ && merger_norm_weight_->numel() == hidden_size_) {
+        ops::layer_norm(*ctx_, *current, *merger_norm_weight_, *merger_norm_bias_,
+                        1e-6f, *scratch, num_patches, hidden_size_);
+        merged_source_tokens = scratch;
     }
 
-    const int merger_fc1_out =
-        !merger_fc1_b_.empty() ? static_cast<int>(merger_fc1_b_.size())
-                               : static_cast<int>(merger_fc1_w_.size() / static_cast<size_t>(merger_in_dim));
-    std::vector<float> merger_h;
-    linear_rowmajor(merger_normed, out_tokens, merger_in_dim,
-                    merger_fc1_w_, merger_fc1_b_, merger_fc1_out, merger_h);
-    gelu_tanh_inplace(merger_h);
+    Tensor merged_input = Tensor::view(*ctx_, merged_source_tokens->data(),
+                                       {out_tokens, merger_in_dim},
+                                       dnnl::memory::data_type::bf16);
+    Tensor* merger_src = &merged_input;
+    if (merger_norm_weight_ && merger_norm_weight_->numel() == merger_in_dim) {
+        ops::layer_norm(*ctx_, merged_input, *merger_norm_weight_, *merger_norm_bias_,
+                        1e-6f, merger_normed, out_tokens, merger_in_dim);
+        merger_src = &merger_normed;
+    }
 
-    std::vector<float> merger_out;
-    linear_rowmajor(merger_h, out_tokens, merger_fc1_out,
-                    merger_fc2_w_, merger_fc2_b_, out_hidden_size_, merger_out);
+    merger_fc1_.forward(*ctx_, *merger_src, merger_hidden, out_tokens);
+    if (merger_fc1_bias_) {
+        ops::bias_add_inplace(*ctx_, merger_hidden, *merger_fc1_bias_, out_tokens, merger_fc1_out_);
+    }
+    ops::gelu_tanh_inplace(*ctx_, merger_hidden, out_tokens * merger_fc1_out_);
+
+    merger_fc2_.forward(*ctx_, merger_hidden, merger_out, out_tokens);
+    if (merger_fc2_bias_) {
+        ops::bias_add_inplace(*ctx_, merger_out, *merger_fc2_bias_, out_tokens, out_hidden_size_);
+    }
 
     out.token_count = out_tokens;
     out.llm_grid_t = 1;
     out.llm_grid_h = merged_h;
     out.llm_grid_w = merged_w;
     out.embeddings.resize(static_cast<size_t>(out_tokens) * static_cast<size_t>(out_hidden_size_));
-    for (size_t i = 0; i < merger_out.size(); ++i) {
-        out.embeddings[i] = bf16(merger_out[i]);
-    }
+    ctx_->memcpy_d2h(out.embeddings.data(), merger_out.data(), out.embeddings.size() * sizeof(bf16));
+    const double merger_ms = stage_ms(stage_start);
 
     if (profile) {
-        const double merger_ms = stage_ms(stage_start);
         const double total_ms = stage_ms(t_total_start);
         AILA_LOG_INFO(
-            "[VisionProfile] file=%s src=%dx%d target=%dx%d llm=%dx%dx%d tokens=%d threads=%d "
+            "[VisionProfile] file=%s src=%dx%d target=%dx%d patch=%dx%d merged=%dx%d llm=%dx%dx%d tokens=%d "
             "decode=%.2fms resize=%.2fms prep=%.2fms patch=%.2fms pos=%.2fms blocks=%.2fms merger=%.2fms total=%.2fms",
-            uri.c_str(), src_w, src_h, target_w, target_h, out.llm_grid_t, out.llm_grid_h, out.llm_grid_w,
-            out.token_count, vision_cpu_threads(), decode_ms, resize_ms, prep_ms, patch_proj_ms,
-            pos_embed_ms, blocks_ms, merger_ms, total_ms);
+            uri.c_str(), src_w, src_h, target_w, target_h,
+            patch_grid_w, patch_grid_h, merged_w, merged_h,
+            out.llm_grid_t, out.llm_grid_h, out.llm_grid_w, out.token_count,
+            decode_ms, resize_ms, prep_ms, patch_proj_ms, pos_embed_ms, blocks_ms, merger_ms, total_ms);
     }
     return true;
 }

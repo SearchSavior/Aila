@@ -798,6 +798,118 @@ void attention_prefill(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
       });
 }
 
+void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
+                    Tensor& output, Tensor& scores_buf,
+                    int seq_len, int num_heads, int head_dim) {
+  (void)scores_buf;
+  if (seq_len <= 0 || num_heads <= 0 || head_dim <= 0) {
+    return;
+  }
+
+  bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  bf16 *k_ptr = static_cast<bf16 *>(k.data());
+  bf16 *v_ptr = static_cast<bf16 *>(v.data());
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int total_dim = num_heads * head_dim;
+  const int wg_size = (head_dim <= 64 && seq_len <= 64) ? 64 : 128;
+  const int tile_t = wg_size;
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> scores(sycl::range<1>(tile_t), cgh);
+    sycl::local_accessor<float, 1> acc_local(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> merge_state(sycl::range<1>(4), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(num_heads * seq_len * wg_size, wg_size),
+        [=](sycl::nd_item<1> item) {
+          const int group = item.get_group(0);
+          const int h = group / seq_len;
+          const int qi = group % seq_len;
+          const int lid = item.get_local_id(0);
+
+          const bf16 *q_row = q_ptr + qi * total_dim + h * head_dim;
+          for (int d = lid; d < head_dim; d += wg_size) {
+            q_cache[d] = static_cast<float>(q_row[d]);
+            acc_local[d] = 0.0f;
+          }
+          if (lid == 0) {
+            merge_state[0] = -1e30f;
+            merge_state[1] = 0.0f;
+            merge_state[2] = 0.0f;
+            merge_state[3] = 0.0f;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int tile_start = 0; tile_start < seq_len; tile_start += tile_t) {
+            const int tile_len = sycl::min(tile_t, seq_len - tile_start);
+
+            float score = -1e30f;
+            if (lid < tile_len) {
+              const bf16 *k_row =
+                  k_ptr + (tile_start + lid) * total_dim + h * head_dim;
+              score = 0.0f;
+              for (int d = 0; d < head_dim; ++d) {
+                score += q_cache[d] * static_cast<float>(k_row[d]);
+              }
+              score *= scale;
+              scores[lid] = score;
+            } else {
+              scores[lid] = -1e30f;
+            }
+
+            const float tile_max = sycl::reduce_over_group(
+                item.get_group(), score, sycl::maximum<float>());
+
+            float exp_score = 0.0f;
+            if (lid < tile_len) {
+              exp_score = sycl::native::exp(scores[lid] - tile_max);
+              scores[lid] = exp_score;
+            } else {
+              scores[lid] = 0.0f;
+            }
+
+            const float tile_sum = sycl::reduce_over_group(
+                item.get_group(), exp_score, sycl::plus<float>());
+
+            if (lid == 0) {
+              const float prev_m = merge_state[0];
+              const float prev_l = merge_state[1];
+              const float new_m = sycl::fmax(prev_m, tile_max);
+              const float alpha = sycl::native::exp(prev_m - new_m);
+              const float beta = sycl::native::exp(tile_max - new_m);
+              merge_state[0] = new_m;
+              merge_state[1] = alpha * prev_l + beta * tile_sum;
+              merge_state[2] = alpha;
+              merge_state[3] = beta;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            const float alpha = merge_state[2];
+            const float beta = merge_state[3];
+            for (int d = lid; d < head_dim; d += wg_size) {
+              float tile_acc = 0.0f;
+              for (int j = 0; j < tile_len; ++j) {
+                const bf16 *v_row =
+                    v_ptr + (tile_start + j) * total_dim + h * head_dim;
+                tile_acc += scores[j] * static_cast<float>(v_row[d]);
+              }
+              acc_local[d] = alpha * acc_local[d] + beta * tile_acc;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          const float inv_l = merge_state[1] > 0.0f ? 1.0f / merge_state[1] : 0.0f;
+          bf16 *o_row = o_ptr + qi * total_dim + h * head_dim;
+          for (int d = lid; d < head_dim; d += wg_size) {
+            o_row[d] = bf16(acc_local[d] * inv_l);
+          }
+        });
+  });
+}
+
 // ============================================================
 // SYCL Kernel: Incremental Prefill Attention
 // ============================================================

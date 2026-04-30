@@ -37,6 +37,49 @@ struct TensorMeta {
     size_t byte_offset_end;
 };
 
+struct Bnb4BitQuantState {
+    std::string quant_type;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    int blocksize = 0;
+    bool nested = false;
+    int nested_blocksize = 0;
+    std::string nested_dtype;
+    float nested_offset = 0.0f;
+};
+
+struct Bnb4BitWeightRef {
+    std::string name;
+    Tensor* packed_weight = nullptr;
+    Tensor* absmax = nullptr;
+    Tensor* quant_map = nullptr;
+    Tensor* nested_absmax = nullptr;
+    Tensor* nested_quant_map = nullptr;
+    Tensor* packed_quant_state = nullptr;
+    Bnb4BitQuantState quant_state{};
+
+    bool valid() const {
+        return packed_weight != nullptr && absmax != nullptr && quant_map != nullptr &&
+               packed_quant_state != nullptr && quant_state.shape.size() == 2;
+    }
+
+    int64_t logical_out_features() const {
+        return quant_state.shape.size() > 0 ? quant_state.shape[0] : 0;
+    }
+
+    int64_t logical_in_features() const {
+        return quant_state.shape.size() > 1 ? quant_state.shape[1] : 0;
+    }
+
+    int64_t logical_numel() const {
+        return logical_out_features() * logical_in_features();
+    }
+
+    int64_t packed_num_bytes() const {
+        return packed_weight ? packed_weight->numel() : 0;
+    }
+};
+
 // ============================================================
 // ModelWeights: 封装模型所有权重 (name -> Tensor GPU 映射)
 // ============================================================
@@ -60,6 +103,9 @@ public:
 
     // 替换已有 tensor (用于预处理)
     void replace(const std::string& name, Tensor tensor);
+
+    // 删除已有 tensor，释放其设备内存
+    void erase(const std::string& name);
 
     // 获取所有名称
     std::vector<std::string> names() const;
@@ -85,6 +131,13 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx);
 // 1) 优先 model.safetensors
 // 2) 否则使用 model.safetensors.index.json + 分片 safetensors
 ModelWeights LoadModelWeightsFromDir(const std::string& model_dir, Context& ctx);
+
+// 从 bitsandbytes 4-bit checkpoint 条目组装运行时视图
+bool LoadBnb4BitWeightRef(Context& ctx,
+                          ModelWeights& weights,
+                          const std::string& name,
+                          Bnb4BitWeightRef& out,
+                          std::string* error_message = nullptr);
 
 // 内部工具函数
 std::vector<std::string> ParseHeader(const std::string& header,

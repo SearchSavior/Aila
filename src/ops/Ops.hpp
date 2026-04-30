@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <string>
+#include <cstdint>
 
 // ============================================================
 // Linear 层 (oneDNN MatMul 封装)
@@ -92,6 +93,11 @@ namespace ops {
     // input/output: [seq_len, hidden_size], weight: [hidden_size]
     void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
                   float eps, Tensor& output, int seq_len, int hidden_size);
+
+    // LayerNorm: output = ((x - mean) / sqrt(var + eps)) * weight + bias
+    // input/output: [rows, cols], weight/bias: [cols]
+    void layer_norm(Context& ctx, Tensor& input, Tensor& weight, Tensor& bias,
+                    float eps, Tensor& output, int rows, int cols);
 
     // Fused: output = rms_norm(input + residual, weight) (writes back to input)
     void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
@@ -213,6 +219,14 @@ namespace ops {
                            int seq_len,
                            int num_heads, int num_kv_heads, int head_dim);
 
+    // Bidirectional Attention (vision prefill)
+    // q/k/v/output: [seq_len, num_heads * head_dim]
+    // scores_buf: [num_heads, seq_len, seq_len]
+    void attention_bidi(Context& ctx,
+                        Tensor& q, Tensor& k, Tensor& v,
+                        Tensor& output, Tensor& scores_buf,
+                        int seq_len, int num_heads, int head_dim);
+
     // Incremental Prefill Attention (seq_len > 1, start_pos > 0)
     // Q attends to full KV cache [0, start_pos + seq_len) with causal masking.
     // New K/V must already be written to cache before calling this.
@@ -239,6 +253,11 @@ namespace ops {
     void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up,
                                Tensor& output, int ff_dim);
 
+    // GELU-Tanh activation: x = gelu(x) (in-place)
+    void gelu_tanh_inplace(Context& ctx, Tensor& input, int n);
+
+    // Bias add: input[row, col] += bias[col] (in-place)
+    void bias_add_inplace(Context& ctx, Tensor& input, Tensor& bias, int rows, int cols);
 
     // 残差连接: a += b (in-place)
     void residual_add(Context& ctx, Tensor& a, Tensor& b, int n);
@@ -315,6 +334,26 @@ namespace ops {
     void sample_with_config_device(Context& ctx, Tensor& logits, int vocab_size,
                                    const GenerationConfig& gen_config,
                                    float random_u, int* d_result);
+
+    // Vision patchify + normalize: RGB u8 -> patch rows bf16
+    // patches: [num_patches, 3 * patch_size * patch_size]
+    void vision_patchify_rgb_u8(Context& ctx, const uint8_t* rgb_device, Tensor& patches,
+                                int width, int height, int patch_size,
+                                float mean0, float mean1, float mean2,
+                                float std0, float std1, float std2);
+
+    // Vision position embedding add with optional bilinear interpolation.
+    void vision_add_position_embedding(Context& ctx, Tensor& tokens, Tensor& pos_embed,
+                                       int patch_grid_w, int patch_grid_h, int hidden_size);
+
+    // Reorder tokens into merge-block order expected by Qwen3.5 vision blocks.
+    void vision_reorder_merge_blocks(Context& ctx, Tensor& src, Tensor& dst,
+                                     int grid_w, int grid_h, int hidden_size, int merge_size);
+
+    // Vision mRoPE in-place for [num_tokens, num_heads * head_dim].
+    void vision_mrope_inplace(Context& ctx, Tensor& x,
+                              int num_tokens, int num_heads, int head_dim,
+                              const int* pos_y, const int* pos_x);
 
     // Physical transpose: dst = src^T
     // src: [R, C], dst: [C, R]

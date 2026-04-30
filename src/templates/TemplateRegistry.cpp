@@ -131,6 +131,13 @@ bool render_chatml(const Tokenizer& tokenizer,
             } else {
                 append_encoded(tokenizer, out_ids, "<think>\n");
             }
+        } else if (disable_thinking) {
+            int end_think_id = tokenizer.special_token_id("</think>");
+            if (end_think_id >= 0) {
+                out_ids.push_back(end_think_id);
+                append_encoded(tokenizer, out_ids, "\n");
+            }
+            append_encoded(tokenizer, out_ids, "Please answer directly and briefly.\n");
         }
     }
     return true;
