@@ -55,7 +55,7 @@ constexpr int kPrefillExact256MinSeq = 1024;
 constexpr int kPrefillCachedExact256MinTotal = 1024;
 constexpr int kVisionBidiExact64HeadDim = 64;
 constexpr int kVisionBidiExact64Tile = 128;
-constexpr int kVisionBidiExact64Wg = 128;
+constexpr int kVisionBidiExact64Wg = 64;
 constexpr int kVisionBidiExact64MinSeq = 256;
 
 void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
@@ -814,6 +814,8 @@ void attention_bidi_exact_head64(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
   constexpr int tile_t = kVisionBidiExact64Tile;
   constexpr int wg_size = kVisionBidiExact64Wg;
   constexpr float scale = 0.125f;
+  static_assert(exact_head_dim == 64);
+  static_assert(tile_t == 2 * wg_size);
   const int total_dim = num_heads * exact_head_dim;
 
   ctx.queue().submit([&](sycl::handler &cgh) {
@@ -829,12 +831,11 @@ void attention_bidi_exact_head64(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
           const int h = group / seq_len;
           const int qi = group % seq_len;
           const int lid = item.get_local_id(0);
+          const int lid_hi = lid + wg_size;
 
           const bf16 *q_row = q_ptr + qi * total_dim + h * exact_head_dim;
-          if (lid < exact_head_dim) {
-            q_cache[lid] = static_cast<float>(q_row[lid]);
-            acc_local[lid] = 0.0f;
-          }
+          q_cache[lid] = static_cast<float>(q_row[lid]);
+          acc_local[lid] = 0.0f;
           if (lid == 0) {
             merge_state[0] = -1e30f;
             merge_state[1] = 0.0f;
@@ -846,40 +847,69 @@ void attention_bidi_exact_head64(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
           for (int tile_start = 0; tile_start < seq_len; tile_start += tile_t) {
             const int tile_len = sycl::min(tile_t, seq_len - tile_start);
 
-            float score = -1e30f;
+            float score_lo = -1e30f;
             if (lid < tile_len) {
               const bf16 *k_row =
                   k_ptr + (tile_start + lid) * total_dim + h * exact_head_dim;
-              score = 0.0f;
+              score_lo = 0.0f;
               for (int d = 0; d < exact_head_dim; d += 8) {
-                score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-                score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-                score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-                score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-                score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-                score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-                score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-                score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+                score_lo += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
+                score_lo += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
+                score_lo += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
+                score_lo += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
+                score_lo += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
+                score_lo += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
+                score_lo += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
+                score_lo += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
               }
-              score *= scale;
-              scores[lid] = score;
+              score_lo *= scale;
+              scores[lid] = score_lo;
             } else {
               scores[lid] = -1e30f;
             }
 
-            const float tile_max = sycl::reduce_over_group(
-                item.get_group(), score, sycl::maximum<float>());
+            float score_hi = -1e30f;
+            if (lid_hi < tile_len) {
+              const bf16 *k_row =
+                  k_ptr + (tile_start + lid_hi) * total_dim + h * exact_head_dim;
+              score_hi = 0.0f;
+              for (int d = 0; d < exact_head_dim; d += 8) {
+                score_hi += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
+                score_hi += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
+                score_hi += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
+                score_hi += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
+                score_hi += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
+                score_hi += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
+                score_hi += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
+                score_hi += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+              }
+              score_hi *= scale;
+              scores[lid_hi] = score_hi;
+            } else {
+              scores[lid_hi] = -1e30f;
+            }
 
-            float exp_score = 0.0f;
+            const float tile_max = sycl::reduce_over_group(
+                item.get_group(), sycl::fmax(score_lo, score_hi), sycl::maximum<float>());
+
+            float exp_score_lo = 0.0f;
             if (lid < tile_len) {
-              exp_score = sycl::native::exp(scores[lid] - tile_max);
-              scores[lid] = exp_score;
+              exp_score_lo = sycl::native::exp(scores[lid] - tile_max);
+              scores[lid] = exp_score_lo;
             } else {
               scores[lid] = 0.0f;
             }
 
+            float exp_score_hi = 0.0f;
+            if (lid_hi < tile_len) {
+              exp_score_hi = sycl::native::exp(scores[lid_hi] - tile_max);
+              scores[lid_hi] = exp_score_hi;
+            } else {
+              scores[lid_hi] = 0.0f;
+            }
+
             const float tile_sum = sycl::reduce_over_group(
-                item.get_group(), exp_score, sycl::plus<float>());
+                item.get_group(), exp_score_lo + exp_score_hi, sycl::plus<float>());
 
             if (lid == 0) {
               const float prev_m = merge_state[0];
@@ -896,23 +926,19 @@ void attention_bidi_exact_head64(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
 
             const float alpha = merge_state[2];
             const float beta = merge_state[3];
-            if (lid < exact_head_dim) {
-              float tile_acc = 0.0f;
-              for (int j = 0; j < tile_len; ++j) {
-                const bf16 *v_row =
-                    v_ptr + (tile_start + j) * total_dim + h * exact_head_dim;
-                tile_acc += scores[j] * static_cast<float>(v_row[lid]);
-              }
-              acc_local[lid] = alpha * acc_local[lid] + beta * tile_acc;
+            float tile_acc = 0.0f;
+            for (int j = 0; j < tile_len; ++j) {
+              const bf16 *v_row =
+                  v_ptr + (tile_start + j) * total_dim + h * exact_head_dim;
+              tile_acc += scores[j] * static_cast<float>(v_row[lid]);
             }
+            acc_local[lid] = alpha * acc_local[lid] + beta * tile_acc;
             item.barrier(sycl::access::fence_space::local_space);
           }
 
           const float inv_l = merge_state[1] > 0.0f ? 1.0f / merge_state[1] : 0.0f;
           bf16 *o_row = o_ptr + qi * total_dim + h * exact_head_dim;
-          if (lid < exact_head_dim) {
-            o_row[lid] = bf16(acc_local[lid] * inv_l);
-          }
+          o_row[lid] = bf16(acc_local[lid] * inv_l);
         });
   });
 }
