@@ -694,7 +694,7 @@ void Bnb4BitLinear::finish_init(Context& ctx) {
     cached_weight_ready_ = false;
 
     cache_dequantized_weight_ = force_dequant_cache_ ||
-                                aila::env::read_flag("AILA_BNB4_CACHE_DEQUANT", false);
+                                aila::env::read_flag("AILA_BNB4_CACHE_DEQUANT", true);
     if (cache_dequantized_weight_) {
         cached_weight_f16_ = Tensor::allocate(ctx,
                                               {(int64_t)in_features_, (int64_t)out_features_},
