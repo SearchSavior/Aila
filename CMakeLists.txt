@@ -43,8 +43,6 @@ set(LIB_SOURCES
     src/ops/SamplingOps.cpp
     src/ops/Transpose.cpp
     src/memory/KVCache.cpp
-    src/models/Qwen3.cpp
-    src/models/Qwen3Bnb4.cpp
     src/models/Qwen3DenseBackend.cpp
     src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp

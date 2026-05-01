@@ -217,10 +217,12 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--greedy") {
             opts.do_sample = false;
+            opts.bench_sample = false;
             continue;
         }
         if (arg == "--sample") {
             opts.do_sample = true;
+            opts.bench_sample = true;
             continue;
         }
         if (arg == "--stream") {

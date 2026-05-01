@@ -358,19 +358,6 @@ public:
                     s.pop_back();
                 }
             };
-            auto strip_no_think_suffix = [&](std::string& s) -> bool {
-                const std::string cmd = "/no_think";
-                rtrim_inplace(s);
-                if (s.size() < cmd.size()) return false;
-                size_t pos = s.size() - cmd.size();
-                if (s.compare(pos, cmd.size(), cmd) != 0) return false;
-                bool boundary_ok = (pos == 0) ||
-                                   std::isspace(static_cast<unsigned char>(s[pos - 1]));
-                if (!boundary_ok) return false;
-                s.erase(pos);
-                rtrim_inplace(s);
-                return true;
-            };
             auto strip_think_blocks = [](std::string& text) {
                 while (true) {
                     size_t start = text.find("<think>");
@@ -415,11 +402,12 @@ public:
                 mm_history_.insert(mm_history_.begin(), std::move(sys_msg));
             }
 
-            std::string cleaned_user_message = user_message;
-            strip_no_think_suffix(cleaned_user_message);
+            // Keep /no_think in the message — generate_messages() and TemplateRegistry
+            // both detect it and handle think-suppression correctly. Stripping here
+            // would prevent downstream detection from ever seeing it.
             Message user_msg;
             user_msg.role = "user";
-            user_msg.content.push_back(ContentPart{ContentType::Text, cleaned_user_message, ""});
+            user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
             mm_history_.push_back(user_msg);
 
             std::string out = generate_messages(mm_history_, gen_config, token_callback);

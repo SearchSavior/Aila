@@ -387,6 +387,378 @@ void packed_nf4_gemv_bf16(Context& ctx,
     });
 }
 
+// ---- Blocked weight layout for cross-sub-group memory coalescing ----
+//
+// Original layout: packed[N][K/2], absmax[N][K/blocksize]
+// Blocked layout:  [K/blocksize][ceil(N/16)][blocksize/16][16][4]
+//   = [kb][rt][quad][sub_row][4 bytes]  — inner stride = 16*4 = 64 bytes
+// At a given (kb, quad), 16 adjacent rows' data is contiguous → 1 cache line.
+//
+// Index: blocked[((kb * num_rt + rt) * quads_per_block + quad) * 64 + sub_row * 4]
+
+struct BlockedDims {
+    int num_k_blocks;
+    int num_row_tiles;
+    int quads_per_block;   // = blocksize / 8  (bytes_per_block/4, bytes_per_block=blocksize/2)
+    int bytes_per_block;
+};
+
+static BlockedDims compute_blocked_dims(int N, int K, int blocksize) {
+    BlockedDims d;
+    d.num_k_blocks = K / blocksize;
+    d.num_row_tiles = (N + 15) / 16;
+    d.bytes_per_block = blocksize / 2;
+    d.quads_per_block = d.bytes_per_block / 4;
+    return d;
+}
+
+static size_t blocked_packed_size(const BlockedDims& d) {
+    return static_cast<size_t>(d.num_k_blocks) * d.num_row_tiles * d.quads_per_block * 64;
+}
+
+static size_t blocked_absmax_size(const BlockedDims& d) {
+    return static_cast<size_t>(d.num_k_blocks) * d.num_row_tiles * 16;
+}
+
+void transpose_bnb_weights_blocked(Context& ctx,
+                                    const uint8_t* src_packed,
+                                    const float* src_absmax,
+                                    uint8_t* dst_packed,
+                                    float* dst_absmax,
+                                    int N, int K, int blocksize) {
+    const BlockedDims d = compute_blocked_dims(N, K, blocksize);
+    const int src_bytes_per_row = K / 2;
+    const int src_absmax_per_row = K / blocksize;
+
+    // Zero-fill dst in case of padding rows in the last tile.
+    size_t packed_bytes = blocked_packed_size(d);
+    size_t absmax_floats = blocked_absmax_size(d);
+    ctx.queue().memset(dst_packed, 0, packed_bytes);
+    ctx.queue().memset(dst_absmax, 0, absmax_floats * sizeof(float));
+
+    // Each work-item copies one uint32_t (4 packed bytes) for one row.
+    size_t total_items = static_cast<size_t>(N) * d.num_k_blocks * d.quads_per_block;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(total_items), [=](sycl::item<1> item) {
+            size_t idx = item.get_id(0);
+            int quad = static_cast<int>(idx % d.quads_per_block);
+            int rem = static_cast<int>(idx / d.quads_per_block);
+            int kb = rem % d.num_k_blocks;
+            int row = rem / d.num_k_blocks;
+
+            int rt = row / 16;
+            int sr = row % 16;
+            int src_byte = kb * d.bytes_per_block + quad * 4;
+            uint32_t val = *reinterpret_cast<const uint32_t*>(
+                src_packed + static_cast<size_t>(row) * src_bytes_per_row + src_byte);
+            size_t dst_off = ((static_cast<size_t>(kb) * d.num_row_tiles + rt) * d.quads_per_block + quad) * 64
+                           + static_cast<size_t>(sr) * 4;
+            *reinterpret_cast<uint32_t*>(dst_packed + dst_off) = val;
+        });
+    });
+
+    // Transpose absmax.
+    size_t absmax_items = static_cast<size_t>(N) * d.num_k_blocks;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(absmax_items), [=](sycl::item<1> item) {
+            size_t idx = item.get_id(0);
+            int kb = static_cast<int>(idx % d.num_k_blocks);
+            int row = static_cast<int>(idx / d.num_k_blocks);
+            int rt = row / 16;
+            int sr = row % 16;
+            float val = src_absmax[static_cast<size_t>(row) * src_absmax_per_row + kb];
+            dst_absmax[((static_cast<size_t>(kb) * d.num_row_tiles + rt) * 16) + sr] = val;
+        });
+    });
+}
+
+void packed_nf4_gemv_bf16_blocked(Context& ctx,
+                                   const uint8_t* blocked_packed,
+                                   const float* blocked_absmax,
+                                   const float* quant_map_ptr,
+                                   const bf16* input_ptr,
+                                   bf16* out_ptr,
+                                   int N, int K, int blocksize) {
+    int num_k_blocks = K / blocksize;
+    int num_row_tiles = (N + 15) / 16;
+    int bytes_per_block = blocksize / 2;
+    int quads_per_block = bytes_per_block / 4;
+    constexpr int TILE_N = 16;
+    constexpr int WG_SIZE = 256;
+    constexpr int SG_SIZE = 16;
+
+    size_t num_groups = static_cast<size_t>(num_row_tiles);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const int lid = static_cast<int>(item.get_local_id(0));
+            const int sg_id = lid / SG_SIZE;
+            const int sg_lane = lid % SG_SIZE;
+            const int rt = static_cast<int>(item.get_group(0));
+            const int row = rt * TILE_N + sg_id;
+
+            if (lid < 16) qmap[lid] = quant_map_ptr[lid];
+            item.barrier(sycl::access::fence_space::local_space);
+
+            float partial = 0.0f;
+            if (row < N) {
+                // Process 2 K-blocks per iteration for full lane utilization.
+                // quads_per_block is typically 8 (for blocksize=64), so 16 lanes process
+                // 8 quads × 2 blocks = 16 quads per iteration → all lanes utilized.
+                for (int kb = 0; kb < num_k_blocks; kb += 2) {
+                    float absmax0 = blocked_absmax[
+                        ((static_cast<size_t>(kb) * num_row_tiles + rt) * TILE_N) + sg_id];
+                    float absmax1 = (kb + 1 < num_k_blocks) ? blocked_absmax[
+                        (((static_cast<size_t>(kb) + 1) * num_row_tiles + rt) * TILE_N) + sg_id] : 0.0f;
+
+                    int gb0 = kb * bytes_per_block;
+                    int gb1 = (kb + 1) * bytes_per_block;
+                    bool have_b1 = (kb + 1 < num_k_blocks);
+
+                    for (int quad = sg_lane; quad < quads_per_block; quad += SG_SIZE) {
+                        size_t base0 = ((static_cast<size_t>(kb) * num_row_tiles + rt) * quads_per_block + quad) * 64;
+                        uint32_t p0 = *reinterpret_cast<const uint32_t*>(blocked_packed + base0 + sg_id * 4);
+
+                        int ib0 = gb0 + quad * 4;
+                        uint8_t b00 = static_cast<uint8_t>(p0);
+                        uint8_t b01 = static_cast<uint8_t>(p0 >> 8);
+                        uint8_t b02 = static_cast<uint8_t>(p0 >> 16);
+                        uint8_t b03 = static_cast<uint8_t>(p0 >> 24);
+                        partial += static_cast<float>(input_ptr[ib0*2+0]) * qmap[b00>>4] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+1]) * qmap[b00&0xF] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+2]) * qmap[b01>>4] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+3]) * qmap[b01&0xF] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+4]) * qmap[b02>>4] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+5]) * qmap[b02&0xF] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+6]) * qmap[b03>>4] * absmax0;
+                        partial += static_cast<float>(input_ptr[ib0*2+7]) * qmap[b03&0xF] * absmax0;
+
+                        if (have_b1) {
+                            size_t base1 = (((static_cast<size_t>(kb) + 1) * num_row_tiles + rt) * quads_per_block + quad) * 64;
+                            uint32_t p1 = *reinterpret_cast<const uint32_t*>(blocked_packed + base1 + sg_id * 4);
+                            int ib1 = gb1 + quad * 4;
+                            uint8_t b10 = static_cast<uint8_t>(p1);
+                            uint8_t b11 = static_cast<uint8_t>(p1 >> 8);
+                            uint8_t b12 = static_cast<uint8_t>(p1 >> 16);
+                            uint8_t b13 = static_cast<uint8_t>(p1 >> 24);
+                            partial += static_cast<float>(input_ptr[ib1*2+0]) * qmap[b10>>4] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+1]) * qmap[b10&0xF] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+2]) * qmap[b11>>4] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+3]) * qmap[b11&0xF] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+4]) * qmap[b12>>4] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+5]) * qmap[b12&0xF] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+6]) * qmap[b13>>4] * absmax1;
+                            partial += static_cast<float>(input_ptr[ib1*2+7]) * qmap[b13&0xF] * absmax1;
+                        }
+                    }
+                }
+            }
+
+            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            if (sg_lane == 0 && row < N) {
+                out_ptr[row] = bf16(sum);
+            }
+        });
+    });
+}
+
+// Test harness: compare blocked gemv against CPU reference.
+// Pre-transposes data on CPU to isolate transpose kernel from gemv kernel.
+static bool run_blocked_gemv_test(Context& ctx) {
+    constexpr int TEST_K = 256;
+    constexpr int TEST_N = 48;
+    constexpr int TEST_BLOCKSIZE = 64;
+    constexpr int TEST_BYTES_PER_ROW = TEST_K / 2;
+    constexpr int TEST_BLOCKS_PER_ROW = TEST_K / TEST_BLOCKSIZE;
+
+    // NF4 dequant table.
+    const float quant_map[16] = {
+        -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+        -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+        0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+        0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
+    };
+
+    // Create synthetic data on host.
+    std::vector<uint8_t> host_packed(TEST_N * TEST_BYTES_PER_ROW);
+    std::vector<float> host_absmax(TEST_N * TEST_BLOCKS_PER_ROW);
+    std::vector<bf16> host_input(TEST_K);
+    for (int n = 0; n < TEST_N; n++) {
+        for (int k = 0; k < TEST_K; k += 2) {
+            uint8_t hi = (n * 7 + k * 13) % 16;
+            uint8_t lo = (n * 7 + (k + 1) * 13) % 16;
+            host_packed[n * TEST_BYTES_PER_ROW + k / 2] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+        for (int kb = 0; kb < TEST_BLOCKS_PER_ROW; kb++) {
+            host_absmax[n * TEST_BLOCKS_PER_ROW + kb] = 1.0f;
+        }
+    }
+    for (int k = 0; k < TEST_K; k++) {
+        host_input[k] = bf16(static_cast<float>((k * 3) % 7 - 3));
+    }
+
+    // CPU reference.
+    std::vector<float> cpu_ref(TEST_N, 0.0f);
+    for (int n = 0; n < TEST_N; n++) {
+        float acc = 0.0f;
+        for (int k = 0; k < TEST_K; k += 2) {
+            int bi = k / 2;
+            uint8_t p = host_packed[n * TEST_BYTES_PER_ROW + bi];
+            int kb = bi / (TEST_BLOCKSIZE / 2);
+            float am = host_absmax[n * TEST_BLOCKS_PER_ROW + kb];
+            acc += float(host_input[k]) * quant_map[(p >> 4) & 0x0F] * am;
+            acc += float(host_input[k + 1]) * quant_map[p & 0x0F] * am;
+        }
+        cpu_ref[n] = acc;
+    }
+
+    // ---- Step 1: Pre-transpose to blocked layout on CPU ----
+    const BlockedDims bd = compute_blocked_dims(TEST_N, TEST_K, TEST_BLOCKSIZE);
+    size_t bp_bytes = blocked_packed_size(bd);
+    size_t ba_floats = blocked_absmax_size(bd);
+    std::vector<uint8_t> cpu_blocked_packed(bp_bytes, 0);
+    std::vector<float> cpu_blocked_absmax(ba_floats, 0.0f);
+
+    const int src_bytes_per_row = TEST_K / 2;
+    const int src_absmax_per_row = TEST_BLOCKS_PER_ROW;
+    for (int n = 0; n < TEST_N; n++) {
+        int rt = n / 16;
+        int sr = n % 16;
+        for (int kb = 0; kb < bd.num_k_blocks; kb++) {
+            // absmax
+            cpu_blocked_absmax[((kb * bd.num_row_tiles + rt) * 16) + sr] =
+                host_absmax[n * src_absmax_per_row + kb];
+            // packed bytes
+            for (int q = 0; q < bd.quads_per_block; q++) {
+                int src_byte = kb * bd.bytes_per_block + q * 4;
+                uint32_t val = *reinterpret_cast<uint32_t*>(
+                    &host_packed[n * src_bytes_per_row + src_byte]);
+                size_t dst_off = ((static_cast<size_t>(kb) * bd.num_row_tiles + rt) * bd.quads_per_block + q) * 64
+                               + sr * 4;
+                *reinterpret_cast<uint32_t*>(&cpu_blocked_packed[dst_off]) = val;
+            }
+        }
+    }
+
+    // ---- Step 2: Upload CPU-blocked data and run blocked gemv on GPU ----
+    Tensor dev_qm = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
+    ctx.queue().memcpy(dev_qm.data(), quant_map, 16 * sizeof(float));
+    ctx.synchronize();
+    const float* qm_dev = static_cast<const float*>(dev_qm.data());
+
+    Tensor dev_bp = Tensor::allocate(ctx, {static_cast<int64_t>(bp_bytes)}, dnnl::memory::data_type::u8);
+    Tensor dev_ba = Tensor::allocate(ctx, {static_cast<int64_t>(ba_floats)}, dnnl::memory::data_type::f32);
+    Tensor dev_input = Tensor::allocate(ctx, {1, TEST_K}, dnnl::memory::data_type::bf16);
+    Tensor dev_out_blocked = Tensor::allocate(ctx, {1, TEST_N}, dnnl::memory::data_type::bf16);
+
+    ctx.queue().memcpy(dev_bp.data(), cpu_blocked_packed.data(), bp_bytes);
+    ctx.queue().memcpy(dev_ba.data(), cpu_blocked_absmax.data(), ba_floats * sizeof(float));
+    ctx.queue().memcpy(dev_input.data(), host_input.data(), TEST_K * sizeof(bf16));
+    ctx.queue().memset(dev_out_blocked.data(), 0, TEST_N * sizeof(bf16));
+    ctx.synchronize();
+
+    packed_nf4_gemv_bf16_blocked(ctx,
+        static_cast<const uint8_t*>(dev_bp.data()),
+        static_cast<const float*>(dev_ba.data()),
+        qm_dev,
+        static_cast<const bf16*>(dev_input.data()),
+        static_cast<bf16*>(dev_out_blocked.data()),
+        TEST_N, TEST_K, TEST_BLOCKSIZE);
+    ctx.synchronize();
+
+    // Read back result.
+    std::vector<bf16> host_blocked(TEST_N);
+    ctx.queue().memcpy(host_blocked.data(), dev_out_blocked.data(), TEST_N * sizeof(bf16));
+    ctx.synchronize();
+
+    // ---- Step 3: Also test GPU transpose + GPU blocked gemv ----
+    Tensor dev_packed = Tensor::allocate(ctx, {TEST_N, TEST_BYTES_PER_ROW}, dnnl::memory::data_type::u8);
+    Tensor dev_absmax = Tensor::allocate(ctx, {TEST_N, TEST_BLOCKS_PER_ROW}, dnnl::memory::data_type::f32);
+    Tensor dev_bp2 = Tensor::allocate(ctx, {static_cast<int64_t>(bp_bytes)}, dnnl::memory::data_type::u8);
+    Tensor dev_ba2 = Tensor::allocate(ctx, {static_cast<int64_t>(ba_floats)}, dnnl::memory::data_type::f32);
+    Tensor dev_out2 = Tensor::allocate(ctx, {1, TEST_N}, dnnl::memory::data_type::bf16);
+
+    ctx.queue().memcpy(dev_packed.data(), host_packed.data(), host_packed.size());
+    ctx.queue().memcpy(dev_absmax.data(), host_absmax.data(), host_absmax.size() * sizeof(float));
+    ctx.synchronize();
+
+    transpose_bnb_weights_blocked(ctx,
+        static_cast<const uint8_t*>(dev_packed.data()),
+        static_cast<const float*>(dev_absmax.data()),
+        static_cast<uint8_t*>(dev_bp2.data()),
+        static_cast<float*>(dev_ba2.data()),
+        TEST_N, TEST_K, TEST_BLOCKSIZE);
+    ctx.synchronize();
+
+    // Read back GPU-transposed data and compare to CPU-transposed.
+    std::vector<uint8_t> gpu_bp(bp_bytes);
+    std::vector<float> gpu_ba(ba_floats);
+    ctx.queue().memcpy(gpu_bp.data(), dev_bp2.data(), bp_bytes);
+    ctx.queue().memcpy(gpu_ba.data(), dev_ba2.data(), ba_floats * sizeof(float));
+    ctx.synchronize();
+
+    bool transpose_ok = true;
+    for (size_t i = 0; i < bp_bytes && transpose_ok; i++) {
+        if (gpu_bp[i] != cpu_blocked_packed[i]) {
+            fprintf(stderr, "[TEST] TRANSPOSE packed mismatch at byte %zu: gpu=%u cpu=%u\n",
+                    i, (unsigned)gpu_bp[i], (unsigned)cpu_blocked_packed[i]);
+            transpose_ok = false;
+        }
+    }
+    for (size_t i = 0; i < ba_floats && transpose_ok; i++) {
+        if (gpu_ba[i] != cpu_blocked_absmax[i]) {
+            fprintf(stderr, "[TEST] TRANSPOSE absmax mismatch at %zu: gpu=%f cpu=%f\n",
+                    i, gpu_ba[i], cpu_blocked_absmax[i]);
+            transpose_ok = false;
+        }
+    }
+    if (transpose_ok) {
+        fprintf(stderr, "[TEST] transpose verified OK (%zu bytes, %zu floats)\n", bp_bytes, ba_floats);
+    }
+
+    // Run blocked gemv on GPU-transposed data.
+    packed_nf4_gemv_bf16_blocked(ctx,
+        static_cast<const uint8_t*>(dev_bp2.data()),
+        static_cast<const float*>(dev_ba2.data()),
+        qm_dev,
+        static_cast<const bf16*>(dev_input.data()),
+        static_cast<bf16*>(dev_out2.data()),
+        TEST_N, TEST_K, TEST_BLOCKSIZE);
+    ctx.synchronize();
+
+    std::vector<bf16> host_out2(TEST_N);
+    ctx.queue().memcpy(host_out2.data(), dev_out2.data(), TEST_N * sizeof(bf16));
+    ctx.synchronize();
+
+    // ---- Compare results ----
+    bool ok = true;
+    int errors = 0;
+    for (int n = 0; n < TEST_N && errors < 10; n++) {
+        float blk = static_cast<float>(host_blocked[n]);
+        float blk2 = static_cast<float>(host_out2[n]);
+        float cpu = cpu_ref[n];
+        float tol = std::max(1.0f, std::fabs(cpu)) * 0.02f;
+
+        if (std::fabs(blk - cpu) > tol) {
+            fprintf(stderr, "[TEST] BLOCKED(CPU-tpose) MISMATCH row=%d blocked=%f cpu=%f diff=%f\n",
+                    n, blk, cpu, std::fabs(blk - cpu));
+            ok = false; errors++;
+        }
+        if (std::fabs(blk2 - cpu) > tol) {
+            fprintf(stderr, "[TEST] BLOCKED(GPU-tpose) MISMATCH row=%d blocked=%f cpu=%f diff=%f\n",
+                    n, blk2, cpu, std::fabs(blk2 - cpu));
+            ok = false; errors++;
+        }
+    }
+
+    if (ok) {
+        fprintf(stderr, "[TEST] blocked_gemv_test PASSED (N=%d K=%d bs=%d)\n", TEST_N, TEST_K, TEST_BLOCKSIZE);
+    }
+    return ok;
+}
+
 void packed_nf4_gemv_bf16_2way(Context& ctx,
                                const uint8_t* packed0,
                                const float* quant_map0,
@@ -933,6 +1305,12 @@ void Bnb4BitLinear::finish_init(Context& ctx) {
         decode_scratchpad_mem_ = decode_scratchpad_.make_dnnl_memory(pd.scratchpad_desc());
     }
     decode_inited_ = true;
+
+    // Opt-in: build blocked weight layout for gemv decode (env var).
+    static bool use_blocked = aila::env::read_flag("AILA_BNB4_BLOCKED_GEMV", false);
+    if (use_blocked) {
+        ensure_blocked_weights(ctx);
+    }
 }
 
 void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
@@ -1164,7 +1542,17 @@ void Bnb4BitLinear::forward(Context& ctx,
     const bool use_packed_decode_fastpath =
         can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, seq_len);
     if (use_packed_decode_fastpath) {
-        packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_);
+        if (blocked_ready_) {
+            packed_nf4_gemv_bf16_blocked(ctx,
+                static_cast<const uint8_t*>(blocked_packed_.data()),
+                static_cast<const float*>(blocked_absmax_.data()),
+                static_cast<const float*>(weight_.quant_map->data()),
+                static_cast<const bf16*>(input.data()),
+                static_cast<bf16*>(output.data()),
+                out_features_, in_features_, weight_.quant_state.blocksize);
+        } else {
+            packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_);
+        }
         return;
     }
 
@@ -1297,4 +1685,50 @@ void Bnb4BitLinear::forward(Context& ctx,
 
     ctx.queue().memcpy(output.data(), output_bf16.data(),
                        static_cast<size_t>(seq_len) * static_cast<size_t>(out_features_) * sizeof(bf16));
+}
+
+void Bnb4BitLinear::ensure_blocked_weights(Context& ctx) {
+    if (blocked_ready_) return;
+    if (!weight_.packed_weight || !weight_.packed_weight->valid()) return;
+    if (!absmax_f32_.valid()) return;
+
+    const int K = in_features_;
+    const int N = out_features_;
+    const int blocksize = weight_.quant_state.blocksize;
+    if (blocksize <= 0 || (blocksize % 2) != 0 || (K % blocksize) != 0) return;
+
+    // Run self-test once.
+    static bool test_run = false;
+    if (!test_run) {
+        test_run = true;
+        bool ok = run_blocked_gemv_test(ctx);
+        if (!ok) {
+            fprintf(stderr, "[BNB] blocked gemv self-test FAILED, falling back to original path\n");
+            return;
+        }
+    }
+
+    const BlockedDims d = compute_blocked_dims(N, K, blocksize);
+    size_t bp_bytes = blocked_packed_size(d);
+    size_t ba_floats = blocked_absmax_size(d);
+
+    blocked_packed_ = Tensor::allocate(ctx, {static_cast<int64_t>(bp_bytes)}, dnnl::memory::data_type::u8);
+    blocked_absmax_ = Tensor::allocate(ctx, {static_cast<int64_t>(ba_floats)}, dnnl::memory::data_type::f32);
+
+    if (!blocked_packed_.valid() || !blocked_absmax_.valid()) {
+        fprintf(stderr, "[BNB] failed to allocate blocked weight tensors\n");
+        return;
+    }
+
+    transpose_bnb_weights_blocked(ctx,
+        static_cast<const uint8_t*>(weight_.packed_weight->data()),
+        static_cast<const float*>(absmax_f32_.data()),
+        static_cast<uint8_t*>(blocked_packed_.data()),
+        static_cast<float*>(blocked_absmax_.data()),
+        N, K, blocksize);
+    ctx.synchronize();
+
+    blocked_ready_ = true;
+    fprintf(stderr, "[BNB] blocked weights ready: N=%d K=%d blocksize=%d num_k_blocks=%d tiles=%d quads_per_block=%d\n",
+            N, K, blocksize, d.num_k_blocks, d.num_row_tiles, d.quads_per_block);
 }

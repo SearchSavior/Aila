@@ -837,9 +837,31 @@ std::vector<int> Tokenizer::apply_chat_template(
     }
 
     // All conversation turns
+    auto rtrim = [](std::string& s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    };
+
     for (size_t i = 0; i < history.messages().size(); ++i) {
-        const auto& msg = history.messages()[i];
+        auto msg = history.messages()[i];  // copy — we may strip /no_think
         bool is_last_user = (msg.role == "user" && i == history.messages().size() - 1);
+        bool no_think = false;
+
+        if (is_last_user) {
+            rtrim(msg.content);
+            const std::string kNoThinkCmd = "/no_think";
+            if (msg.content.size() >= kNoThinkCmd.size()) {
+                size_t pos = msg.content.size() - kNoThinkCmd.size();
+                if (msg.content.compare(pos, kNoThinkCmd.size(), kNoThinkCmd) == 0) {
+                    bool boundary_ok = (pos == 0) ||
+                        std::isspace(static_cast<unsigned char>(msg.content[pos - 1]));
+                    if (boundary_ok) {
+                        no_think = true;
+                        msg.content.erase(pos);
+                        rtrim(msg.content);
+                    }
+                }
+            }
+        }
 
         ids.push_back(im_start_id_);
 
@@ -857,24 +879,14 @@ std::vector<int> Tokenizer::apply_chat_template(
             auto asst_tokens = encode("assistant\n");
             ids.insert(ids.end(), asst_tokens.begin(), asst_tokens.end());
 
-            // Check /no_think
-            std::string cleaned = msg.content;
-            auto rtrim = [](std::string& s) {
-                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
-            };
-            rtrim(cleaned);
-            const std::string kNoThinkCmd = "/no_think";
-            if (cleaned.size() >= kNoThinkCmd.size()) {
-                size_t pos = cleaned.size() - kNoThinkCmd.size();
-                if (cleaned.compare(pos, kNoThinkCmd.size(), kNoThinkCmd) == 0) {
-                    auto end_think_it = special_tokens_.find("</think>");
-                    if (end_think_it != special_tokens_.end()) {
-                        auto nl_tokens = encode("\n");
-                        ids.push_back(end_think_it->second);
-                        ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
-                        auto direct_tokens = encode("Please answer directly and briefly.\n");
-                        ids.insert(ids.end(), direct_tokens.begin(), direct_tokens.end());
-                    }
+            if (no_think) {
+                auto end_think_it = special_tokens_.find("</think>");
+                if (end_think_it != special_tokens_.end()) {
+                    auto nl_tokens = encode("\n");
+                    ids.push_back(end_think_it->second);
+                    ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
+                    auto direct_tokens = encode("Please answer directly and briefly.\n");
+                    ids.insert(ids.end(), direct_tokens.begin(), direct_tokens.end());
                 }
             }
         } else {

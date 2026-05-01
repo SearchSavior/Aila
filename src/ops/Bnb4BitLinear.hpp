@@ -83,12 +83,17 @@ private:
     Tensor owned_packed_weight_;
     Tensor absmax_f32_;
     Tensor cached_weight_bf16_;
+    Tensor blocked_packed_;
+    Tensor blocked_absmax_;
     int in_features_ = 0;
     int out_features_ = 0;
     bool force_dequant_cache_ = false;
     bool release_quant_after_cache_ = false;
     bool cache_dequantized_weight_ = false;
     bool cached_weight_ready_ = false;
+    bool blocked_ready_ = false;
+
+    void ensure_blocked_weights(Context& ctx);
 
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;
