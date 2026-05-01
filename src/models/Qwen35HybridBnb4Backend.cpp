@@ -2003,7 +2003,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 }
             } else {
                 time_stage(ProfileStage::LinearProj, [&] {
-                    layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
+                    layer.linear_qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, seq_len);
                 });
                 time_stage(ProfileStage::FullSplit, [&] {
                     ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v,
@@ -2053,7 +2053,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 });
 
                 time_stage(ProfileStage::AttnGate, [&] {
-                    layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
+                    layer.linear_z_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.z, seq_len);
                     ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * linear_kv_dim_);
                 });
             }
