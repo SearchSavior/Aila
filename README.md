@@ -4,6 +4,8 @@
 
 [中文](README_zh.md)
 
+> **Note:** This project is under active development and does not yet fully support all listed models. The current focus is on the **Qwen3.5** family; Qwen3 model performance may not be optimal.
+
 A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYCL + oneDNN**. Features hand-optimized kernels for bitsandbytes 4-bit (NF4) quantized models, fused dequant+matmul, and GPU-accelerated DeltaNet recurrence for Qwen3.5 hybrid architectures.
 
 ## Features
@@ -57,9 +59,9 @@ Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
 
 | Engine | Backend | Model | Prefill | Decode |
 |--------|---------|-------|---------|--------|
-| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | **50 tok/s** |
+| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | 50 tok/s |
 | llama.cpp b8996 | SYCL | Qwen3.5-4B Q4_K_XL | 1290 tok/s | 28 tok/s |
-| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | 60 tok/s |
+| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | **60 tok/s** |
 
 Aila delivers the highest prefill throughput and competitive decode performance against Vulkan while using a more accurate NF4 4-bit quantization that retains vision capabilities.
 

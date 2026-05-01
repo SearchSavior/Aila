@@ -4,6 +4,8 @@
 
 [English](README.md)
 
+> **注意：** 该项目仍在积极开发中，并不能兼顾支持的所有模型。目前的重点在 **Qwen3.5** 模型上，Qwen3 模型的性能可能并不理想。
+
 基于 **SYCL + oneDNN** 构建的高性能 LLM 推理引擎，专为 **Intel Arc 显卡** 设计。针对 bitsandbytes 4-bit (NF4) 量化模型提供手写优化 kernel，包括融合反量化+矩阵乘法、GEMV 解码，以及 Qwen3.5 混合架构的 GPU DeltaNet 循环加速。
 
 ## 功能特性
@@ -57,9 +59,9 @@
 
 | 引擎 | 后端 | 模型 | Prefill | Decode |
 |------|------|------|---------|--------|
-| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | **50 tok/s** |
+| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | 50 tok/s |
 | llama.cpp b8996 | SYCL | Qwen3.5-4B Q4_K_XL | 1290 tok/s | 28 tok/s |
-| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | 60 tok/s |
+| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | **60 tok/s** |
 
 Aila 提供最高的 prefill 吞吐量，同时在保留视觉能力的 NF4 量化下实现接近 Vulkan 的 decode 性能。
 
