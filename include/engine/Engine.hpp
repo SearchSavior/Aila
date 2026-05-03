@@ -441,15 +441,32 @@ public:
             // Default: 0.8B uses closed-think, 4B uses open-think.
             bool default_open_think =
                 !is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
+            bool prepend_think = !user_wants_no_think &&
+                (force_thinking || default_open_think);
 
-            std::string out = generate_messages(mm_history_, gen_config, token_callback);
+            // For streaming mode, inject <think>\n before the first real token
+            // since generate_messages() returns empty string when streaming.
+            decltype(token_callback) wrapped_cb;
+            bool think_injected = false;
+            if (prepend_think && token_callback) {
+                wrapped_cb = [&](const std::string& token) {
+                    if (!think_injected) {
+                        think_injected = true;
+                        token_callback("<think>\n");
+                    }
+                    token_callback(token);
+                };
+            }
+            auto& cb = (prepend_think && token_callback) ? wrapped_cb : token_callback;
+
+            std::string out = generate_messages(mm_history_, gen_config, cb);
             while (last_error_code_ == EngineErrorCode::ContextOverflow) {
                 if (!drop_oldest_mm_pair()) {
                     break;
                 }
                 AILA_LOG_WARN("[Generate] Qwen3.5 history truncated to fit context window (%zu messages remaining)",
                               mm_history_.size());
-                out = generate_messages(mm_history_, gen_config, token_callback);
+                out = generate_messages(mm_history_, gen_config, cb);
             }
 
             if (last_error_code_ != EngineErrorCode::Ok) {
