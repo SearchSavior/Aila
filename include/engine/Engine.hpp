@@ -411,16 +411,12 @@ public:
                 mm_history_.insert(mm_history_.begin(), std::move(sys_msg));
             }
 
-            // Keep /no_think in the message — generate_messages() and TemplateRegistry
-            // both detect it and handle think-suppression correctly. Stripping here
-            // would prevent downstream detection from ever seeing it.
-            Message user_msg;
-            user_msg.role = "user";
-            user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
-            mm_history_.push_back(user_msg);
-
-            // Determine think mode. /no_think wins over /think.
+            // Determine think mode for output prepend. /no_think wins.
+            // TemplateRegistry handles suffix stripping from the message text
+            // before encoding — we keep the raw message in history so
+            // downstream detection works for both single and multi-turn.
             bool user_wants_no_think = false;
+            bool force_thinking = false;
             {
                 std::string t = user_message;
                 rtrim_inplace(t);
@@ -432,8 +428,15 @@ public:
                         user_wants_no_think = true;
                     }
                 }
+                if (!user_wants_no_think) {
+                    force_thinking = ends_with_think(t);
+                }
             }
-            bool force_thinking = !user_wants_no_think && ends_with_think(user_message);
+
+            Message user_msg;
+            user_msg.role = "user";
+            user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
+            mm_history_.push_back(user_msg);
 
             // Default: 0.8B uses closed-think, 4B uses open-think.
             bool default_open_think =
@@ -456,13 +459,17 @@ public:
                 return "";
             }
 
-            // For default open-think (4B without /no_think), the template
-            // injected <think>\n as prefix. The decoded tokens start after
-            // that prefix, so prepend it. For /think, generate_messages()
-            // already handles the prepend — don't double-prepend here.
-            bool default_open = default_open_think && !user_wants_no_think && !force_thinking;
-            if (default_open && !out.empty() && out.compare(0, 7, "<think>") != 0) {
-                out.insert(0, "<think>\n");
+            // The template injected <think>\n as assistant prefix when
+            // open-think is used (/think or default on non-0.8B without
+            // /no_think). The decoded output starts after that prefix,
+            // so prepend <think>\n. We handle both cases here because
+            // the suffix was stripped from history before generate_messages()
+            // could see it.
+            if (!user_wants_no_think && !out.empty() && out.compare(0, 7, "<think>") != 0) {
+                bool prepend = force_thinking || default_open_think;
+                if (prepend) {
+                    out.insert(0, "<think>\n");
+                }
             }
 
             // Strip think blocks from history to save context, unless the user
@@ -529,7 +536,8 @@ public:
 
         bool no_think_requested = ends_with_no_think(user_message);
 
-        // --- Add user message to history (for display / overflow rebuild) ---
+        // Suffix is stripped by Tokenizer/TemplateRegistry at encode time
+        // — no need to strip here, downstream handles it for all messages.
         history_.add_user(user_message);
 
         // --- Build the token sequence for this turn ---

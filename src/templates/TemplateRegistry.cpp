@@ -138,10 +138,19 @@ bool render_chatml(const Tokenizer& tokenizer,
         if (!collect_text_content(m.content, allow_vision_placeholders, tokenizer, merged, error_message)) {
             return false;
         }
-        if (add_generation_prompt && i + 1 == messages.size() && m.role == "user") {
-            disable_thinking = strip_no_think_suffix(merged);
-            if (!disable_thinking) {
-                force_thinking = strip_think_suffix(merged);
+        // Strip suffix from ALL user messages so the model never sees raw
+        // /no_think or /think in multi-turn context. Only use detection
+        // result from the last user message for think-mode control.
+        if (m.role == "user") {
+            bool is_last = add_generation_prompt && (i + 1 == messages.size());
+            if (is_last) {
+                disable_thinking = strip_no_think_suffix(merged);
+                if (!disable_thinking) {
+                    force_thinking = strip_think_suffix(merged);
+                }
+            } else {
+                strip_no_think_suffix(merged);
+                strip_think_suffix(merged);
             }
         }
 
