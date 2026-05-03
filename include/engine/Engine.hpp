@@ -376,6 +376,15 @@ public:
                     text.pop_back();
                 }
             };
+            auto ends_with_think = [&](const std::string& s) -> bool {
+                const std::string cmd = "/think";
+                std::string t = s;
+                rtrim_inplace(t);
+                if (t.size() < cmd.size()) return false;
+                size_t pos = t.size() - cmd.size();
+                if (t.compare(pos, cmd.size(), cmd) != 0) return false;
+                return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
+            };
             auto drop_oldest_mm_pair = [&]() -> bool {
                 int first_user = -1;
                 for (int i = 0; i < static_cast<int>(mm_history_.size()); ++i) {
@@ -410,6 +419,8 @@ public:
             user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
             mm_history_.push_back(user_msg);
 
+            bool force_thinking = ends_with_think(user_message);
+
             std::string out = generate_messages(mm_history_, gen_config, token_callback);
             while (last_error_code_ == EngineErrorCode::ContextOverflow) {
                 if (!drop_oldest_mm_pair()) {
@@ -427,8 +438,13 @@ public:
                 return "";
             }
 
+            // When /think is used, preserve think blocks in history so the user
+            // sees them in the output. Note: this means thinking tokens count
+            // against the context window in subsequent turns.
             std::string history_text = out;
-            strip_think_blocks(history_text);
+            if (!force_thinking) {
+                strip_think_blocks(history_text);
+            }
             Message assistant_msg;
             assistant_msg.role = "assistant";
             assistant_msg.content.push_back(ContentPart{ContentType::Text, history_text, ""});
