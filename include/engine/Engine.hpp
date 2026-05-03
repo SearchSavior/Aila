@@ -419,7 +419,25 @@ public:
             user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
             mm_history_.push_back(user_msg);
 
-            bool force_thinking = ends_with_think(user_message);
+            // Determine think mode. /no_think wins over /think.
+            bool user_wants_no_think = false;
+            {
+                std::string t = user_message;
+                rtrim_inplace(t);
+                const std::string nt = "/no_think";
+                if (t.size() >= nt.size()) {
+                    size_t p = t.size() - nt.size();
+                    if (t.compare(p, nt.size(), nt) == 0 &&
+                        (p == 0 || std::isspace(static_cast<unsigned char>(t[p - 1])))) {
+                        user_wants_no_think = true;
+                    }
+                }
+            }
+            bool force_thinking = !user_wants_no_think && ends_with_think(user_message);
+
+            // Default: 0.8B uses closed-think, 4B uses open-think.
+            bool default_open_think =
+                !is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
 
             std::string out = generate_messages(mm_history_, gen_config, token_callback);
             while (last_error_code_ == EngineErrorCode::ContextOverflow) {
@@ -438,9 +456,17 @@ public:
                 return "";
             }
 
-            // When /think is used, preserve think blocks in history so the user
-            // sees them in the output. Note: this means thinking tokens count
-            // against the context window in subsequent turns.
+            // When open-think was used (/think or default on non-0.8B without
+            // /no_think), the template injected <think>\n as assistant prefix.
+            // The generated output starts after that prefix, so we prepend
+            // <think>\n to produce a complete response.
+            bool open_think_used = force_thinking || (default_open_think && !user_wants_no_think);
+            if (open_think_used && !out.empty()) {
+                out.insert(0, "<think>\n");
+            }
+
+            // Strip think blocks from history to save context, unless the user
+            // explicitly requested thinking via /think.
             std::string history_text = out;
             if (!force_thinking) {
                 strip_think_blocks(history_text);
@@ -462,6 +488,14 @@ public:
         };
         auto ends_with_no_think = [&](const std::string& s) -> bool {
             const std::string cmd = "/no_think";
+            std::string t = trim_copy(s);
+            if (t.size() < cmd.size()) return false;
+            size_t pos = t.size() - cmd.size();
+            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
+            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
+        };
+        auto ends_with_think = [&](const std::string& s) -> bool {
+            const std::string cmd = "/think";
             std::string t = trim_copy(s);
             if (t.size() < cmd.size()) return false;
             size_t pos = t.size() - cmd.size();
@@ -868,6 +902,14 @@ public:
             if (t.compare(pos, cmd.size(), cmd) != 0) return false;
             return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
         };
+        auto ends_with_think = [&](const std::string& s) -> bool {
+            const std::string cmd = "/think";
+            std::string t = trim_copy(s);
+            if (t.size() < cmd.size()) return false;
+            size_t pos = t.size() - cmd.size();
+            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
+            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
+        };
         auto strip_leading_think_artifacts = [](std::string& text) {
             auto ltrim = [](std::string& x) {
                 size_t i = 0;
@@ -893,6 +935,7 @@ public:
             ltrim(text);
         };
         bool no_think_requested = false;
+        bool force_thinking = false;
         if (!messages.empty() && messages.back().role == "user") {
             std::string merged_user_text;
             for (const auto& part : messages.back().content) {
@@ -901,6 +944,9 @@ public:
                 }
             }
             no_think_requested = ends_with_no_think(merged_user_text);
+            if (!no_think_requested) {
+                force_thinking = ends_with_think(merged_user_text);
+            }
         }
 
         GenerationConfig tuned_cfg = gen_config;
@@ -1395,6 +1441,12 @@ public:
         }
         if (no_think_requested) {
             strip_leading_think_artifacts(output_text);
+        }
+        // When open-think was used (/think or default on non-0.8B without
+        // /no_think), the template injected <think>\n as assistant prefix.
+        // The decoded output starts after that, so prepend it back.
+        if (force_thinking && !output_text.empty()) {
+            output_text.insert(0, "<think>\n");
         }
 
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
