@@ -456,12 +456,11 @@ public:
                 return "";
             }
 
-            // When open-think was used (/think or default on non-0.8B without
-            // /no_think), the template injected <think>\n as assistant prefix.
-            // The generated output starts after that prefix, so we prepend
-            // <think>\n to produce a complete response.
+            // When open-think was used and the model does NOT generate
+            // <think> as its first token (common on models trained with
+            // closed-think), prepend it so the output is well-formed.
             bool open_think_used = force_thinking || (default_open_think && !user_wants_no_think);
-            if (open_think_used && !out.empty()) {
+            if (open_think_used && !out.empty() && out.rfind("<think>", 0) != 0) {
                 out.insert(0, "<think>\n");
             }
 
@@ -1442,10 +1441,9 @@ public:
         if (no_think_requested) {
             strip_leading_think_artifacts(output_text);
         }
-        // When open-think was used (/think or default on non-0.8B without
-        // /no_think), the template injected <think>\n as assistant prefix.
-        // The decoded output starts after that, so prepend it back.
-        if (force_thinking && !output_text.empty()) {
+        // When open-think was used and the model does NOT generate
+        // <think> as its first token, prepend it back.
+        if (force_thinking && !output_text.empty() && output_text.rfind("<think>", 0) != 0) {
             output_text.insert(0, "<think>\n");
         }
 
