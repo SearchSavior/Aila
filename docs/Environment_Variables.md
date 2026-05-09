@@ -13,6 +13,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 | `AILA_DECODE_CHUNK_SIZE` | int | `12` | Non-streaming greedy decode chunk size (tokens per host sync) |
 | `AILA_STREAM_CHUNK_SIZE` | int | `4` | Streaming greedy decode chunk size |
 | `AILA_STREAM_OUTPUT` | int | auto | Force streaming (`1`) or non-streaming (`0`). Auto-detected from terminal type when not set |
+| `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
 | `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (skip for unsupported specs) |
 
 ---

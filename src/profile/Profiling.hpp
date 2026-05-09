@@ -2,6 +2,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cctype>
 #include <chrono>
 #include <string>
 #include <mutex>
@@ -23,9 +24,36 @@ void set_log_callback(LogCallback cb, void* user_data = nullptr);
 // Set minimum log level (messages below this level are suppressed).
 void set_log_level(LogLevel level);
 
+// Get current minimum log level.
+LogLevel get_log_level();
+
 // Core logging function (internal use, prefer macros below)
 void log(LogLevel level, const char* fmt, ...);
 void vlog(LogLevel level, const char* fmt, va_list args);
+
+// Convert string to LogLevel (case-insensitive, supports names and numeric values)
+inline LogLevel log_level_from_string(const std::string& s) {
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower == "debug" || lower == "0")   return LogLevel::Debug;
+    if (lower == "warning" || lower == "warn" || lower == "2") return LogLevel::Warning;
+    if (lower == "error" || lower == "3")   return LogLevel::Error;
+    return LogLevel::Info; // "info", "1", or anything else
+}
+
+// Get human-readable name for log level
+inline const char* log_level_name(LogLevel level) {
+    switch (level) {
+        case LogLevel::Debug:   return "debug";
+        case LogLevel::Info:    return "info";
+        case LogLevel::Warning: return "warning";
+        case LogLevel::Error:   return "error";
+    }
+    return "unknown";
+}
 
 // Convenience macros
 #define AILA_LOG_DEBUG(...) ::aila::log(::aila::LogLevel::Debug, __VA_ARGS__)

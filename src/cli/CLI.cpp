@@ -130,6 +130,7 @@ Options:
   --bench-warmup <N>       Benchmark warmup iterations (default: 1)
   --bench-sample           Benchmark decode in sampling mode
   --bench-greedy           Benchmark decode in greedy mode (default)
+  --log-level <level>      Minimum log level (debug/info/warning/error, default: info)
   --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
   -h, --help               Show this help message
   -v, --version            Show version
@@ -137,6 +138,7 @@ Options:
 Environment Variables:
   AILA_MODEL_DIR           Default model directory
   AILA_MAX_SEQ_LEN         Default max sequence length
+  AILA_LOG_LEVEL           Default log level (debug/info/warning/error, default: info)
   AILA_STREAM_OUTPUT       Force stream mode (0/1)
   AILA_DECODE_CHUNK_SIZE   Default decode chunk size
   AILA_STREAM_CHUNK_SIZE   Default stream chunk size
@@ -153,6 +155,7 @@ Interactive Commands:
   /stream_off              Disable streaming output
   /decode_chunk <N>        Set decode chunk size
   /stream_chunk <N>        Set stream chunk size
+  /log_level <level>       Set log level (debug/info/warning/error)
   /config                  Show current configuration
 )" << std::flush;
 }
@@ -167,6 +170,12 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
     opts.max_seq_len = aila::env::read_int("AILA_MAX_SEQ_LEN", 4096);
     opts.decode_chunk_size = aila::env::read_int("AILA_DECODE_CHUNK_SIZE", 12);
     opts.stream_chunk_size = aila::env::read_int("AILA_STREAM_CHUNK_SIZE", 4);
+    {
+        std::string log_level_env = aila::env::read_string("AILA_LOG_LEVEL", "");
+        if (!log_level_env.empty()) {
+            opts.log_level = aila::log_level_from_string(log_level_env);
+        }
+    }
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -285,6 +294,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--bench-greedy") {
             opts.bench_sample = false;
+            continue;
+        }
+        if (arg == "--log-level" && i + 1 < argc) {
+            opts.log_level = aila::log_level_from_string(argv[++i]);
             continue;
         }
         if (arg == "--messages-json" && i + 1 < argc) {
@@ -442,6 +455,18 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
+    registry.register_command("/log_level", "Set log level (debug/info/warning/error)", [&](const std::string& args) {
+        if (!args.empty()) {
+            aila::LogLevel lv = aila::log_level_from_string(args);
+            aila::set_log_level(lv);
+            std::cout << "[Config] log_level=" << aila::log_level_name(lv) << std::endl;
+        } else {
+            std::cout << "[Config] log_level=" << aila::log_level_name(aila::get_log_level()) << std::endl;
+            std::cout << "[Config] Usage: /log_level <debug|info|warning|error>" << std::endl;
+        }
+        return true;
+    });
+
     registry.register_command("/config", "Show current configuration", [&, engine](const std::string&) {
         std::cout << "\n[Configuration]" << std::endl;
         std::cout << "  do_sample:          " << (gen_config.do_sample ? "true" : "false") << std::endl;
@@ -454,6 +479,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::cout << "  decode_chunk_size:  " << gen_config.decode_chunk_size << std::endl;
         std::cout << "  stream_chunk_size:  " << gen_config.stream_chunk_size << std::endl;
         std::cout << "  stream_output:      " << (stream_output ? "true" : "false") << std::endl;
+        std::cout << "  log_level:          " << aila::log_level_name(aila::get_log_level()) << std::endl;
         std::cout << "  rep_penalty:        " << gen_config.repetition_penalty << std::endl;
         std::cout << "  pres_penalty:       " << gen_config.presence_penalty << std::endl;
         std::cout << "  freq_penalty:       " << gen_config.frequency_penalty << std::endl;

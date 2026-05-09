@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "profile/Profiling.hpp"
 #include <string>
 #include <vector>
 #include <functional>
@@ -42,6 +43,9 @@ struct CLIOptions {
     int bench_iters = 5;           // --bench-iters
     int bench_warmup = 1;          // --bench-warmup
     bool bench_sample = false;     // --bench-sample / --bench-greedy
+
+    // Log level
+    aila::LogLevel log_level = aila::LogLevel::Info; // --log-level (or AILA_LOG_LEVEL)
 
     // Single-shot messages JSON mode
     std::string messages_json_path; // --messages-json

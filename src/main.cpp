@@ -32,9 +32,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Apply log level from CLI / environment
+    aila::set_log_level(opts.log_level);
+
     // Check GPU device
     CheckDevice();
-    AILA_LOG_INFO("[Config] max_seq_len=%d", opts.max_seq_len);
+    AILA_LOG_INFO("[Config] log_level=%s max_seq_len=%d",
+                  aila::log_level_name(opts.log_level), opts.max_seq_len);
 
     // Initialize engine
     InferenceEngine engine;

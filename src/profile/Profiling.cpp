@@ -32,6 +32,11 @@ void set_log_level(LogLevel level) {
     g_min_level = level;
 }
 
+LogLevel get_log_level() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_min_level;
+}
+
 void vlog(LogLevel level, const char* fmt, va_list args) {
     LogCallback cb;
     void* ud;
