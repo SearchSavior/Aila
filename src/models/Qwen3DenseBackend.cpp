@@ -398,6 +398,7 @@ void Qwen3DenseBackend::reset() {
     kv_cache_.reset();
 }
 
-void Qwen3DenseBackend::truncate_kv_cache(int new_len) {
+bool Qwen3DenseBackend::truncate_kv_cache(int new_len) {
     kv_cache_.truncate(new_len);
+    return true;
 }

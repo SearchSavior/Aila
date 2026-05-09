@@ -20,7 +20,11 @@ public:
 
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) = 0;
     virtual void reset() = 0;
-    virtual void truncate_kv_cache(int new_len) = 0;
+    // Truncate cached state to new_len positions.  Returns true if the
+    // truncation was clean (state is consistent at new_len so incremental
+    // prefill can continue).  Returns false if a full reset was necessary
+    // (caller must do a full prefill of all prompt tokens).
+    virtual bool truncate_kv_cache(int new_len) = 0;
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;

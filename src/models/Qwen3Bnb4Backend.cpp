@@ -447,6 +447,7 @@ void Qwen3Bnb4Backend::reset() {
     kv_cache_.reset();
 }
 
-void Qwen3Bnb4Backend::truncate_kv_cache(int new_len) {
+bool Qwen3Bnb4Backend::truncate_kv_cache(int new_len) {
     kv_cache_.truncate(new_len);
+    return true;
 }

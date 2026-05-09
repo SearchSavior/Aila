@@ -17,7 +17,7 @@ public:
 
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
-    void truncate_kv_cache(int new_len) override;
+    bool truncate_kv_cache(int new_len) override;
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }

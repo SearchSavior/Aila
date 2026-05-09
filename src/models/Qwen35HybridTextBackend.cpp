@@ -2406,12 +2406,36 @@ void Qwen35HybridTextBackend::reset() {
     }
 }
 
-void Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
-    if (new_len >= current_len_) return;
+bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
+    if (new_len >= current_len_) return true;
     if (new_len == 0) {
         reset();
-        return;
+        return false;
     }
-    // Recurrent linear layers cannot be safely "trimmed" without replay, so reset conservatively.
-    reset();
+    // Truncate attention KV caches to new_len (just move the position
+    // cursor — GQA layers use current_len_ as the write head).
+    current_len_ = new_len;
+    // DeltaNet recurrent state cannot be positionally truncated — it is a
+    // single accumulated matrix.  Zero it out and let the caller replay
+    // all prompt tokens through a full prefill to rebuild it.
+    if (use_delta_linear_) {
+        for (size_t i = 0; i < layer_caches_.size(); ++i) {
+            auto& layer = layers_[i];
+            auto& cache = layer_caches_[i];
+            if (!layer.is_linear) continue;
+            if (cache.linear_state.valid()) {
+                cache.linear_state.context()->queue().memset(
+                    cache.linear_state.data(), 0, cache.linear_state.size_bytes());
+            }
+            if (cache.linear_conv_state.valid()) {
+                cache.linear_conv_state.context()->queue().memset(
+                    cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
+            }
+            std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
+            std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
+            cache.device_state_dirty = false;
+            cache.linear_conv_head = 0;
+        }
+    }
+    return false;
 }

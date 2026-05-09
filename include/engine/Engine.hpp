@@ -573,8 +573,18 @@ public:
         // Truncate the physical KV cache inside the model to match the reusable prefix.
         // This is necessary because if we stripped <think> blocks, the sequence diverged,
         // and we cannot append new tokens to the end of the previous longer sequence.
-        if (backend_) backend_->truncate_kv_cache(reusable_prefix);
-        cached_ids_.resize(reusable_prefix);
+        if (backend_) {
+            bool trunc_ok = backend_->truncate_kv_cache(reusable_prefix);
+            if (!trunc_ok) {
+                backend_->reset();
+                cached_ids_.clear();
+                reusable_prefix = 0;
+            } else {
+                cached_ids_.resize(reusable_prefix);
+            }
+        } else {
+            cached_ids_.resize(reusable_prefix);
+        }
 
         // --- Context overflow: if too long, clear and rebuild from scratch ---
         int max_ctx = backend_ ? backend_->max_seq_len() : 0;
@@ -1225,8 +1235,21 @@ public:
                 reusable_prefix++;
             }
         }
-        if (backend_) backend_->truncate_kv_cache(reusable_prefix);
-        cached_ids_.resize(reusable_prefix);
+        if (backend_) {
+            bool trunc_ok = backend_->truncate_kv_cache(reusable_prefix);
+            if (!trunc_ok) {
+                // Backend could not partially truncate (e.g. DeltaNet
+                // recurrent state requires a full rebuild).  Reset and
+                // fall back to a full prefill of all prompt tokens.
+                backend_->reset();
+                cached_ids_.clear();
+                reusable_prefix = 0;
+            } else {
+                cached_ids_.resize(reusable_prefix);
+            }
+        } else {
+            cached_ids_.resize(reusable_prefix);
+        }
 
         int prefill_start = reusable_prefix;
         int new_tokens_to_prefill = total_prompt_len - prefill_start;
