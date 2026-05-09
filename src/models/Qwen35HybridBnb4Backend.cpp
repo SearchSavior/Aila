@@ -2254,12 +2254,23 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
             });
         } else if (seq_len == 1) {
+            // Fused gate+up GEMV + SiLU in one kernel (no SLM, vec8+FMA).
+            // Falls back to separate path if packed weights are unavailable.
+            bool fused_ok = false;
             time_stage(ProfileStage::FfnProj, [&] {
-                layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
+                fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                    ctx, layer.gate_up_proj, buf_.normed, buf_.gate, ff_dim_);
+                if (!fused_ok) {
+                    layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
+                }
             });
-            time_stage(ProfileStage::FfnAct, [&] {
-                ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
-            });
+            if (fused_ok) {
+                time_stage(ProfileStage::FfnAct, [&] { });
+            } else {
+                time_stage(ProfileStage::FfnAct, [&] {
+                    ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
+                });
+            }
             time_stage(ProfileStage::DownProj, [&] {
                 layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len);
             });

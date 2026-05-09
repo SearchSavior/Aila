@@ -160,18 +160,16 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
-        sycl::local_accessor<bf16, 1> input_slm(sycl::range<1>(in_features), cgh);
         cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            using vec8 = sycl::vec<bf16, 8>;
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
             const int row = static_cast<int>(item.get_group(0)) * static_cast<int>(rows_per_group) + sg_id;
+            const int stride = static_cast<int>(sub_group_size) * 4;
 
             if (lid < 16) qmap[lid] = quant_map_ptr[lid];
-            for (int i = lid; i < in_features; i += static_cast<int>(wg_size)) {
-                input_slm[i] = input_ptr[i];
-            }
             item.barrier(sycl::access::fence_space::local_space);
 
             float gate_acc = 0.0f;
@@ -179,51 +177,61 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
             if (row < intermediate_size) {
                 const int row_byte_base = row * packed_bytes_per_row;
                 const int row_block_base = row * blocks_per_row;
-                for (int byte_offset = sg_lane * 4; byte_offset + 3 < packed_bytes_per_row;
-                     byte_offset += static_cast<int>(sub_group_size) * 4) {
-                    const uint32_t g4 = *reinterpret_cast<const uint32_t*>(gate_packed + row_byte_base + byte_offset);
-                    const uint32_t u4 = *reinterpret_cast<const uint32_t*>(up_packed + row_byte_base + byte_offset);
-                    const float g_absmax = gate_absmax[row_block_base + (byte_offset / (blocksize / 2))];
-                    const float u_absmax = up_absmax[row_block_base + (byte_offset / (blocksize / 2))];
-                    const int input_base = byte_offset * 2;
-                    const float i0 = static_cast<float>(input_slm[input_base + 0]);
-                    const float i1 = static_cast<float>(input_slm[input_base + 1]);
-                    const float i2 = static_cast<float>(input_slm[input_base + 2]);
-                    const float i3 = static_cast<float>(input_slm[input_base + 3]);
-                    const float i4 = static_cast<float>(input_slm[input_base + 4]);
-                    const float i5 = static_cast<float>(input_slm[input_base + 5]);
-                    const float i6 = static_cast<float>(input_slm[input_base + 6]);
-                    const float i7 = static_cast<float>(input_slm[input_base + 7]);
-                    gate_acc += i0 * qmap[static_cast<uint8_t>(g4) >> 4] * g_absmax;
-                    gate_acc += i1 * qmap[static_cast<uint8_t>(g4) & 0x0F] * g_absmax;
-                    gate_acc += i2 * qmap[static_cast<uint8_t>(g4 >> 8) >> 4] * g_absmax;
-                    gate_acc += i3 * qmap[static_cast<uint8_t>(g4 >> 8) & 0x0F] * g_absmax;
-                    gate_acc += i4 * qmap[static_cast<uint8_t>(g4 >> 16) >> 4] * g_absmax;
-                    gate_acc += i5 * qmap[static_cast<uint8_t>(g4 >> 16) & 0x0F] * g_absmax;
-                    gate_acc += i6 * qmap[static_cast<uint8_t>(g4 >> 24) >> 4] * g_absmax;
-                    gate_acc += i7 * qmap[static_cast<uint8_t>(g4 >> 24) & 0x0F] * g_absmax;
-                    up_acc += i0 * qmap[static_cast<uint8_t>(u4) >> 4] * u_absmax;
-                    up_acc += i1 * qmap[static_cast<uint8_t>(u4) & 0x0F] * u_absmax;
-                    up_acc += i2 * qmap[static_cast<uint8_t>(u4 >> 8) >> 4] * u_absmax;
-                    up_acc += i3 * qmap[static_cast<uint8_t>(u4 >> 8) & 0x0F] * u_absmax;
-                    up_acc += i4 * qmap[static_cast<uint8_t>(u4 >> 16) >> 4] * u_absmax;
-                    up_acc += i5 * qmap[static_cast<uint8_t>(u4 >> 16) & 0x0F] * u_absmax;
-                    up_acc += i6 * qmap[static_cast<uint8_t>(u4 >> 24) >> 4] * u_absmax;
-                    up_acc += i7 * qmap[static_cast<uint8_t>(u4 >> 24) & 0x0F] * u_absmax;
+                int byte_offset = sg_lane * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row;
+                     byte_offset += stride) {
+                    const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                        gate_packed + row_byte_base + byte_offset);
+                    const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                        up_packed + row_byte_base + byte_offset);
+                    const float ga = gate_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const float ua = up_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const int ib = byte_offset * 2;
+                    const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
+                    const uint8_t gb0 = static_cast<uint8_t>(g4);
+                    const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                    const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                    const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                    const uint8_t ub0 = static_cast<uint8_t>(u4);
+                    const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                    const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                    const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[gb0 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[gb0 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[gb1 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[gb1 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[gb2 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[gb2 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[gb3 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[gb3 & 0xF] * ga, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[ub0 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[ub0 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[ub1 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[ub1 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[ub2 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[ub2 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[ub3 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[ub3 & 0xF] * ua, up_acc);
                 }
-                for (int byte_offset = sg_lane; byte_offset < packed_bytes_per_row;
+                for (; byte_offset < packed_bytes_per_row;
                      byte_offset += static_cast<int>(sub_group_size)) {
                     const uint8_t gb = gate_packed[row_byte_base + byte_offset];
                     const uint8_t ub = up_packed[row_byte_base + byte_offset];
-                    const float g_absmax = gate_absmax[row_block_base + (byte_offset / (blocksize / 2))];
-                    const float u_absmax = up_absmax[row_block_base + (byte_offset / (blocksize / 2))];
-                    const int input_index = byte_offset * 2;
-                    const float i0 = static_cast<float>(input_slm[input_index]);
-                    const float i1 = static_cast<float>(input_slm[input_index + 1]);
-                    gate_acc += i0 * qmap[gb >> 4] * g_absmax;
-                    gate_acc += i1 * qmap[gb & 0x0F] * g_absmax;
-                    up_acc += i0 * qmap[ub >> 4] * u_absmax;
-                    up_acc += i1 * qmap[ub & 0x0F] * u_absmax;
+                    const float ga = gate_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const float ua = up_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const int ii = byte_offset * 2;
+                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        qmap[gb >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        qmap[gb & 0xF] * ga, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        qmap[ub >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        qmap[ub & 0xF] * ua, up_acc);
                 }
             }
 
