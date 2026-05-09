@@ -5,3 +5,4 @@ bitsandbytes/
 /models/
 *.txt
 tmp/
+.claude/settings.json
