@@ -340,42 +340,50 @@ void packed_nf4_gemv_bf16(Context& ctx,
 
             float partial = 0.0f;
             if (row < out_features) {
+                using vec8 = sycl::vec<bf16, 8>;
                 const int row_byte_base = row * packed_bytes_per_row;
                 const int row_block_base = row * blocks_per_row;
                 int byte_offset = sg_lane * 4;
-                for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size) * 4) {
-                    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_ptr + row_byte_base + byte_offset);
-                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
-                    const int input_base = byte_offset * 2;
-                    const uint8_t b0 = static_cast<uint8_t>(packed4);
-                    const uint8_t b1 = static_cast<uint8_t>(packed4 >> 8);
-                    const uint8_t b2 = static_cast<uint8_t>(packed4 >> 16);
-                    const uint8_t b3 = static_cast<uint8_t>(packed4 >> 24);
-                    const float q0 = quant_map_cache[b0 >> 4] * absmax;
-                    const float q1 = quant_map_cache[b0 & 0x0F] * absmax;
-                    const float q2 = quant_map_cache[b1 >> 4] * absmax;
-                    const float q3 = quant_map_cache[b1 & 0x0F] * absmax;
-                    const float q4 = quant_map_cache[b2 >> 4] * absmax;
-                    const float q5 = quant_map_cache[b2 & 0x0F] * absmax;
-                    const float q6 = quant_map_cache[b3 >> 4] * absmax;
-                    const float q7 = quant_map_cache[b3 & 0x0F] * absmax;
-                    partial += static_cast<float>(input_ptr[input_base + 0]) * q0;
-                    partial += static_cast<float>(input_ptr[input_base + 1]) * q1;
-                    partial += static_cast<float>(input_ptr[input_base + 2]) * q2;
-                    partial += static_cast<float>(input_ptr[input_base + 3]) * q3;
-                    partial += static_cast<float>(input_ptr[input_base + 4]) * q4;
-                    partial += static_cast<float>(input_ptr[input_base + 5]) * q5;
-                    partial += static_cast<float>(input_ptr[input_base + 6]) * q6;
-                    partial += static_cast<float>(input_ptr[input_base + 7]) * q7;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row;
+                     byte_offset += stride) {
+                    const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
+                        packed_ptr + row_byte_base + byte_offset);
+                    const float am = absmax_ptr[row_block_base +
+                        (byte_offset / packed_bytes_per_block)];
+                    const int ib = byte_offset * 2;
+                    const uint8_t b0 = static_cast<uint8_t>(p4);
+                    const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
+                    const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
+                    const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
+                    const float d0 = quant_map_cache[b0 >> 4] * am;
+                    const float d1 = quant_map_cache[b0 & 0xF] * am;
+                    const float d2 = quant_map_cache[b1 >> 4] * am;
+                    const float d3 = quant_map_cache[b1 & 0xF] * am;
+                    const float d4 = quant_map_cache[b2 >> 4] * am;
+                    const float d5 = quant_map_cache[b2 & 0xF] * am;
+                    const float d6 = quant_map_cache[b3 >> 4] * am;
+                    const float d7 = quant_map_cache[b3 & 0xF] * am;
+                    const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
+                    partial = sycl::fma(static_cast<float>(in_v[0]), d0, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[1]), d1, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[2]), d2, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[3]), d3, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[4]), d4, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[5]), d5, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[6]), d6, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[7]), d7, partial);
                 }
-                for (; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size)) {
-                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
-                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
-                    const int input_index = byte_offset * 2;
-                    partial += static_cast<float>(input_ptr[input_index]) *
-                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
-                    partial += static_cast<float>(input_ptr[input_index + 1]) *
-                               quant_map_cache[packed & 0x0F] * absmax;
+                for (; byte_offset < packed_bytes_per_row;
+                     byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t pb = packed_ptr[row_byte_base + byte_offset];
+                    const float am = absmax_ptr[row_block_base +
+                        (byte_offset / packed_bytes_per_block)];
+                    const int ii = byte_offset * 2;
+                    partial = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        quant_map_cache[(pb >> 4) & 0xF] * am, partial);
+                    partial = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        quant_map_cache[pb & 0xF] * am, partial);
                 }
             }
 
