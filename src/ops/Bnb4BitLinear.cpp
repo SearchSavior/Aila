@@ -364,23 +364,25 @@ void packed_nf4_gemv_bf16(Context& ctx,
                     const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
                     const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
                     const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
-                    const float d0 = quant_map_cache[b0 >> 4] * am;
-                    const float d1 = quant_map_cache[b0 & 0xF] * am;
-                    const float d2 = quant_map_cache[b1 >> 4] * am;
-                    const float d3 = quant_map_cache[b1 & 0xF] * am;
-                    const float d4 = quant_map_cache[b2 >> 4] * am;
-                    const float d5 = quant_map_cache[b2 & 0xF] * am;
-                    const float d6 = quant_map_cache[b3 >> 4] * am;
-                    const float d7 = quant_map_cache[b3 & 0xF] * am;
                     const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
-                    partial = sycl::fma(static_cast<float>(in_v[0]), d0, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[1]), d1, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[2]), d2, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[3]), d3, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[4]), d4, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[5]), d5, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[6]), d6, partial);
-                    partial = sycl::fma(static_cast<float>(in_v[7]), d7, partial);
+                    // Inline dequant into FMA: eliminates 8 float temporaries,
+                    // giving the compiler freedom to schedule and reuse registers.
+                    partial = sycl::fma(static_cast<float>(in_v[0]),
+                        quant_map_cache[b0 >> 4] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[1]),
+                        quant_map_cache[b0 & 0xF] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[2]),
+                        quant_map_cache[b1 >> 4] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[3]),
+                        quant_map_cache[b1 & 0xF] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[4]),
+                        quant_map_cache[b2 >> 4] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[5]),
+                        quant_map_cache[b2 & 0xF] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[6]),
+                        quant_map_cache[b3 >> 4] * am, partial);
+                    partial = sycl::fma(static_cast<float>(in_v[7]),
+                        quant_map_cache[b3 & 0xF] * am, partial);
                 }
                 for (; byte_offset < packed_bytes_per_row;
                      byte_offset += static_cast<int>(sub_group_size)) {
