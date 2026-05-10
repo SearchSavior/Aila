@@ -387,7 +387,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
     bool force_direct_tied_lm_head = aila::env::read_flag("AILA_Q35_DIRECT_TIED_LM_HEAD", false);
     bool allow_unsupported_legacy_linear = aila::env::read_flag("AILA_Q35_ALLOW_UNSUPPORTED_LEGACY_LINEAR", false);
-    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    static const bool s_gqa_fastpath_cached = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
     bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
     bool force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
     decode_ffn_custom_enabled_ = (hidden_size_ == kDecodeFfnHidden &&
@@ -1003,7 +1004,8 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
-    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    static const bool s_gqa_fastpath_cached = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
     bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
         q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
     bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
@@ -1330,7 +1332,8 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
     float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
-    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    static const bool s_gqa_fastpath_cached = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
     bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
         q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
     bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
@@ -1798,14 +1801,17 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     if (seq_len <= 0) {
         throw std::runtime_error("Qwen35HybridTextBackend::forward: seq_len must be positive");
     }
-    bool profile_decode = (seq_len == 1) && aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
-    bool profile_prefill = (seq_len > 1) && aila::env::read_flag("AILA_PROFILE_Q35_PREFILL", false);
-    int profile_every = profile_decode
-        ? std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32))
-        : std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_PREFILL_EVERY", 1));
+    static const bool s_profile_decode = aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
+    static const bool s_profile_prefill = aila::env::read_flag("AILA_PROFILE_Q35_PREFILL", false);
+    static const int s_decode_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
+    static const int s_prefill_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_PREFILL_EVERY", 1));
+    static const bool s_profile_host_only = aila::env::read_flag("AILA_PROFILE_Q35_HOST_ONLY", false);
+    bool profile_decode = (seq_len == 1) && s_profile_decode;
+    bool profile_prefill = (seq_len > 1) && s_profile_prefill;
+    int profile_every = profile_decode ? s_decode_every : s_prefill_every;
     bool profile_enabled = profile_decode || profile_prefill;
     std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
-    bool profile_host_only = profile_enabled && aila::env::read_flag("AILA_PROFILE_Q35_HOST_ONLY", false);
+    bool profile_host_only = profile_enabled && s_profile_host_only;
     auto time_stage = [&](ProfileStage stage, auto&& fn) {
         if (!profile_enabled) {
             fn();
@@ -1854,17 +1860,23 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     full_rotary_dim = std::min(full_head_dim_, full_rotary_dim);
     if (full_rotary_dim & 1) --full_rotary_dim;
     if (full_rotary_dim <= 0) full_rotary_dim = std::min(2, full_head_dim_);
-    bool debug_layer_stats = aila::env::read_flag("AILA_DEBUG_Q35_LAYER_STATS", false);
-    int debug_layer_detail_idx = aila::env::read_int_raw("AILA_DEBUG_Q35_LAYER_DETAIL", -1);
-    bool debug_linear_compare = aila::env::read_flag("AILA_DEBUG_Q35_LINEAR_COMPARE", false);
-    int debug_linear_compare_layer = aila::env::read_int_raw("AILA_DEBUG_Q35_LINEAR_COMPARE_LAYER", -1);
+    static const bool s_debug_layer_stats = aila::env::read_flag("AILA_DEBUG_Q35_LAYER_STATS", false);
+    static const int s_debug_layer_detail = aila::env::read_int_raw("AILA_DEBUG_Q35_LAYER_DETAIL", -1);
+    static const bool s_debug_linear_compare = aila::env::read_flag("AILA_DEBUG_Q35_LINEAR_COMPARE", false);
+    static const int s_debug_linear_compare_layer = aila::env::read_int_raw("AILA_DEBUG_Q35_LINEAR_COMPARE_LAYER", -1);
+    static const bool s_experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
+    static const bool s_force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
+    bool debug_layer_stats = s_debug_layer_stats;
+    int debug_layer_detail_idx = s_debug_layer_detail;
+    bool debug_linear_compare = s_debug_linear_compare;
+    int debug_linear_compare_layer = s_debug_linear_compare_layer;
     bool grouped_linear_heads = linear_kv_heads_ > linear_q_heads_;
     int linear_conv_rows = std::max(0, linear_conv_kernel_dim_ - 1);
     bool default_grouped_linear_fastpath = supports_default_grouped_linear_delta_fastpath(
         linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
         linear_conv_kernel_dim_, linear_conv_rows);
-    bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
-    bool force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
+    bool experimental_grouped_linear_gpu = s_experimental_grouped_linear_gpu;
+    bool force_host_grouped_linear = s_force_host_grouped_linear;
     bool use_grouped_linear_gpu = grouped_linear_heads && !force_host_grouped_linear &&
                                   (default_grouped_linear_fastpath || experimental_grouped_linear_gpu);
     bool use_host_grouped_linear = grouped_linear_heads && !use_grouped_linear_gpu;
