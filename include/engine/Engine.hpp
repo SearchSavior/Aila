@@ -978,6 +978,11 @@ public:
                 force_thinking = ends_with_think(merged_user_text);
             }
         }
+        bool default_open_think =
+            (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
+            !is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
+        bool prepend_think = !no_think_requested &&
+            (force_thinking || default_open_think);
 
         GenerationConfig tuned_cfg = gen_config;
         if (model_spec_.family == ModelFamily::Qwen35Hybrid && tuned_cfg.do_sample) {
@@ -1326,7 +1331,15 @@ public:
         std::string output_text;
         bool streaming = (token_callback != nullptr);
         bool suppress_leading_think = no_think_requested;
+        bool think_injected = false;
         auto emit_stream_piece = [&](const std::string& piece) {
+            if (prepend_think && !think_injected) {
+                think_injected = true;
+                if (piece != "<think>") {
+                    output_text += "<think>\n";
+                    token_callback("<think>\n");
+                }
+            }
             if (no_think_requested && suppress_leading_think) {
                 if (piece == "<think>" || piece == "</think>") {
                     return;
@@ -1485,9 +1498,9 @@ public:
         if (no_think_requested) {
             strip_leading_think_artifacts(output_text);
         }
-        // When open-think was used and the model does NOT generate
-        // <think> as its first token, prepend it back.
-        if (force_thinking && !output_text.empty() && output_text.compare(0, 7, "<think>") != 0) {
+        // When open-think was used (explicit /think or model default) and the
+        // model does NOT generate <think> as its first token, prepend it back.
+        if (prepend_think && !output_text.empty() && output_text.compare(0, 7, "<think>") != 0) {
             output_text.insert(0, "<think>\n");
         }
 

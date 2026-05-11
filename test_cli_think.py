@@ -14,7 +14,7 @@ env["PATH"] = BUILD + ";" + env.get("PATH", "")
 
 print(f"Running: {EXE} -m {MODEL} --messages-json {tmp} --max-tokens 512 --greedy --no-stream")
 result = subprocess.run(
-    [EXE, "-m", MODEL, "--messages-json", tmp, "--max-tokens", "512", "--greedy", "--no-stream"],
+    [EXE, "-m", MODEL, "--messages-json", tmp, "--max-tokens", "512", "--greedy", "--no-stream", "--log-level", "error"],
     capture_output=True, text=True, timeout=300, env=env
 )
 
