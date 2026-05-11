@@ -340,8 +340,12 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
   int padded_cached_len = round_up(effective_len, 32);
 
   // Phase 1: QK^T via joint_matrix (writes unnormalized logits)
+  // Q (head_dim=256 bf16 = 512 bytes) fits entirely in SLM.  Pre-load
+  // it once so the inner JM loop runs without barriers — the XMX engine
+  // can pipeline K-cache global loads with the previous MAD.
+  const int q_slm_size = head_dim;
   ctx.queue().submit([&](sycl::handler &cgh) {
-    sycl::local_accessor<bf16, 1> a_local(sycl::range<1>(TM * TK), cgh);
+    sycl::local_accessor<bf16, 1> q_slm(sycl::range<1>(q_slm_size), cgh);
     sycl::local_accessor<float, 1> c_local(sycl::range<1>(TM * TN), cgh);
 
     cgh.parallel_for(
@@ -367,18 +371,17 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
               k_ptr + kv_head * max_seq_len * head_dim +
               (attn_start + t0) * head_dim;
 
-          for (int kb = 0; kb < head_dim; kb += TK) {
-            for (int i = lid; i < TM * TK; i += SG) {
-              int c = i % TK;
-              a_local[i] = q_head[kb + c];
-            }
-            item.barrier(sycl::access::fence_space::local_space);
+          // Load entire Q vector into SLM once (256 bf16 = 512 bytes).
+          for (int i = lid; i < head_dim; i += SG)
+            q_slm[i] = q_head[i];
+          item.barrier(sycl::access::fence_space::local_space);
 
-            auto a_ptr = a_local.get_multi_ptr<sycl::access::decorated::no>();
+          for (int kb = 0; kb < head_dim; kb += TK) {
+            auto a_ptr = q_slm.get_multi_ptr<sycl::access::decorated::no>();
             auto b_ptr = sycl::address_space_cast<
                 sycl::access::address_space::global_space,
                 sycl::access::decorated::no>(k_head_tile + kb);
-            joint_matrix_load(sg, sub_a, a_ptr, TK);
+            joint_matrix_load(sg, sub_a, a_ptr + kb, TK);
             joint_matrix_load(sg, sub_b, b_ptr, head_dim);
             joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
           }
