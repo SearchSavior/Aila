@@ -7,6 +7,16 @@
 #include <array>
 
 // ============================================================
+// RoPE / MRoPE configuration
+// ============================================================
+struct RopeSpec {
+    float rope_theta = 1000000.0f;
+    float partial_rotary_factor = 1.0f;
+    bool mrope_interleaved = false;
+    std::array<int, 3> mrope_section = {0, 0, 0};
+};
+
+// ============================================================
 // Qwen3-0.6B Model Configuration
 // ============================================================
 struct Qwen3Config {
@@ -26,6 +36,8 @@ struct Qwen3Config {
     int eos_token_id = 151645;
     int im_start_id  = 151644;
     int im_end_id    = 151645;
+
+    RopeSpec rope{};
 
     int num_heads_per_kv_group() const { return num_attention_heads / num_key_value_heads; }
 };
@@ -53,14 +65,8 @@ struct Message {
 enum class ModelFamily {
     Qwen3Dense,
     Qwen35Hybrid,
+    Qwen3ASR,
     Unknown
-};
-
-struct RopeSpec {
-    float rope_theta = 1000000.0f;
-    float partial_rotary_factor = 1.0f;
-    bool mrope_interleaved = false;
-    std::array<int, 3> mrope_section = {0, 0, 0};
 };
 
 struct Qwen35TextConfig {
@@ -174,6 +180,21 @@ struct QuantizationConfig {
     }
 };
 
+struct AudioEncoderConfig {
+    int d_model = 896;
+    int encoder_attention_heads = 14;
+    int encoder_ffn_dim = 3584;
+    int encoder_layers = 18;
+    int output_dim = 1024;
+    int num_mel_bins = 128;
+    int downsample_hidden_size = 480;
+    int n_window = 50;
+    int n_window_infer = 800;
+    int conv_chunksize = 500;
+    int max_source_positions = 1500;
+    int head_dim = 64;  // d_model / encoder_attention_heads
+};
+
 struct ModelSpec {
     ModelFamily family = ModelFamily::Qwen3Dense;
     std::string model_type;
@@ -185,10 +206,17 @@ struct ModelSpec {
     Qwen35TextConfig qwen35_text{};
     VisionConfig vision{};
 
+    // Qwen3-ASR path
+    AudioEncoderConfig audio{};
+    int audio_token_id = -1;
+    int audio_start_token_id = -1;
+    int audio_end_token_id = -1;
+
     // Model-level quantization metadata
     QuantizationConfig quantization{};
 
     bool has_vision() const { return vision.enabled; }
+    bool has_audio() const { return audio.d_model > 0; }
     bool is_quantized() const { return quantization.enabled(); }
     bool is_bitsandbytes_4bit() const { return quantization.is_bitsandbytes_4bit(); }
 };

@@ -417,4 +417,10 @@ namespace ops {
     // src: [R, C], dst: [C, R]
     void transpose(Context& ctx, Tensor& src, Tensor& dst);
 
+    // Sinusoidal position embedding (in-place add, used by audio encoder).
+    // input: [seq_len, d_model] bf16, modified in-place.
+    void sinusoidal_position_embedding(Context& ctx, Tensor& input,
+                                       int seq_len, int d_model,
+                                       float max_timescale = 10000.0f);
+
 } // namespace ops

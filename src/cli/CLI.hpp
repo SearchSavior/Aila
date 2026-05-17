@@ -49,6 +49,9 @@ struct CLIOptions {
 
     // Single-shot messages JSON mode
     std::string messages_json_path; // --messages-json
+
+    // ASR transcription mode
+    std::string transcribe_path;    // --transcribe
 };
 
 // Parse command-line arguments

@@ -6,7 +6,10 @@
 #include "../src/models/Qwen3Bnb4Backend.hpp"
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
+#include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
+#include "../src/audio/Qwen3ASRAudioEncoder.hpp"
+#include "../src/audio/AudioPreprocessor.hpp"
 #include "../src/utils/Tokenizer.hpp"
 #include "../src/utils/ModelConfig.hpp"
 #include "../src/utils/ModelSpec.hpp"
@@ -22,6 +25,8 @@
 #include <algorithm>
 #include <vector>
 #include <cctype>
+#include <fstream>
+#include <cstdint>
 
 // ============================================================
 // Inference Engine: orchestrates loading, tokenization, inference
@@ -142,6 +147,11 @@ public:
                         "Do not assume images or videos unless explicitly provided.";
                     AILA_LOG_INFO("[Config] Applied Qwen3.5 text-only default system prompt");
                 }
+            } else if (model_spec_.family == ModelFamily::Qwen3ASR) {
+                config_ = model_spec_.qwen3;
+                AILA_LOG_INFO("[ModelSpec] model_type=qwen3_asr text_hidden=%d layers=%d vocab=%d audio_enc_layers=%d audio_d_model=%d",
+                              config_.hidden_size, config_.num_hidden_layers, config_.vocab_size,
+                              model_spec_.audio.encoder_layers, model_spec_.audio.d_model);
             } else {
                 config_ = model_spec_.qwen3;
                 AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_dense hidden=%d layers=%d vocab=%d",
@@ -176,7 +186,9 @@ public:
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
 
         // 5. Initialize backend
-        if (model_spec_.is_bitsandbytes_4bit()) {
+        if (model_spec_.family == ModelFamily::Qwen3ASR) {
+            backend_ = std::make_unique<Qwen3ASRBackend>();
+        } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
             } else {
@@ -191,6 +203,19 @@ public:
         if (!backend_->load(*ctx_, *weights_, model_spec_, max_seq_len, &backend_error)) {
             AILA_LOG_ERROR("Failed to initialize model backend: %s", backend_error.c_str());
             return false;
+        }
+
+        audio_encoder_.reset();
+        if (model_spec_.family == ModelFamily::Qwen3ASR) {
+            audio_encoder_ = std::make_unique<aila::audio::Qwen3ASRAudioEncoder>();
+            std::string audio_error;
+            if (audio_encoder_->load(*ctx_, *weights_, model_spec_.audio, &audio_error)) {
+                AILA_LOG_INFO("[Audio] Qwen3-ASR audio encoder loaded (output_dim=%d)",
+                              audio_encoder_->output_dim());
+            } else {
+                AILA_LOG_ERROR("[Audio] Audio encoder init failed: %s", audio_error.c_str());
+                return false;
+            }
         }
 
         vision_backend_enabled_ = false;
@@ -1530,6 +1555,197 @@ public:
     // ============================================================
     // Raw prefill for benchmark (no decode, no history)
     // ============================================================
+
+    // ASR transcription from WAV file
+    std::string transcribe(const std::string& wav_path,
+                           const GenerationConfig& gen_config = GenerationConfig()) {
+        using bf16 = sycl::ext::oneapi::bfloat16;
+        clear_error();
+
+        if (model_spec_.family != ModelFamily::Qwen3ASR || !audio_encoder_) {
+            set_error(EngineErrorCode::RuntimeError, "ASR backend not initialized");
+            return "";
+        }
+
+        // 1. Audio preprocessing: pure C++ mel spectrogram
+        MelSpectrogram mel;
+        AILA_LOG_INFO("[Transcribe] Loading audio: %s", wav_path.c_str());
+        std::string preprocess_error;
+        if (!wav_to_mel(wav_path, mel, &preprocess_error)) {
+            set_error(EngineErrorCode::RuntimeError, "Audio preprocessing failed: " + preprocess_error);
+            return "";
+        }
+        AILA_LOG_INFO("[Transcribe] Mel: %d frames x %d bins, actual=%d", mel.n_frames, mel.n_mels, mel.actual_frames);
+
+        // 2. Upload mel to GPU — transpose from frame-major (F×M) to NCHW (1×M×F)
+        int mel_padded_frames = mel.n_frames;
+        int mel_actual_frames = mel.actual_frames;
+        int nM = mel.n_mels;
+        // Transpose: src[frame*nM + mel] → dst[mel*padded + frame] (NCHW layout)
+        std::vector<bf16> mel_bf16(static_cast<size_t>(mel_padded_frames) * nM);
+        for (int f = 0; f < mel_padded_frames; ++f)
+            for (int m = 0; m < nM; ++m)
+                mel_bf16[m * mel_padded_frames + f] = bf16(mel.data[f * nM + m]);
+
+        Tensor mel_device = Tensor::allocate(*ctx_, {1, nM, mel_padded_frames});
+        ctx_->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(bf16));
+
+        // 3. Audio encoder (GPU)
+        int audio_len = 0;
+        int od = model_spec_.audio.output_dim;
+        int max_audio_len = (mel_actual_frames / 8) + 16;
+        Tensor af_tmp = Tensor::allocate(*ctx_, {max_audio_len, od});
+        std::string enc_error;
+        if (!audio_encoder_->encode(*ctx_, mel_device, mel_actual_frames,
+                                     af_tmp, audio_len, &enc_error)) {
+            set_error(EngineErrorCode::RuntimeError, "Audio encoding failed: " + enc_error);
+            return "";
+        }
+        Tensor audio_features = Tensor::allocate(*ctx_, {audio_len, od});
+        bf16* af_dst = audio_features.data_as<bf16>();
+        bf16* af_src = af_tmp.data_as<bf16>();
+        ctx_->queue().memcpy(af_dst, af_src, static_cast<size_t>(audio_len) * od * sizeof(bf16));
+        AILA_LOG_INFO("[Transcribe] Audio encoded: %d tokens", audio_len);
+
+        // 4. Build prompt tokens using tokenizer for text content
+        int audio_start_id = model_spec_.audio_start_token_id;
+        int audio_end_id   = model_spec_.audio_end_token_id;
+        int audio_pad_id   = model_spec_.audio_token_id;
+        int im_start_id    = config_.im_start_id;
+        int im_end_id      = config_.im_end_id;
+
+        std::vector<int> prompt_ids;
+        auto add_text = [&](const std::string& t) {
+            auto ids = tokenizer_.encode(t);
+            prompt_ids.insert(prompt_ids.end(), ids.begin(), ids.end());
+        };
+
+        // <|im_start|>system\n<|im_end|>\n  (empty system prompt for ASR)
+        prompt_ids.push_back(im_start_id);
+        add_text("system\n");
+        prompt_ids.push_back(im_end_id);
+        add_text("\n");
+
+        // <|im_start|>user\n<|audio_start|><|audio_pad|>xN<|audio_end|>\n<|im_end|>\n
+        prompt_ids.push_back(im_start_id);
+        add_text("user\n");
+        prompt_ids.push_back(audio_start_id);
+        for (int i = 0; i < audio_len; ++i) prompt_ids.push_back(audio_pad_id);
+        prompt_ids.push_back(audio_end_id);
+        add_text("\n");
+        prompt_ids.push_back(im_end_id);
+        add_text("\n");
+
+        // <|im_start|>assistant\n
+        prompt_ids.push_back(im_start_id);
+        add_text("assistant\n");
+        AILA_LOG_INFO("[Transcribe] Prompt: %zu tokens", prompt_ids.size());
+
+        // 5. Download audio features and set overrides
+        std::vector<bf16> audio_bf16(static_cast<size_t>(audio_len) * model_spec_.audio.output_dim);
+        ctx_->memcpy_d2h(audio_bf16.data(), audio_features.data(), audio_bf16.size() * sizeof(bf16));
+        ctx_->synchronize();
+
+        std::vector<int> pad_positions;
+        for (size_t i = 0; i < prompt_ids.size(); ++i)
+            if (prompt_ids[i] == audio_pad_id) pad_positions.push_back(static_cast<int>(i));
+        // 6. Reset backend state BEFORE setting overrides/positions
+        backend_->reset();
+        cached_ids_.clear();
+
+        backend_->set_embedding_overrides(pad_positions, audio_bf16, model_spec_.audio.output_dim);
+        AILA_LOG_INFO("[Transcribe] Overrides set: %zu positions", pad_positions.size());
+
+        // 7. MRoPE positions (can be disabled via AILA_NO_MROPE=1 for debugging)
+        if (!aila::env::read_flag("AILA_NO_MROPE", false)) {
+            int total_len = static_cast<int>(prompt_ids.size());
+            std::vector<int> pos_t(total_len), pos_h(total_len), pos_w(total_len);
+            for (int i = 0; i < total_len; ++i) {
+                pos_t[i] = i; pos_h[i] = i; pos_w[i] = i;
+            }
+            backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, 0);
+            AILA_LOG_INFO("[Transcribe] MRoPE positions set");
+        } else {
+            AILA_LOG_INFO("[Transcribe] MRoPE disabled (AILA_NO_MROPE=1)");
+        }
+
+        // 8. Prefill
+        int* device_ids = static_cast<int*>(ctx_->alloc_device(prompt_ids.size() * sizeof(int)));
+        ctx_->memcpy_h2d_async(device_ids, prompt_ids.data(), prompt_ids.size() * sizeof(int));
+        GenerationConfig tuned_gen = gen_config;
+        if (tuned_gen.max_new_tokens <= 0) tuned_gen.max_new_tokens = 256;
+
+        int prompt_len = static_cast<int>(prompt_ids.size());
+        AILA_LOG_INFO("[Transcribe] Prefill: %d tokens", prompt_len);
+        Tensor* logits_ptr = &backend_->forward(*ctx_, device_ids, prompt_len);
+        ctx_->free_device(device_ids);
+
+        // Debug: dump prefill logits for 1.7B comparison
+        static bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
+        if (dump_logits) {
+            ctx_->synchronize();
+            std::vector<float> lvec(config_.vocab_size);
+            if (logits_ptr->dtype() == dnnl::memory::data_type::f32)
+                ctx_->memcpy_d2h(lvec.data(), logits_ptr->data(), lvec.size() * sizeof(float));
+            else {
+                std::vector<bf16> tmp(config_.vocab_size);
+                ctx_->memcpy_d2h(tmp.data(), logits_ptr->data(), tmp.size() * sizeof(bf16));
+                for (int vi=0;vi<config_.vocab_size;++vi) lvec[vi]=(float)tmp[vi];
+            }
+            std::ofstream lf("debug_cpp_logits.bin", std::ios::binary);
+            lf.write(reinterpret_cast<const char*>(lvec.data()), lvec.size() * sizeof(float));
+            AILA_LOG_INFO("[Transcribe] Dumped prefill logits");
+        }
+
+        if (backend_->supports_vision_embedding_override())
+            backend_->clear_mrope_positions();
+
+        // Decode loop
+        std::vector<int> generated_ids;
+        int* one_token_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        for (int step = 0; step < tuned_gen.max_new_tokens; ++step) {
+            int next_token;
+            if (!tuned_gen.do_sample) {
+                int* argmax_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                ops::argmax(*ctx_, *logits_ptr, config_.vocab_size, argmax_dev);
+                ctx_->memcpy_d2h(&next_token, argmax_dev, sizeof(int));
+                ctx_->free_device(argmax_dev);
+            } else {
+                next_token = ops::sample_with_config(*ctx_, *logits_ptr, config_.vocab_size,
+                                                     tuned_gen, generated_ids);
+            }
+
+            if (next_token == config_.eos_token_id || next_token == config_.im_end_id) break;
+            generated_ids.push_back(next_token);
+            ctx_->memcpy_h2d(one_token_dev, &next_token, sizeof(int));
+            logits_ptr = &backend_->forward(*ctx_, one_token_dev, 1);
+        }
+        ctx_->free_device(one_token_dev);
+
+        // 9. Decode and parse output
+        std::string raw = tokenizer_.decode(generated_ids);
+
+        // Strip "language XXX<asr_text>" prefix if present
+        size_t asr_pos = raw.find("<asr_text>");
+        std::string transcript;
+        if (asr_pos != std::string::npos) {
+            transcript = raw.substr(asr_pos + 10);  // skip "<asr_text>"
+        } else {
+            transcript = raw;
+        }
+
+        // Trim whitespace
+        while (!transcript.empty() && std::isspace(static_cast<unsigned char>(transcript.front())))
+            transcript.erase(0, 1);
+        while (!transcript.empty() && std::isspace(static_cast<unsigned char>(transcript.back())))
+            transcript.pop_back();
+
+        cached_ids_ = prompt_ids;
+        cached_ids_.insert(cached_ids_.end(), generated_ids.begin(), generated_ids.end());
+
+        return transcript;
+    }
+
     double benchmark_prefill(const std::vector<int>& token_ids) {
         if (backend_) backend_->reset();
         cached_ids_.clear();
@@ -1833,6 +2049,7 @@ private:
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
     std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
+    std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
     aila::templating::TemplateRegistry template_registry_;
     Tokenizer tokenizer_;
     bool vision_backend_enabled_ = false;

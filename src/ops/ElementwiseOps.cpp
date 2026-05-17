@@ -862,4 +862,39 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
     });
 }
 
+// ============================================================
+// SYCL Kernel: Sinusoidal Position Embedding (audio encoder)
+// ============================================================
+
+void sinusoidal_position_embedding(Context& ctx, Tensor& input,
+                                   int seq_len, int d_model,
+                                   float max_timescale) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    // Python SinusoidsPositionEmbedding formula:
+    // log_inc = log(max_ts) / (C//2 - 1)
+    // inv_timescales[j] = exp(-j * log_inc)
+    // pe[pos, j] = sin(pos * inv_timescales[j])      for j=0..C//2-1
+    // pe[pos, C//2+j] = cos(pos * inv_timescales[j])
+    int half = d_model / 2;
+    float log_timescale_increment = std::log(max_timescale) / static_cast<float>(half - 1);
+
+    ctx.queue().parallel_for(sycl::range<1>(seq_len * half),
+        [=](sycl::id<1> idx) {
+            int i = static_cast<int>(idx[0]);
+            int pos = i / half;
+            int j = i % half;
+
+            float inv_timescale = sycl::exp(-log_timescale_increment * static_cast<float>(j));
+            float angle = static_cast<float>(pos) * inv_timescale;
+            float sin_val = sycl::sin(angle);
+            float cos_val = sycl::cos(angle);
+
+            int base = pos * d_model;
+            float old_sin_pos = static_cast<float>(in_ptr[base + j]);
+            float old_cos_pos = static_cast<float>(in_ptr[base + half + j]);
+            in_ptr[base + j]          = bf16(old_sin_pos + sin_val);
+            in_ptr[base + half + j]   = bf16(old_cos_pos + cos_val);
+        });
+}
+
 } // namespace ops

@@ -132,6 +132,18 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ASR transcription mode
+    if (!opts.transcribe_path.empty()) {
+        gen_config.do_sample = false;  // greedy for ASR
+        std::string transcript = engine.transcribe(opts.transcribe_path, gen_config);
+        if (engine.last_error_code() != EngineErrorCode::Ok) {
+            AILA_LOG_ERROR("Transcription failed: %s", engine.last_error_message().c_str());
+            return 2;
+        }
+        std::cout << transcript << std::endl;
+        return 0;
+    }
+
     // Run interactive loop
     return run_interactive(engine, gen_config, opts.stream_output);
 }

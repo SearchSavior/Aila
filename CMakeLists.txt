@@ -52,11 +52,13 @@ set(LIB_SOURCES
     src/ops/VisionOps.cpp
     src/ops/SamplingOps.cpp
     src/ops/Transpose.cpp
+    src/ops/ConvOps.cpp
     src/memory/KVCache.cpp
     src/models/Qwen3DenseBackend.cpp
     src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp
     src/models/Qwen35HybridBnb4Backend.cpp
+    src/models/Qwen3ASRBackend.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp
@@ -64,6 +66,8 @@ set(LIB_SOURCES
     src/utils/SafeTensors.cpp
     src/templates/TemplateRegistry.cpp
     src/vision/Qwen35VisionEncoder.cpp
+    src/audio/Qwen3ASRAudioEncoder.cpp
+    src/audio/AudioPreprocessor.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
@@ -89,6 +93,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/core)
 include_directories(${PROJECT_SOURCE_DIR}/src/ops)
 include_directories(${PROJECT_SOURCE_DIR}/src/memory)
 include_directories(${PROJECT_SOURCE_DIR}/src/models)
+include_directories(${PROJECT_SOURCE_DIR}/src/audio)
 include_directories(${PROJECT_SOURCE_DIR}/src/bench)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 

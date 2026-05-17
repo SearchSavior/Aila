@@ -1,6 +1,8 @@
 llama.cpp/
 oneDNN/
 vllm/
+transformers/
+Qwen3-ASR/
 build/
 bitsandbytes/
 /models/

@@ -306,6 +306,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.messages_json_path = argv[++i];
             continue;
         }
+        if (arg == "--transcribe" && i + 1 < argc) {
+            opts.transcribe_path = argv[++i];
+            continue;
+        }
         // Positional: treat first positional as model dir
         if (arg[0] != '-' && opts.model_dir.empty()) {
             opts.model_dir = arg;
