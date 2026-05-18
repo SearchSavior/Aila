@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
 
     // Initialize engine
     InferenceEngine engine;
-    if (!engine.init(opts.model_dir, opts.max_seq_len)) {
+    if (!engine.init(opts.model_dir, opts.max_seq_len, opts.lora_dir)) {
         AILA_LOG_ERROR("Failed to initialize inference engine");
         return 1;
     }

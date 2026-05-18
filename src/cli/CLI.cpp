@@ -134,6 +134,7 @@ Options:
   --bench-greedy           Benchmark decode in greedy mode (default)
   --log-level <level>      Minimum log level (debug/info/warning/error, default: info)
   --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
+  --lora <path>              LoRA adapter directory (or set AILA_LORA_DIR)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -169,6 +170,7 @@ void print_version() {
 bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
     // Load defaults from environment
     opts.model_dir = aila::env::read_string("AILA_MODEL_DIR", "");
+    opts.lora_dir = aila::env::read_string("AILA_LORA_DIR", "");
     opts.max_seq_len = aila::env::read_int("AILA_MAX_SEQ_LEN", 4096);
     opts.decode_chunk_size = aila::env::read_int("AILA_DECODE_CHUNK_SIZE", 12);
     opts.stream_chunk_size = aila::env::read_int("AILA_STREAM_CHUNK_SIZE", 4);
@@ -304,6 +306,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--messages-json" && i + 1 < argc) {
             opts.messages_json_path = argv[++i];
+            continue;
+        }
+        if (arg == "--lora" && i + 1 < argc) {
+            opts.lora_dir = argv[++i];
             continue;
         }
         if (arg == "--transcribe" && i + 1 < argc) {

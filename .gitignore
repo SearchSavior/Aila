@@ -2,6 +2,7 @@ llama.cpp/
 oneDNN/
 vllm/
 transformers/
+peft/
 Qwen3-ASR/
 build/
 bitsandbytes/

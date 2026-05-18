@@ -71,6 +71,7 @@ set(LIB_SOURCES
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
+    src/lora/LoraLoader.cpp
     src/bench/Benchmark.cpp
 )
 
@@ -95,6 +96,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/memory)
 include_directories(${PROJECT_SOURCE_DIR}/src/models)
 include_directories(${PROJECT_SOURCE_DIR}/src/audio)
 include_directories(${PROJECT_SOURCE_DIR}/src/bench)
+include_directories(${PROJECT_SOURCE_DIR}/src/lora)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 # ============================================================

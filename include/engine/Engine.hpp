@@ -10,6 +10,8 @@
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
+#include "../src/lora/LoraLoader.hpp"
+#include "../src/lora/LoraConfig.hpp"
 #include "../src/utils/Tokenizer.hpp"
 #include "../src/utils/ModelConfig.hpp"
 #include "../src/utils/ModelSpec.hpp"
@@ -36,9 +38,11 @@ public:
     InferenceEngine() = default;
 
     // Initialize: load model + tokenizer from model directory
-    bool init(const std::string& model_dir, int max_seq_len = 4096) {
+    bool init(const std::string& model_dir, int max_seq_len = 4096,
+              const std::string& lora_dir = "") {
         clear_error();
         model_dir_ = model_dir;
+        lora_dir_ = lora_dir;
 
         AILA_LOG_INFO("========================================");
         AILA_LOG_INFO("  Aila Inference Engine");
@@ -184,6 +188,27 @@ public:
         // 4. Load model weights
         AILA_LOG_INFO("[4/4] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
+
+        // 4.5. Merge LoRA adapter weights (if provided)
+        if (!lora_dir_.empty()) {
+            AILA_LOG_INFO("[LoRA] Loading adapter from: %s", lora_dir_.c_str());
+            aila::lora::LoraAdapter adapter;
+            std::string lora_error;
+            if (!aila::lora::LoraLoader::load(lora_dir_, adapter, &lora_error)) {
+                AILA_LOG_ERROR("[LoRA] Failed to load adapter: %s", lora_error.c_str());
+                return false;
+            }
+            AILA_LOG_INFO("[LoRA] Adapter loaded: r=%d alpha=%d scaling=%.2f pairs=%zu",
+                          adapter.config.r, adapter.config.lora_alpha,
+                          adapter.config.scaling, adapter.pairs.size());
+            std::string merge_error;
+            int merged = aila::lora::LoraLoader::merge_into_weights(*ctx_, adapter, *weights_, &merge_error);
+            if (merged < 0) {
+                AILA_LOG_ERROR("[LoRA] Merge failed: %s", merge_error.c_str());
+                return false;
+            }
+            AILA_LOG_INFO("[LoRA] Merged %d weight matrices", merged);
+        }
 
         // 5. Initialize backend
         if (model_spec_.family == ModelFamily::Qwen3ASR) {
@@ -2042,6 +2067,7 @@ private:
     }
 
     std::string model_dir_;
+    std::string lora_dir_;
     std::string system_prompt_ = "You are a helpful assistant.";
     Qwen3Config config_;
     ModelSpec model_spec_;
