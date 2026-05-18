@@ -28,6 +28,8 @@ public:
 
     bool load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
               int max_seq_len, std::string* error_message) override;
+    bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
+                    std::string* error_message = nullptr) override;
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;

@@ -14,6 +14,104 @@ int round_up_seq(int v, int granularity) {
 
 Qwen3Bnb4Backend::~Qwen3Bnb4Backend() = default;
 
+bool Qwen3Bnb4Backend::apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
+                                  std::string* error_message) {
+    int H = hidden_size_;
+    int QD = q_dim_;
+    int KVD = kv_dim_;
+    int FF = ff_dim_;
+    float scaling = adapter.config.scaling;
+
+    auto upload_f32_to_bf16 = [&](const std::vector<float>& f32_data,
+                                   int rows, int cols) -> Tensor {
+        size_t n = static_cast<size_t>(rows) * cols;
+        std::vector<bf16> bf16_data(n);
+        for (size_t i = 0; i < n; ++i) {
+            bf16_data[i] = bf16(f32_data[i]);
+        }
+        Tensor t = Tensor::allocate(ctx, {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                    dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(t.data(), bf16_data.data(), n * sizeof(bf16));
+        return t;
+    };
+
+    // Collect attachments per layer, per fused projection
+    int num_layers = cfg_.num_hidden_layers;
+    std::vector<std::vector<LoraAttachment>> qkv_attachments(num_layers);
+    std::vector<std::vector<LoraAttachment>> gate_up_attachments(num_layers);
+
+    for (const auto& pair : adapter.pairs) {
+        // Parse "model.layers.N.self_attn.TARGET.weight" or "model.layers.N.mlp.TARGET.weight"
+        const std::string prefix = "model.layers.";
+        size_t pos = pair.weight_name.find(prefix);
+        if (pos != 0) continue;
+
+        size_t num_start = prefix.size();
+        size_t num_end = pair.weight_name.find('.', num_start);
+        if (num_end == std::string::npos) continue;
+        int layer_idx = std::stoi(pair.weight_name.substr(num_start, num_end - num_start));
+        if (layer_idx < 0 || layer_idx >= num_layers) continue;
+
+        size_t last_dot = pair.weight_name.rfind('.');
+        size_t prev_dot = pair.weight_name.rfind('.', last_dot - 1);
+        std::string target = pair.weight_name.substr(prev_dot + 1, last_dot - prev_dot - 1);
+
+        LoraAttachment att;
+        att.lora_a = upload_f32_to_bf16(pair.lora_a, pair.r, pair.in_features);
+        att.lora_b = upload_f32_to_bf16(pair.lora_b, pair.out_features, pair.r);
+        att.scaling = scaling;
+
+        if (target == "q_proj") {
+            att.output_offset = 0;
+            att.output_rows = QD;
+            qkv_attachments[layer_idx].push_back(std::move(att));
+        } else if (target == "k_proj") {
+            att.output_offset = QD;
+            att.output_rows = KVD;
+            qkv_attachments[layer_idx].push_back(std::move(att));
+        } else if (target == "v_proj") {
+            att.output_offset = QD + KVD;
+            att.output_rows = KVD;
+            qkv_attachments[layer_idx].push_back(std::move(att));
+        } else if (target == "o_proj") {
+            att.output_offset = 0;
+            att.output_rows = H;
+            std::vector<LoraAttachment> tmp;
+            tmp.push_back(std::move(att));
+            layers_[layer_idx].o_proj.set_lora(std::move(tmp));
+        } else if (target == "gate_proj") {
+            att.output_offset = 0;
+            att.output_rows = FF;
+            gate_up_attachments[layer_idx].push_back(std::move(att));
+        } else if (target == "up_proj") {
+            att.output_offset = FF;
+            att.output_rows = FF;
+            gate_up_attachments[layer_idx].push_back(std::move(att));
+        } else if (target == "down_proj") {
+            att.output_offset = 0;
+            att.output_rows = H;
+            std::vector<LoraAttachment> tmp;
+            tmp.push_back(std::move(att));
+            layers_[layer_idx].down_proj.set_lora(std::move(tmp));
+        }
+    }
+
+    // Set fused attachments on qkv_proj and gate_up_proj
+    for (int i = 0; i < num_layers; ++i) {
+        if (!qkv_attachments[i].empty()) {
+            layers_[i].qkv_proj.set_lora(std::move(qkv_attachments[i]));
+        }
+        if (!gate_up_attachments[i].empty()) {
+            layers_[i].gate_up_proj.set_lora(std::move(gate_up_attachments[i]));
+        }
+    }
+
+    AILA_LOG_INFO("[Qwen3Bnb4] LoRA adapter applied: r=%d alpha=%d scaling=%.2f",
+                  adapter.config.r, adapter.config.lora_alpha, adapter.config.scaling);
+    if (error_message) *error_message = "";
+    return true;
+}
+
 void Qwen3Bnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     if (seq_len <= runtime_seq_capacity_) return;
 

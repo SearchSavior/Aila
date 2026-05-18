@@ -796,6 +796,98 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
     return true;
 }
 
+void Bnb4BitLinear::apply_lora_decode(Context& ctx, Tensor& input, Tensor& output) {
+    const bf16* in_ptr = static_cast<const bf16*>(input.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    int in_f = in_features_;
+
+    for (const auto& att : lora_attachments_) {
+        const bf16* a_ptr = static_cast<const bf16*>(att.lora_a.data());
+        const bf16* b_ptr = static_cast<const bf16*>(att.lora_b.data());
+        int r = static_cast<int>(att.lora_a.shape(0));
+        int rows = att.output_rows;
+        int offset = att.output_offset;
+        float scale = att.scaling;
+
+        // Small USM temp buffer for intermediate: (r,) float
+        float* inter_f32 = sycl::malloc_device<float>(static_cast<size_t>(r), ctx.queue());
+
+        // Step 1: intermediate[k] = sum_j A[k,j] * x[j]
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(r)),
+            [=](sycl::id<1> idx) {
+                int k = idx[0];
+                float sum = 0.0f;
+                for (int j = 0; j < in_f; ++j) {
+                    sum += static_cast<float>(a_ptr[static_cast<size_t>(k) * in_f + j]) *
+                           static_cast<float>(in_ptr[j]);
+                }
+                inter_f32[k] = sum;
+            });
+
+        // Step 2: output[offset + i] += sum_k B[i,k] * intermediate[k] * scale
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(rows)),
+            [=](sycl::id<1> idx) {
+                int i = idx[0];
+                float acc = 0.0f;
+                for (int k = 0; k < r; ++k) {
+                    acc += static_cast<float>(b_ptr[static_cast<size_t>(i) * r + k]) * inter_f32[k];
+                }
+                int out_idx = offset + i;
+                out_ptr[out_idx] = bf16(static_cast<float>(out_ptr[out_idx]) + acc * scale);
+            });
+
+        sycl::free(inter_f32, ctx.queue());
+    }
+}
+
+void Bnb4BitLinear::apply_lora_prefill(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
+    const bf16* in_ptr = static_cast<const bf16*>(input.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    int in_f = in_features_;
+
+    for (const auto& att : lora_attachments_) {
+        const bf16* a_ptr = static_cast<const bf16*>(att.lora_a.data());
+        const bf16* b_ptr = static_cast<const bf16*>(att.lora_b.data());
+        int r = static_cast<int>(att.lora_a.shape(0));
+        int rows = att.output_rows;
+        int offset = att.output_offset;
+        float scale = att.scaling;
+
+        // Allocate temp buffer for intermediate: (seq_len, r)
+        Tensor inter = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), static_cast<int64_t>(r)},
+                                        dnnl::memory::data_type::f32);
+        float* inter_ptr = static_cast<float*>(inter.data());
+
+        // Step 1: intermediate[b,k] = sum_j A[k,j] * input[b,j]
+        ctx.queue().parallel_for(sycl::range<2>(static_cast<size_t>(seq_len), static_cast<size_t>(r)),
+            [=](sycl::id<2> idx) {
+                int b = idx[0];
+                int k = idx[1];
+                float sum = 0.0f;
+                for (int j = 0; j < in_f; ++j) {
+                    sum += static_cast<float>(a_ptr[static_cast<size_t>(k) * in_f + j]) *
+                           static_cast<float>(in_ptr[static_cast<size_t>(b) * in_f + j]);
+                }
+                inter_ptr[static_cast<size_t>(b) * r + k] = sum;
+            });
+
+        // Step 2: output[b, offset+i] += sum_k B[i,k] * intermediate[b,k] * scale
+        int out_f = static_cast<int>(output.shape(1));
+        ctx.queue().parallel_for(sycl::range<2>(static_cast<size_t>(seq_len), static_cast<size_t>(rows)),
+            [=](sycl::id<2> idx) {
+                int b = idx[0];
+                int i = idx[1];
+                float acc = 0.0f;
+                for (int k = 0; k < r; ++k) {
+                    acc += static_cast<float>(b_ptr[static_cast<size_t>(i) * r + k]) *
+                           inter_ptr[static_cast<size_t>(b) * r + k];
+                }
+                int out_idx = static_cast<size_t>(b) * out_f + offset + i;
+                out_ptr[out_idx] = bf16(static_cast<float>(out_ptr[out_idx]) + acc * scale);
+            });
+    }
+}
+
 void Bnb4BitLinear::forward(Context& ctx,
                             Bnb4BitLinearScratch& scratch,
                             Tensor& input,
@@ -814,6 +906,9 @@ void Bnb4BitLinear::forward(Context& ctx,
         can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, seq_len);
     if (use_packed_decode_fastpath) {
         packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, add_residual);
+        if (!lora_attachments_.empty()) {
+            apply_lora_decode(ctx, input, output);
+        }
         return;
     }
 
@@ -833,6 +928,9 @@ void Bnb4BitLinear::forward(Context& ctx,
                              static_cast<bf16*>(output.data()),
                              seq_len, out_features_, in_features_,
                              blocksize);
+        if (!lora_attachments_.empty()) {
+            apply_lora_prefill(ctx, input, output, seq_len);
+        }
         return;
     }
 
@@ -942,6 +1040,10 @@ void Bnb4BitLinear::forward(Context& ctx,
             }
         }
         cp.prim.execute(ctx.stream(), cp.args);
+    }
+
+    if (!lora_attachments_.empty()) {
+        apply_lora_prefill(ctx, input_bf16, output_bf16, seq_len);
     }
 
     ctx.queue().memcpy(output.data(), output_bf16.data(),

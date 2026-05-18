@@ -189,25 +189,33 @@ public:
         AILA_LOG_INFO("[4/4] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
 
-        // 4.5. Merge LoRA adapter weights (if provided)
+        // 4.5. Load LoRA adapter (if provided)
+        aila::lora::LoraAdapter lora_adapter;
+        bool has_nf4_lora = false;
         if (!lora_dir_.empty()) {
             AILA_LOG_INFO("[LoRA] Loading adapter from: %s", lora_dir_.c_str());
-            aila::lora::LoraAdapter adapter;
             std::string lora_error;
-            if (!aila::lora::LoraLoader::load(lora_dir_, adapter, &lora_error)) {
+            if (!aila::lora::LoraLoader::load(lora_dir_, lora_adapter, &lora_error)) {
                 AILA_LOG_ERROR("[LoRA] Failed to load adapter: %s", lora_error.c_str());
                 return false;
             }
             AILA_LOG_INFO("[LoRA] Adapter loaded: r=%d alpha=%d scaling=%.2f pairs=%zu",
-                          adapter.config.r, adapter.config.lora_alpha,
-                          adapter.config.scaling, adapter.pairs.size());
-            std::string merge_error;
-            int merged = aila::lora::LoraLoader::merge_into_weights(*ctx_, adapter, *weights_, &merge_error);
-            if (merged < 0) {
-                AILA_LOG_ERROR("[LoRA] Merge failed: %s", merge_error.c_str());
-                return false;
+                          lora_adapter.config.r, lora_adapter.config.lora_alpha,
+                          lora_adapter.config.scaling, lora_adapter.pairs.size());
+
+            // Dense models: merge LoRA delta into base weights before backend sees them.
+            // NF4 models: defer to backend (weights are packed uint8, cannot merge in-place).
+            if (!model_spec_.is_bitsandbytes_4bit()) {
+                std::string merge_error;
+                int merged = aila::lora::LoraLoader::merge_into_weights(*ctx_, lora_adapter, *weights_, &merge_error);
+                if (merged < 0) {
+                    AILA_LOG_ERROR("[LoRA] Merge failed: %s", merge_error.c_str());
+                    return false;
+                }
+                AILA_LOG_INFO("[LoRA] Merged %d weight matrices (dense)", merged);
+            } else {
+                has_nf4_lora = true;
             }
-            AILA_LOG_INFO("[LoRA] Merged %d weight matrices", merged);
         }
 
         // 5. Initialize backend
@@ -224,10 +232,21 @@ public:
         } else {
             backend_ = std::make_unique<Qwen3DenseBackend>();
         }
+
         std::string backend_error;
         if (!backend_->load(*ctx_, *weights_, model_spec_, max_seq_len, &backend_error)) {
             AILA_LOG_ERROR("Failed to initialize model backend: %s", backend_error.c_str());
             return false;
+        }
+
+        // Apply LoRA to NF4 backend (weights are packed uint8, must be done at runtime)
+        if (has_nf4_lora) {
+            std::string lora_apply_error;
+            if (!backend_->apply_lora(*ctx_, lora_adapter, &lora_apply_error)) {
+                AILA_LOG_ERROR("[LoRA] NF4 apply_lora failed: %s", lora_apply_error.c_str());
+                return false;
+            }
+            AILA_LOG_INFO("[LoRA] NF4 runtime LoRA applied to backend");
         }
 
         audio_encoder_.reset();

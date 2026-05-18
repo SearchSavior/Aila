@@ -3,6 +3,7 @@
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
 #include "../utils/SafeTensors.hpp"
+#include "../lora/LoraLoader.hpp"
 #include "engine/Types.hpp"
 #include <string>
 #include <vector>
@@ -17,6 +18,9 @@ public:
                       const ModelSpec& spec,
                       int max_seq_len,
                       std::string* error_message) = 0;
+
+    virtual bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
+                            std::string* error_message = nullptr) { return true; }
 
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) = 0;
     virtual void reset() = 0;

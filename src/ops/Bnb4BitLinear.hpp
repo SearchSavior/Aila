@@ -9,6 +9,14 @@
 #include <unordered_map>
 #include <vector>
 
+struct LoraAttachment {
+    Tensor lora_a;         // (r, in_features) bf16 GPU
+    Tensor lora_b;         // (rows, r) bf16 GPU
+    float scaling = 1.0f;
+    int output_offset = 0; // starting row offset in the output tensor
+    int output_rows = 0;   // number of output rows this attachment covers
+};
+
 struct Bnb4BitLinearScratch {
     Tensor input_bf16;
     Tensor output_bf16;
@@ -57,6 +65,11 @@ public:
 
     int in_features() const { return in_features_; }
     int out_features() const { return out_features_; }
+
+    void set_lora(std::vector<LoraAttachment>&& attachments) {
+        lora_attachments_ = std::move(attachments);
+    }
+    bool has_lora() const { return !lora_attachments_.empty(); }
 
 private:
     bool init_fused_rows_impl(Context& ctx,
@@ -110,4 +123,8 @@ private:
         std::unordered_map<int, dnnl::memory> args;
     };
     std::unordered_map<int, CachedPrimitive> prim_cache_;
+
+    std::vector<LoraAttachment> lora_attachments_;
+    void apply_lora_decode(Context& ctx, Tensor& input, Tensor& output);
+    void apply_lora_prefill(Context& ctx, Tensor& input, Tensor& output, int seq_len);
 };
