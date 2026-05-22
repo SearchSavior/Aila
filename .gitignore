@@ -4,6 +4,7 @@ vllm/
 transformers/
 peft/
 Qwen3-ASR/
+qwen-asr/
 build/
 bitsandbytes/
 /models/

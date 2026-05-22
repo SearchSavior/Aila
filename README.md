@@ -252,6 +252,7 @@ Aila/
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel's deep neural network library providing the matmul primitives used for bf16 inference
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 quantization format and dequantization reference
 - **[simdjson](https://github.com/simdjson/simdjson)** — Fast JSON parser used for model config and tokenizer metadata
+- **[dr_libs](https://github.com/mackron/dr_libs)** — Single-header audio decoding libraries (`dr_wav`, `dr_mp3`, `dr_flac`) used for ASR audio preprocessing
 
 ## 📄 License
 

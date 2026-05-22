@@ -3,113 +3,26 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <iostream>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
+// Integrate dr_wav and dr_mp3
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
+
+#define DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+
+#define DR_FLAC_IMPLEMENTATION
+#include "dr_flac.h"
+
 // Pre-computed slaney mel filterbank (matches Python WhisperFeatureExtractor)
 #include "mel_fb_data.inc"
 
 namespace {
-
-// ---- WAV header parsing ----
-
-struct WavHeader {
-    uint16_t audio_format = 0;
-    uint16_t num_channels = 0;
-    uint32_t sample_rate = 0;
-    uint32_t byte_rate = 0;
-    uint16_t block_align = 0;
-    uint16_t bits_per_sample = 0;
-    uint32_t data_size = 0;
-};
-
-bool read_wav_header(std::ifstream& in, WavHeader& hdr) {
-    char riff[5] = {};
-    in.read(riff, 4);
-    if (std::strncmp(riff, "RIFF", 4) != 0) return false;
-
-    uint32_t file_size;
-    in.read(reinterpret_cast<char*>(&file_size), 4);
-
-    char wave[5] = {};
-    in.read(wave, 4);
-    if (std::strncmp(wave, "WAVE", 4) != 0) return false;
-
-    // Scan chunks
-    while (in.good()) {
-        char chunk_id[5] = {};
-        in.read(chunk_id, 4);
-        uint32_t chunk_size = 0;
-        in.read(reinterpret_cast<char*>(&chunk_size), 4);
-
-        if (std::strncmp(chunk_id, "fmt ", 4) == 0) {
-            in.read(reinterpret_cast<char*>(&hdr.audio_format), 2);
-            in.read(reinterpret_cast<char*>(&hdr.num_channels), 2);
-            in.read(reinterpret_cast<char*>(&hdr.sample_rate), 4);
-            in.read(reinterpret_cast<char*>(&hdr.byte_rate), 4);
-            in.read(reinterpret_cast<char*>(&hdr.block_align), 2);
-            in.read(reinterpret_cast<char*>(&hdr.bits_per_sample), 2);
-            // Skip extra fmt bytes if any
-            if (chunk_size > 16) {
-                in.ignore(chunk_size - 16);
-            }
-        } else if (std::strncmp(chunk_id, "data", 4) == 0) {
-            hdr.data_size = chunk_size;
-            return true;  // Found data chunk, done scanning
-        } else {
-            in.ignore(chunk_size);
-        }
-    }
-    return false;
-}
-
-// ---- FIR low-pass filter for 32k -> 16k decimation ----
-
-std::vector<float> build_decimation_filter() {
-    // Kaiser windowed sinc, cutoff = 0.9 * Nyquist/2 = 0.9 * 8000/32000 = 0.225
-    // (normalized freq), 33 taps
-    const int ntaps = 33;
-    const double cutoff = 0.225;  // normalized to Nyquist (16kHz for 32k signal)
-    const double beta = 5.0;      // Kaiser beta
-
-    std::vector<float> h(ntaps);
-    int mid = ntaps / 2;
-
-    // Kaiser window: I0(beta * sqrt(1 - (2n/N)^2)) / I0(beta)
-    auto I0 = [](double x) {
-        double sum = 1.0, term = 1.0;
-        for (int k = 1; k < 50; ++k) {
-            term *= (x * x) / (4.0 * k * k);
-            sum += term;
-            if (term < 1e-12) break;
-        }
-        return sum;
-    };
-    double I0_beta = I0(beta);
-
-    for (int i = 0; i < ntaps; ++i) {
-        int n = i - mid;
-        double x = (n == 0) ? (2.0 * cutoff) : (std::sin(2.0 * M_PI * cutoff * n) / (M_PI * n));
-        double w = I0(beta * std::sqrt(1.0 - std::pow(2.0 * n / ntaps, 2))) / I0_beta;
-        h[i] = static_cast<float>(x * w);
-    }
-
-    // Normalize (unity gain at DC)
-    float sum = 0.0f;
-    for (float v : h) sum += v;
-    for (float& v : h) v /= sum;
-
-    return h;
-}
-
-// ---- Hann window ----
-
-// NOTE: hann_window_400 is no longer used; Hann is computed inline.
-// Keeping for reference but updated to periodic formula.
-
-// ---- Mel filterbank ----
 
 // Convert Hz to mel scale
 inline float hz_to_mel(float hz) {
@@ -121,9 +34,7 @@ inline float mel_to_hz(float mel) {
 }
 
 std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) {
-    // n_freq_bins = n_fft/2 + 1 = 201 for n_fft=400
     int n_freq = n_fft / 2 + 1;
-
     float mel_low = hz_to_mel(0.0f);
     float mel_high = hz_to_mel(static_cast<float>(sample_rate) / 2.0f);
 
@@ -150,76 +61,197 @@ std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) 
     return filters;
 }
 
-} // anonymous namespace
-
-// ============================================================
-// load_wav
-// ============================================================
-
-bool load_wav(const std::string& path, WavFile& wav, std::string* error) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        if (error) *error = "Cannot open: " + path;
+// Local loaders via dr_libs
+bool load_wav_dr(const std::string& path, AudioBuffer& audio, std::string* error) {
+    drwav wav;
+    if (!drwav_init_file(&wav, path.c_str(), nullptr)) {
+        if (error) *error = "Failed to init WAV file";
         return false;
     }
 
-    WavHeader hdr;
-    if (!read_wav_header(in, hdr)) {
-        if (error) *error = "Invalid WAV header: " + path;
-        return false;
-    }
-
-    wav.sample_rate = hdr.sample_rate;
-    wav.channels = hdr.num_channels;
-
-    if (hdr.audio_format == 0x0003) {
-        // IEEE float (f32le)
-        size_t num_samples = hdr.data_size / 4;
-        wav.samples.resize(num_samples);
-        in.read(reinterpret_cast<char*>(wav.samples.data()), hdr.data_size);
-    } else if (hdr.audio_format == 0x0001) {
-        // PCM s16le
-        size_t num_samples = hdr.data_size / 2;
-        std::vector<int16_t> raw(num_samples);
-        in.read(reinterpret_cast<char*>(raw.data()), hdr.data_size);
-        wav.samples.resize(num_samples);
-        for (size_t i = 0; i < num_samples; ++i) {
-            wav.samples[i] = static_cast<float>(raw[i]) / 32768.0f;
-        }
-    } else {
-        if (error)
-            *error = "Unsupported WAV format: " + std::to_string(hdr.audio_format);
-        return false;
-    }
-
+    audio.sample_rate = wav.sampleRate;
+    audio.channels = wav.channels;
+    audio.samples.resize(wav.totalPCMFrameCount * wav.channels);
+    
+    drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, audio.samples.data());
+    drwav_uninit(&wav);
     return true;
 }
 
-// ============================================================
-// resample_32k_to_16k
-// ============================================================
+bool load_mp3_dr(const std::string& path, AudioBuffer& audio, std::string* error) {
+    drmp3 mp3;
+    if (!drmp3_init_file(&mp3, path.c_str(), nullptr)) {
+        if (error) *error = "Failed to init MP3 file";
+        return false;
+    }
 
-void resample_32k_to_16k(const std::vector<float>& input,
-                         std::vector<float>& output) {
-    static const std::vector<float> fir = build_decimation_filter();
-    const int ntaps = static_cast<int>(fir.size());
-    const int mid = ntaps / 2;
-    const size_t n_in = input.size();
-
-    // Each output sample at 16kHz = every other sample at 32kHz after filtering
-    size_t n_out = n_in / 2;
-    output.resize(n_out);
-
-    for (size_t i = 0; i < n_out; ++i) {
-        int center = static_cast<int>(i) * 2;  // center position in 32kHz domain
-        float sum = 0.0f;
-        for (int t = 0; t < ntaps; ++t) {
-            int src_idx = center + t - mid;
-            if (src_idx >= 0 && src_idx < static_cast<int>(n_in)) {
-                sum += input[static_cast<size_t>(src_idx)] * fir[t];
-            }
+    audio.sample_rate = mp3.sampleRate;
+    audio.channels = mp3.channels;
+    
+    drmp3_uint64 total_pcm_frames = drmp3_get_pcm_frame_count(&mp3);
+    if (total_pcm_frames == 0) {
+        std::vector<float> temp_buffer;
+        std::vector<float> chunk(4096 * mp3.channels);
+        while (true) {
+            drmp3_uint64 read_frames = drmp3_read_pcm_frames_f32(&mp3, 4096, chunk.data());
+            if (read_frames == 0) break;
+            temp_buffer.insert(temp_buffer.end(), chunk.begin(), chunk.begin() + read_frames * mp3.channels);
         }
-        output[i] = sum;
+        audio.samples = std::move(temp_buffer);
+    } else {
+        audio.samples.resize(total_pcm_frames * mp3.channels);
+        drmp3_read_pcm_frames_f32(&mp3, total_pcm_frames, audio.samples.data());
+    }
+
+    drmp3_uninit(&mp3);
+    return true;
+}
+
+bool load_flac_dr(const std::string& path, AudioBuffer& audio, std::string* error) {
+    drflac* flac = drflac_open_file(path.c_str(), nullptr);
+    if (!flac) {
+        if (error) *error = "Failed to open FLAC file";
+        return false;
+    }
+
+    audio.sample_rate = flac->sampleRate;
+    audio.channels = flac->channels;
+    audio.samples.resize(flac->totalPCMFrameCount * flac->channels);
+
+    drflac_read_pcm_frames_f32(flac, flac->totalPCMFrameCount, audio.samples.data());
+    drflac_close(flac);
+    return true;
+}
+
+// Subprocess pipe decoding via ffmpeg
+bool load_via_ffmpeg(const std::string& path, AudioBuffer& audio, std::string* error) {
+    std::string cmd = "ffmpeg -v error -i \"" + path + "\" -f s16le -ac 1 -ar 16000 -";
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.c_str(), "rb");
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+
+    if (!pipe) {
+        if (error) *error = "Failed to open ffmpeg pipe";
+        return false;
+    }
+
+    std::vector<float> samples;
+    int16_t buffer[4096];
+    size_t count;
+    while ((count = fread(buffer, sizeof(int16_t), 4096, pipe)) > 0) {
+        for (size_t i = 0; i < count; ++i) {
+            samples.push_back(static_cast<float>(buffer[i]) / 32768.0f);
+        }
+    }
+
+#ifdef _WIN32
+    int exit_code = _pclose(pipe);
+#else
+    int exit_code = pclose(pipe);
+#endif
+
+    if (exit_code != 0 || samples.empty()) {
+        if (error) *error = "ffmpeg failed or executable not found (exit code: " + std::to_string(exit_code) + ")";
+        return false;
+    }
+
+    audio.sample_rate = 16000;
+    audio.channels = 1;
+    audio.samples = std::move(samples);
+    return true;
+}
+
+} // anonymous namespace
+
+// ============================================================
+// load_audio
+// ============================================================
+
+bool load_audio(const std::string& path, AudioBuffer& audio, std::string* error) {
+    std::string ext = "";
+    size_t idx = path.find_last_of('.');
+    if (idx != std::string::npos) {
+        ext = path.substr(idx + 1);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    }
+
+    std::string local_error = "";
+    if (ext == "mp3") {
+        if (load_mp3_dr(path, audio, &local_error)) return true;
+    } else if (ext == "wav") {
+        if (load_wav_dr(path, audio, &local_error)) return true;
+    } else if (ext == "flac") {
+        if (load_flac_dr(path, audio, &local_error)) return true;
+    }
+
+    // Attempt native format trial if unknown ext
+    if (ext != "mp3" && ext != "wav" && ext != "flac") {
+        if (load_wav_dr(path, audio, nullptr)) return true;
+        if (load_mp3_dr(path, audio, nullptr)) return true;
+        if (load_flac_dr(path, audio, nullptr)) return true;
+    }
+
+    // Fallback to FFmpeg pipe
+    std::string ffmpeg_error = "";
+    if (load_via_ffmpeg(path, audio, &ffmpeg_error)) {
+        return true;
+    }
+
+    if (error) {
+        *error = "Local decode failed (" + local_error + ") and FFmpeg fallback failed (" + ffmpeg_error + ")";
+    }
+    return false;
+}
+
+// ============================================================
+// load_wav (Compatibility wrapper)
+// ============================================================
+
+bool load_wav(const std::string& path, WavFile& wav, std::string* error) {
+    return load_audio(path, wav, error);
+}
+
+// ============================================================
+// resample_to_16k (Cubic spline interpolation)
+// ============================================================
+
+void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<float>& output) {
+    if (src_rate == 16000) {
+        output = input;
+        return;
+    }
+
+    double ratio = static_cast<double>(src_rate) / 16000.0;
+    size_t input_size = input.size();
+    size_t output_size = static_cast<size_t>(std::round(input_size / ratio));
+    output.resize(output_size);
+
+    auto get_sample = [&](int idx) -> float {
+        if (idx < 0) return input[0];
+        if (idx >= static_cast<int>(input_size)) return input[input_size - 1];
+        return input[idx];
+    };
+
+    for (size_t i = 0; i < output_size; ++i) {
+        double t = i * ratio;
+        int idx = static_cast<int>(std::floor(t));
+        double f = t - idx;
+
+        // Cubic spline Hermite interpolation (Catmull-Rom)
+        float y0 = get_sample(idx - 1);
+        float y1 = get_sample(idx);
+        float y2 = get_sample(idx + 1);
+        float y3 = get_sample(idx + 2);
+
+        float a0 = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+        float a1 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+        float a2 = -0.5f * y0 + 0.5f * y2;
+        float a3 = y1;
+
+        float val = static_cast<float>(((a0 * f + a1) * f + a2) * f + a3);
+        output[i] = val;
     }
 }
 
@@ -236,18 +268,9 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
     const int n_freq = n_fft / 2 + 1;  // 201
     const size_t n_samples = samples_16k.size();
 
-    // Pad audio to 30 seconds (480000 samples) to match WhisperFeatureExtractor
-    const int target_samples = 480000;
-    std::vector<float> padded_samples(target_samples, 0.0f);
-    size_t copy_len = std::min(n_samples, (size_t)target_samples);
-    std::copy(samples_16k.begin(), samples_16k.begin() + copy_len, padded_samples.begin());
-
-    // Number of frames with center=True: (n_padded) / hop + 1 = 3001, trim to 3000
-    int n_frames_raw = (target_samples) / hop_length + 1;  // 3001
-    int n_frames = std::min(n_frames_raw, 3000);  // 3000
-    // Actual frames: matches Python's feature_attention_mask.sum() = n_samples / hop
-    int actual_frames = static_cast<int>(n_samples) / hop_length;
-    if (actual_frames > n_frames) actual_frames = n_frames;
+    // 动态计算帧数。在 PyTorch（center=True）中，帧数为 n_samples / hop_length + 1
+    int n_frames = static_cast<int>(n_samples / hop_length + 1);
+    int actual_frames = n_frames;
 
     // Hann window (PyTorch default: periodic, cos(2*pi*n/N))
     std::vector<float> hann(n_fft);
@@ -265,9 +288,9 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
     // Right: idx >= N       → signal[2N-idx-2]  (idx=N→N-2, idx=N+1→N-3,...)
     auto reflect_idx = [&](int idx) -> int {
         if (idx < 0) return -idx;
-        if (idx >= target_samples) {
-            int over = idx - target_samples;
-            return target_samples - over - 2;
+        if (idx >= static_cast<int>(n_samples)) {
+            int over = idx - static_cast<int>(n_samples);
+            return static_cast<int>(n_samples) - over - 2;
         }
         return idx;
     };
@@ -284,7 +307,11 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
             float angle_step = -2.0f * static_cast<float>(M_PI) * k / n_fft;
             for (int n = 0; n < n_fft; ++n) {
                 int idx = reflect_idx(start + n);
-                float sample = padded_samples[idx] * hann[n];
+                // 边界保护：以防反射后仍然越界（在极其短的音频上可能出现）
+                if (idx < 0) idx = 0;
+                else if (idx >= static_cast<int>(n_samples)) idx = static_cast<int>(n_samples) - 1;
+
+                float sample = samples_16k[idx] * hann[n];
                 float angle = angle_step * n;
                 real_sum += sample * std::cos(angle);
                 imag_sum += sample * std::sin(angle);

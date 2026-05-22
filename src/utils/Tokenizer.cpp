@@ -240,6 +240,61 @@ bool Tokenizer::load(const std::string& model_dir) {
         }
     };
 
+    auto load_added_tokens_from_tokenizer_config_json = [&]() {
+        try {
+            const std::string tokenizer_config_path = model_dir + "/tokenizer_config.json";
+            std::ifstream tf(tokenizer_config_path, std::ios::binary);
+            if (!tf.is_open()) {
+                return;
+            }
+
+            std::string tc_str((std::istreambuf_iterator<char>(tf)),
+                                std::istreambuf_iterator<char>());
+            tf.close();
+
+            simdjson::padded_string tc_padded(tc_str);
+            simdjson::ondemand::parser tc_parser;
+            simdjson::ondemand::document tc_doc = tc_parser.iterate(tc_padded);
+
+            auto decoder_val = tc_doc["added_tokens_decoder"];
+            if (decoder_val.error() != simdjson::error_code::SUCCESS) {
+                return;
+            }
+            auto decoder_obj = decoder_val.get_object();
+            size_t loaded_count = 0;
+            for (auto field : decoder_obj) {
+                std::string_view id_str = field.unescaped_key();
+                auto token_obj = field.value().get_object();
+                
+                std::string_view content_view = token_obj["content"].get_string();
+                std::string tok_str(content_view);
+                
+                int64_t id = std::stoll(std::string(id_str));
+                
+                token_to_id_[tok_str] = static_cast<int>(id);
+                if (id >= static_cast<int64_t>(id_to_token_.size())) {
+                    id_to_token_.resize(static_cast<size_t>(id) + 1);
+                }
+                id_to_token_[static_cast<int>(id)] = tok_str;
+
+                bool is_special = false;
+                auto special_val = token_obj["special"];
+                if (special_val.error() == simdjson::error_code::SUCCESS) {
+                    is_special = special_val.get_bool();
+                }
+
+                if (is_special || tok_str == "<asr_text>" || tok_str == "<think>" || tok_str == "</think>") {
+                    special_tokens_[tok_str] = static_cast<int>(id);
+                }
+                loaded_count++;
+            }
+            AILA_LOG_INFO("[Tokenizer] Loaded %zu added tokens from tokenizer_config.json (total special tokens: %zu)",
+                          loaded_count, special_tokens_.size());
+        } catch (const std::exception& e) {
+            AILA_LOG_WARN("[Tokenizer] Could not load tokenizer_config.json added tokens: %s", e.what());
+        }
+    };
+
     bool loaded_base_tokenizer = false;
 
     try {
@@ -378,6 +433,7 @@ bool Tokenizer::load(const std::string& model_dir) {
     }
 
     load_special_tokens_from_tokenizer_json();
+    load_added_tokens_from_tokenizer_config_json();
 
     special_token_order_.reserve(special_tokens_.size());
     for (const auto& [token, _] : special_tokens_) {
@@ -696,8 +752,8 @@ std::string Tokenizer::decode(int token_id) const {
     const std::string& token = id_to_token_[token_id];
 
     if (special_tokens_.count(token)) {
-        // Keep think markers visible by default so users can observe CoT boundaries.
-        if (token == "<think>" || token == "</think>") {
+        // Keep think markers and ASR text tags visible so users and downstreams can parse them.
+        if (token == "<think>" || token == "</think>" || token == "<asr_text>") {
             return token;
         }
         return "";

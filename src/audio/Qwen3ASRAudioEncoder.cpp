@@ -12,15 +12,26 @@ namespace aila {
 namespace audio {
 
 // ---- helpers ----
+static void dump_tensor_f32(Context& ctx, Tensor& t, const std::string& filename) {
+    std::vector<bf16> dbg(t.numel());
+    ctx.memcpy_d2h(dbg.data(), t.data(), dbg.size() * sizeof(bf16));
+    ctx.synchronize();
+    std::vector<float> f32(dbg.size());
+    for (size_t i = 0; i < dbg.size(); ++i) {
+        f32[i] = (float)dbg[i];
+    }
+    std::ofstream ofs(filename, std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(f32.data()), f32.size() * sizeof(float));
+}
 
 static void nchw_to_ntch(Context& ctx, Tensor& src, Tensor& dst,
-                          int C, int H, int W) {
-    // src: [C*H*W] NCHW row-major (N=1)
-    // dst: [W, C*H] row-major
+                          int C, int H, int W_padded, int W_out) {
+    // src: [C*H*W_padded] NCHW row-major (N=1)
+    // dst: [W_out, C*H] row-major
     bf16* s = src.data_as<bf16>();
     bf16* d = dst.data_as<bf16>();
     int ch = C * H;
-    ctx.queue().parallel_for(sycl::range<1>(W * ch),
+    ctx.queue().parallel_for(sycl::range<1>(W_out * ch),
         [=](sycl::id<1> idx) {
             int i = static_cast<int>(idx[0]);
             int t = i / ch;        // w dimension → time
@@ -28,7 +39,7 @@ static void nchw_to_ntch(Context& ctx, Tensor& src, Tensor& dst,
             // NCHW: [n][c][h][w], n=0
             int c = r / H;
             int h = r % H;
-            int src_idx = ((c * H) + h) * W + t;
+            int src_idx = ((c * H) + h) * W_padded + t;
             d[i] = s[src_idx];
         });
 }
@@ -161,6 +172,9 @@ bool Qwen3ASRAudioEncoder::load(Context& ctx,
     proj1_.init(ctx, *proj1_weight, cfg.d_model, cfg.d_model);
     proj2_.init(ctx, *proj2_weight, cfg.d_model, cfg.output_dim);
 
+    proj1_bias_ = G("proj1.bias", false);
+    proj2_bias_ = G("proj2.bias", false);
+
     if (cfg.output_dim <= 0) {
         err("Invalid audio output_dim");
         return false;
@@ -180,6 +194,8 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         if (error_message) *error_message = "Audio encoder not loaded";
         return false;
     }
+
+    bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
 
     int d = cfg_.d_model;
     int ffn = cfg_.encoder_ffn_dim;
@@ -219,27 +235,39 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         int this_chunk_len = std::min(chunk_size, mel_time_len - chunk_start);
         int cw = chunk_out_lengths[ci];
 
-        // Copy chunk: mel_input({1,mel_bins,padded}) → chunk_mel({1,1,mel_bins,chunk_len})
+        // Copy chunk: mel_input({1,mel_bins,padded}) -> chunk_mel({1,1,mel_bins,chunk_size}) (always pad to chunk_size=100)
         int mel_row_len = mel_input.shape(2);
-        Tensor chunk_mel = Tensor::allocate(ctx, {1, 1, mel_bins, this_chunk_len});
+        int chunk_mel_w = chunk_size;
+        Tensor chunk_mel = Tensor::allocate(ctx, {1, 1, mel_bins, chunk_mel_w});
         {
             bf16* src_base = mel_input.data_as<bf16>();
             bf16* dst = chunk_mel.data_as<bf16>();
-            int ck = chunk_start, cl = this_chunk_len;
-            int mb = mel_bins, mrl = mel_row_len;
-            ctx.queue().parallel_for(sycl::range<1>(mb * cl), [=](sycl::id<1> idx) {
+            int ck = chunk_start;
+            int cl_eff = this_chunk_len;
+            int cl_pad = chunk_mel_w;
+            int mb = mel_bins;
+            int mrl = mel_row_len;
+            ctx.queue().parallel_for(sycl::range<1>(mb * cl_pad), [=](sycl::id<1> idx) {
                 int i = (int)idx[0];
-                int h = i / cl;
-                int w = i % cl;
-                dst[h * cl + w] = src_base[h * mrl + ck + w];
+                int h = i / cl_pad;
+                int w = i % cl_pad;
+                if (w < cl_eff) {
+                    dst[h * cl_pad + w] = src_base[h * mrl + ck + w];
+                } else {
+                    dst[h * cl_pad + w] = (bf16)0.0f;
+                }
             });
         }
 
         int c1_h = (mel_bins + 2 - 3) / 2 + 1;
-        int c1_w = (this_chunk_len + 2 - 3) / 2 + 1;
+        int c1_w = (chunk_mel_w + 2 - 3) / 2 + 1;
         Tensor c1_out = Tensor::allocate(ctx, {1, ds, c1_h, c1_w});
         ops::conv2d_gelu(ctx, chunk_mel, *conv2d1_weight_, *conv2d1_bias_,
-                         c1_out, 1, 1, ds, mel_bins, this_chunk_len, c1_h, c1_w);
+                         c1_out, 1, 1, ds, mel_bins, chunk_mel_w, c1_h, c1_w);
+
+        if (ci == 0 && dump_logits) {
+            dump_tensor_f32(ctx, c1_out, "debug_cpp_c1.bin");
+        }
 
         int c2_h = (c1_h + 2 - 3) / 2 + 1;
         int c2_w = (c1_w + 2 - 3) / 2 + 1;
@@ -252,17 +280,13 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         Tensor c3_out = Tensor::allocate(ctx, {1, ds, c3_h, c3_w});
         ops::conv2d_gelu(ctx, c2_out, *conv2d3_weight_, *conv2d3_bias_,
                          c3_out, 1, ds, ds, c2_h, c2_w, c3_h, c3_w);
-        if (ci == 0) { // save first chunk c3
-            std::vector<bf16> dbg(c3_out.numel());
-            ctx.memcpy_d2h(dbg.data(), c3_out.data(), dbg.size()*sizeof(bf16)); ctx.synchronize();
-            std::vector<float> f32(dbg.size()); for(size_t i=0;i<dbg.size();++i) f32[i]=(float)dbg[i];
-            std::ofstream ofs("debug_cpp_c3.bin",std::ios::binary);
-            int32_t hdr[4]={1,ds,c3_h,c3_w}; ofs.write((char*)hdr,16); ofs.write((char*)f32.data(),f32.size()*4);
+        if (ci == 0 && dump_logits) {
+            dump_tensor_f32(ctx, c3_out, "debug_cpp_c3.bin");
         }
 
         // Reshape + conv_out
         Tensor conv_flat = Tensor::allocate(ctx, {cw, conv_flat_dim});
-        nchw_to_ntch(ctx, c3_out, conv_flat, ds, c3_h, c3_w);
+        nchw_to_ntch(ctx, c3_out, conv_flat, ds, c3_h, c3_w, cw);
 
         // View of output buffer for this chunk
         bf16* out_ptr = all_conv_out.data_as<bf16>() + out_offset * d;
@@ -282,6 +306,10 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
     // Copy all_conv_out to enc_hidden_
     ops::copy_tensor(ctx, all_conv_out, enc_hidden_, audio_seq_len * d);
 
+    if (dump_logits) {
+        dump_tensor_f32(ctx, enc_hidden_, "debug_cpp_hidden_states_pre_encoder.bin");
+    }
+
     float ln_eps = 1e-5f;
     for (int i = 0; i < cfg_.encoder_layers; ++i) {
         auto& L = layers_[i];
@@ -297,9 +325,63 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         if (L.k_bias) ops::bias_add_inplace(ctx, enc_k_, *L.k_bias, audio_seq_len, d);
         if (L.v_bias) ops::bias_add_inplace(ctx, enc_v_, *L.v_bias, audio_seq_len, d);
 
-        ops::attention_bidi(ctx, enc_q_, enc_k_, enc_v_,
-                           enc_attn_out_, enc_scores_,
-                           audio_seq_len, heads, hd);
+        if (i == 0 && dump_logits) {
+            dump_tensor_f32(ctx, enc_q_, "debug_cpp_l0_q.bin");
+            dump_tensor_f32(ctx, enc_k_, "debug_cpp_l0_k.bin");
+            dump_tensor_f32(ctx, enc_v_, "debug_cpp_l0_v.bin");
+        }
+
+        // aftercnn_len = audio_seq_len: The actual model uses _get_feat_extract_output_lengths()
+        // which accounts for chunked processing and gives the same value as total_out (e.g., 135).
+        // This differs from the naive 3-layer stride-2 formula which incorrectly gives 130.
+        int aftercnn_len = audio_seq_len;
+
+        int block_size = 13 * (cfg_.n_window_infer / (cfg_.n_window * 2));
+        std::vector<int> cu_seqlens = {0};
+        {
+            int curr = 0;
+            while (curr < aftercnn_len) {
+                int this_block = std::min(block_size, aftercnn_len - curr);
+                curr += this_block;
+                cu_seqlens.push_back(curr);
+            }
+        }
+
+        for (size_t b = 0; b < cu_seqlens.size() - 1; ++b) {
+            int start = cu_seqlens[b];
+            int end = cu_seqlens[b + 1];
+            int len = end - start;
+
+            bf16* q_ptr = enc_q_.data_as<bf16>() + start * d;
+            bf16* k_ptr = enc_k_.data_as<bf16>() + start * d;
+            bf16* v_ptr = enc_v_.data_as<bf16>() + start * d;
+            bf16* out_ptr = enc_attn_out_.data_as<bf16>() + start * d;
+
+            Tensor q_block = Tensor::view(ctx, q_ptr, {len, d}, enc_q_.dtype());
+            Tensor k_block = Tensor::view(ctx, k_ptr, {len, d}, enc_k_.dtype());
+            Tensor v_block = Tensor::view(ctx, v_ptr, {len, d}, enc_v_.dtype());
+            Tensor out_block = Tensor::view(ctx, out_ptr, {len, d}, enc_attn_out_.dtype());
+            Tensor scores_block = Tensor::view(ctx, enc_scores_.data(), {heads, len, len}, enc_scores_.dtype());
+
+            ops::attention_bidi(ctx, q_block, k_block, v_block,
+                               out_block, scores_block,
+                               len, heads, hd);
+        }
+
+        if (audio_seq_len > aftercnn_len) {
+            bf16* out_ptr = enc_attn_out_.data_as<bf16>();
+            int rem_start = aftercnn_len;
+            int rem_end = audio_seq_len;
+
+            ctx.queue().parallel_for(sycl::range<1>((rem_end - rem_start) * d), [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                out_ptr[rem_start * d + i] = (bf16)0.0f;
+            });
+        }
+
+        if (i == 0 && dump_logits) {
+            dump_tensor_f32(ctx, enc_attn_out_, "debug_cpp_l0_attn_out.bin");
+        }
 
         L.out_proj.forward(ctx, enc_attn_out_, enc_normed_, audio_seq_len);
         if (L.out_bias) ops::bias_add_inplace(ctx, enc_normed_, *L.out_bias, audio_seq_len, d);
@@ -315,14 +397,29 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         L.fc2.forward(ctx, enc_ffn_, enc_normed_, audio_seq_len);
         if (L.fc2_bias) ops::bias_add_inplace(ctx, enc_normed_, *L.fc2_bias, audio_seq_len, d);
         ops::residual_add(ctx, enc_hidden_, enc_normed_, audio_seq_len * d);
+
+        if (dump_logits && (i == 0 || i == 1 || i == 2 || i == 11 || i == 23)) {
+            std::string fname = "debug_cpp_l" + std::to_string(i) + "_out.bin";
+            dump_tensor_f32(ctx, enc_hidden_, fname);
+        }
     }
 
     // Output projection
     ops::layer_norm(ctx, enc_hidden_, *ln_post_weight, *ln_post_bias,
                     ln_eps, enc_normed_, audio_seq_len, d);
     proj1_.forward(ctx, enc_normed_, enc_proj1_, audio_seq_len);
+    if (proj1_bias_) {
+        ops::bias_add_inplace(ctx, enc_proj1_, *proj1_bias_, audio_seq_len, d);
+    }
     ops::gelu_tanh_inplace(ctx, enc_proj1_, audio_seq_len * d);
     proj2_.forward(ctx, enc_proj1_, output_features, audio_seq_len);
+    if (proj2_bias_) {
+        ops::bias_add_inplace(ctx, output_features, *proj2_bias_, audio_seq_len, cfg_.output_dim);
+    }
+
+    if (dump_logits) {
+        dump_tensor_f32(ctx, output_features, "debug_cpp_af.bin");
+    }
 
     output_len = audio_seq_len;
     return true;

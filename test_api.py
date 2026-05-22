@@ -102,6 +102,7 @@ class AilaAPI:
         self._set("aila_generate_messages_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
 
         self._set("aila_free_string", None, [c_void_p])
+        self._set("aila_transcribe", c_void_p, [c_void_p, c_char_p, c_void_p, c_char_p, POINTER(c_char_p)])
 
         self._set("aila_set_log_callback", None, [LogCallback, c_void_p])
         self._set("aila_set_log_level", None, [c_int])
@@ -511,6 +512,72 @@ def test_stress_threaded_generation(api: AilaAPI, model_dir: str, max_seq: int):
         test(f"thread {i} result non-empty", r is not None and len(r) > 0, r[:60] if r else "None")
 
 
+def test_transcribe(api: AilaAPI, engine, model_path: str):
+    print("\n[Transcribe]")
+    cfg = api.aila_default_gen_config()
+    cfg.max_new_tokens = 64
+    cfg.do_sample = 0
+
+    wav_path = "./This is an English test.wav"
+    is_asr_model = "asr" in model_path.lower()
+
+    if not is_asr_model:
+        # Defense test for non-ASR models
+        lang_p = c_char_p()
+        out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, byref(lang_p))
+        test("transcribe on non-ASR model returns NULL", out_p is None)
+        err = api.aila_last_error_code(engine)
+        test("transcribe error code is RUNTIME (6)", err == 6) # RUNTIME
+        return
+
+    # Tests with ASR model
+    if not os.path.isfile(wav_path):
+        skip("transcribe test", f"audio file not found at {wav_path}")
+        return
+
+    # Test 1: Auto-detection (forced_language = None)
+    lang_p = c_char_p()
+    t0 = time.time()
+    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, byref(lang_p))
+    elapsed = time.time() - t0
+
+    test("transcribe (auto-detect) returns non-NULL", out_p is not None)
+    if out_p:
+        text = string_at(out_p).decode("utf-8", errors="replace")
+        test("transcribe text is clean (no 'language' or '<asr_text>')", "language" not in text and "<asr_text>" not in text)
+        test("transcribe text length > 0", len(text) > 0, f"{elapsed:.1f}s → {text[:80]!r}")
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(out_p)
+
+    test("language_out is not NULL", lang_p.value is not None)
+    if lang_p.value:
+        lang = lang_p.value.decode("utf-8")
+        test("detected language is English", lang == "English", f"lang={lang!r}")
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(lang_p)
+
+    # Test 2: Forced Language (forced_language = "English")
+    lang_p = c_char_p()
+    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), b"English", byref(lang_p))
+    test("transcribe (forced language) returns non-NULL", out_p is not None)
+    if out_p:
+        text = string_at(out_p).decode("utf-8", errors="replace")
+        test("forced transcribe text length > 0", len(text) > 0, f"text={text[:80]!r}")
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(out_p)
+
+    test("language_out for forced language is English", lang_p.value is not None)
+    if lang_p.value:
+        lang = lang_p.value.decode("utf-8")
+        test("forced language value is English", lang == "English", f"lang={lang!r}")
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(lang_p)
+
+    # Test 3: NULL safety
+    test("transcribe(NULL engine) returns NULL", api.aila_transcribe(None, wav_path.encode(), None, None, None) is None)
+    test("transcribe(NULL wav_path) returns NULL", api.aila_transcribe(engine, None, None, None, None) is None)
+
+
 def test_stress_long_prompt(api: AilaAPI, engine):
     print("\n[Stress — long prompt]")
     cfg = api.aila_default_gen_config()
@@ -586,21 +653,27 @@ def main():
         test("generate(NULL engine)", api.aila_generate(None, b"hi", None) is None)
         skip("model-dependent tests", "init failed")
     else:
-        test_generate_simple(api, engine)
-        test_generate_sampling(api, engine)
-        test_generate_messages(api, engine)
-        test_generate_no_think(api, engine)
-        test_generate_think(api, engine)
-        test_streaming(api, engine)
-        test_streaming_messages(api, engine)
-        test_streaming_abort(api, engine)
-        test_context_api(api, engine)
-        test_error_api(api, engine)
-        test_stress_long_prompt(api, engine)
+        is_asr_model = "asr" in args.model.lower()
+        if is_asr_model:
+            test_error_api(api, engine)
+            test_transcribe(api, engine, args.model)
+        else:
+            test_generate_simple(api, engine)
+            test_generate_sampling(api, engine)
+            test_generate_messages(api, engine)
+            test_generate_no_think(api, engine)
+            test_generate_think(api, engine)
+            test_streaming(api, engine)
+            test_streaming_messages(api, engine)
+            test_streaming_abort(api, engine)
+            test_context_api(api, engine)
+            test_error_api(api, engine)
+            test_transcribe(api, engine, args.model)
+            test_stress_long_prompt(api, engine)
 
-        if not args.quick:
-            test_stress_create_destroy(api)
-            test_stress_threaded_generation(api, args.model, args.max_seq)
+            if not args.quick:
+                test_stress_create_destroy(api)
+                test_stress_threaded_generation(api, args.model, args.max_seq)
 
         api.aila_engine_destroy(engine)
 

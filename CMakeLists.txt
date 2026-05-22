@@ -98,6 +98,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/audio)
 include_directories(${PROJECT_SOURCE_DIR}/src/bench)
 include_directories(${PROJECT_SOURCE_DIR}/src/lora)
 include_directories(${PROJECT_SOURCE_DIR}/src)
+include_directories(${PROJECT_SOURCE_DIR}/third_party/dr_libs)
 
 # ============================================================
 # Dependencies

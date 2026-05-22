@@ -198,4 +198,28 @@ AILA_API int aila_last_error_code(AilaEngine* engine);
  */
 AILA_API const char* aila_last_error_message(AilaEngine* engine);
 
+/**
+ * Transcribe audio file (blocking).
+ * Supports WAV, MP3, FLAC, and other formats handled by the engine.
+ * @param engine           Initialized engine handle (configured with Qwen3-ASR model)
+ * @param wav_path         Path to the audio file
+ * @param config           Generation config (NULL for defaults)
+ * @param forced_language  Optional language name to force (e.g. "Chinese", "English").
+ *                         Set to NULL or "" to enable auto-detection.
+ * @param language_out     If not NULL, receives a newly allocated UTF-8 string containing the
+ *                         recognized language name (e.g. "Chinese", "English").
+ *                         Caller must free this string with aila_free_string().
+ *                         If an error occurs, sets *language_out to NULL.
+ * @return Newly allocated UTF-8 string containing the clean transcription text.
+ *         Caller must free the returned string with aila_free_string().
+ *         Returns NULL on error.
+ */
+AILA_API char* aila_transcribe(
+    AilaEngine* engine,
+    const char* wav_path,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    char** language_out
+);
+
 #endif /* AILA_API_H */

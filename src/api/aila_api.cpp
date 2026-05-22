@@ -234,3 +234,71 @@ AILA_API const char* aila_last_error_message(AilaEngine* engine) {
     if (!engine) return kEmpty;
     return engine->engine.last_error_message().c_str();
 }
+
+AILA_API char* aila_transcribe(
+    AilaEngine* engine,
+    const char* wav_path,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    char** language_out
+) {
+    if (language_out) {
+        *language_out = nullptr;
+    }
+    if (!engine || !wav_path) {
+        return nullptr;
+    }
+
+    try {
+        GenerationConfig cfg = to_cpp_config(config);
+        std::string cpp_lang;
+        std::string cpp_forced = forced_language ? forced_language : "";
+
+        std::string result = engine->engine.transcribe(
+            std::string(wav_path),
+            cfg,
+            &cpp_lang,
+            cpp_forced
+        );
+
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return nullptr;
+        }
+
+        // Return recognized language if requested
+        if (language_out && !cpp_lang.empty()) {
+            char* out_lang = static_cast<char*>(malloc(cpp_lang.size() + 1));
+            if (out_lang) {
+                memcpy(out_lang, cpp_lang.c_str(), cpp_lang.size() + 1);
+                *language_out = out_lang;
+            }
+        }
+
+        // Return transcript text
+        char* out_text = static_cast<char*>(malloc(result.size() + 1));
+        if (!out_text) {
+            // Cleanup language string if allocated
+            if (language_out && *language_out) {
+                free(*language_out);
+                *language_out = nullptr;
+            }
+            return nullptr;
+        }
+        memcpy(out_text, result.c_str(), result.size() + 1);
+        return out_text;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Transcribe failed: %s", e.what());
+        if (language_out && *language_out) {
+            free(*language_out);
+            *language_out = nullptr;
+        }
+        return nullptr;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Transcribe failed: unknown exception");
+        if (language_out && *language_out) {
+            free(*language_out);
+            *language_out = nullptr;
+        }
+        return nullptr;
+    }
+}

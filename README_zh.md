@@ -252,6 +252,7 @@ Aila/
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel 深度神经网络库，提供 bf16 推理所用的矩阵乘法原语
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 量化格式和反量化参考实现
 - **[simdjson](https://github.com/simdjson/simdjson)** — 高性能 JSON 解析器，用于模型配置和分词器元数据
+- **[dr_libs](https://github.com/mackron/dr_libs)** — 单文件头音频解码库（`dr_wav`、`dr_mp3`、`dr_flac`），用于 ASR 音频预处理
 
 ## 📄 许可证
 

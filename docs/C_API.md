@@ -138,6 +138,27 @@ typedef int (*AilaTokenCallback)(const char* token_text, void* user_data);
 - `token_text` — UTF-8 token string, valid only during the callback
 - Return `0` to continue, non-zero to abort generation
 
+### Audio Transcription (ASR)
+
+#### `aila_transcribe`
+
+```c
+char* aila_transcribe(AilaEngine* engine, const char* wav_path,
+                      const AilaGenConfig* config,
+                      const char* forced_language,
+                      char** language_out);
+```
+
+Transcribes an audio file (blocking). Supports WAV, MP3, FLAC, and other audio formats.
+If the loaded model does not support ASR (i.e. not configured with Qwen3-ASR model), the call will be gracefully intercepted, returning `NULL` and setting the error code to `AILA_ERR_RUNTIME` (6).
+
+- `wav_path` — Path to the audio file.
+- `config` — Generation configuration (can be `NULL` for defaults).
+- `forced_language` — Optional language name to force (e.g., `"Chinese"`, `"English"`). Set to `NULL` or `""` for auto-detection.
+- `language_out` — If not `NULL`, receives a newly allocated UTF-8 string containing the recognized/forced language name (e.g., `"Chinese"`, `"English"`). The caller **must** free this string with `aila_free_string()`.
+
+Returns a newly allocated UTF-8 string containing the clean transcription text (stripped of control tags like `<asr_text>` and language prefixes). The caller **must** free the returned string with `aila_free_string()`. Returns `NULL` on error.
+
 ### Memory Management
 
 #### `aila_free_string`
@@ -295,6 +316,8 @@ lib.aila_engine_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.aila_engine_init.restype = ctypes.c_int
 lib.aila_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 lib.aila_generate.restype = ctypes.c_void_p
+lib.aila_transcribe.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+lib.aila_transcribe.restype = ctypes.c_void_p
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
 
@@ -341,6 +364,7 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern IntPtr aila_engine_create();
     [DllImport("AilaShared.dll")] static extern int aila_engine_init(IntPtr e, string dir, int maxSeq);
     [DllImport("AilaShared.dll")] static extern IntPtr aila_generate(IntPtr e, string prompt, ref AilaGenConfig cfg);
+    [DllImport("AilaShared.dll")] static extern IntPtr aila_transcribe(IntPtr e, string wavPath, ref AilaGenConfig cfg, string forcedLang, out IntPtr langOut);
     [DllImport("AilaShared.dll")] static extern void aila_free_string(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_engine_destroy(IntPtr e);
     // ... etc
@@ -359,6 +383,13 @@ extern "C" {
     fn aila_engine_create() -> *mut c_void;
     fn aila_engine_init(engine: *mut c_void, model_dir: *const c_char, max_seq: c_int) -> c_int;
     fn aila_generate(engine: *mut c_void, prompt: *const c_char, config: *const AilaGenConfig) -> *mut c_char;
+    fn aila_transcribe(
+        engine: *mut c_void,
+        wav_path: *const c_char,
+        config: *const AilaGenConfig,
+        forced_language: *const c_char,
+        language_out: *mut *mut c_char,
+    ) -> *mut c_char;
     fn aila_free_string(s: *mut c_char);
     fn aila_engine_destroy(engine: *mut c_void);
 }

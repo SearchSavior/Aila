@@ -76,6 +76,8 @@ private:
     Tensor* ln_post_weight = nullptr;
     Tensor* ln_post_bias = nullptr;
     Linear proj1_, proj2_;
+    Tensor* proj1_bias_ = nullptr;
+    Tensor* proj2_bias_ = nullptr;
 
     // Runtime buffers (reallocated as needed)
     Tensor conv_buf_a_;   // intermediate conv output
