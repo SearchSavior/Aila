@@ -240,6 +240,11 @@ AILA_API char* aila_transcribe(
     const char* wav_path,
     const AilaGenConfig* config,
     const char* forced_language,
+    const char* system_prompt,
+    float segment_sec,
+    int past_text_conditioning,
+    AilaTokenCallback token_callback,
+    void* user_data,
     char** language_out
 ) {
     if (language_out) {
@@ -253,12 +258,25 @@ AILA_API char* aila_transcribe(
         GenerationConfig cfg = to_cpp_config(config);
         std::string cpp_lang;
         std::string cpp_forced = forced_language ? forced_language : "";
+        std::string cpp_sys = system_prompt ? system_prompt : "";
+        bool cpp_past = (past_text_conditioning != 0);
+
+        std::function<void(const std::string&)> token_cb = nullptr;
+        if (token_callback) {
+            token_cb = [=](const std::string& token_text) {
+                token_callback(token_text.c_str(), user_data);
+            };
+        }
 
         std::string result = engine->engine.transcribe(
             std::string(wav_path),
             cfg,
             &cpp_lang,
-            cpp_forced
+            cpp_forced,
+            cpp_sys,
+            segment_sec,
+            cpp_past,
+            token_cb
         );
 
         if (engine->engine.last_error_code() != EngineErrorCode::Ok) {

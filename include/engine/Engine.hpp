@@ -1864,11 +1864,50 @@ public:
     // Raw prefill for benchmark (no decode, no history)
     // ============================================================
 
+    static int find_split_point(const float* samples, int n_samples, int target_sample, float search_sec) {
+        int search_half = static_cast<int>(search_sec * 16000);
+        int lo = target_sample - search_half;
+        int hi = target_sample + search_half;
+        if (lo < 0) lo = 0;
+        if (hi > n_samples) hi = n_samples;
+
+        int win_samples = 1600; // 100ms at 16kHz
+        float best_energy = 1e30f;
+        int best_center = target_sample;
+
+        for (int pos = lo; pos + win_samples <= hi; pos += win_samples / 2) {
+            float energy = 0.0f;
+            int end = pos + win_samples;
+            if (end > n_samples) end = n_samples;
+            for (int j = pos; j < end; j++) {
+                energy += samples[j] * samples[j];
+            }
+            energy /= (end - pos);
+            if (energy < best_energy) {
+                best_energy = energy;
+                best_center = pos + (end - pos) / 2;
+            }
+        }
+        return best_center;
+    }
+
+    static bool should_insert_boundary_space(int prev_ch, int next_ch) {
+        if (prev_ch <= 0 || next_ch <= 0) return false;
+        if (std::isspace(static_cast<unsigned char>(prev_ch))) return false;
+        if (std::isspace(static_cast<unsigned char>(next_ch))) return false;
+        if (std::ispunct(static_cast<unsigned char>(next_ch))) return false;
+        return true;
+    }
+
     // ASR transcription from WAV file
     std::string transcribe(const std::string& wav_path,
                            const GenerationConfig& gen_config = GenerationConfig(),
                            std::string* language_out = nullptr,
-                           const std::string& forced_language = "") {
+                           const std::string& forced_language = "",
+                           const std::string& system_prompt = "",
+                           float segment_sec = 0.0f,
+                           bool past_text_conditioning = false,
+                           std::function<void(const std::string&)> token_callback = nullptr) {
         using bf16 = sycl::ext::oneapi::bfloat16;
         clear_error();
 
@@ -1877,210 +1916,275 @@ public:
             return "";
         }
 
-        // 1. Audio preprocessing: pure C++ mel spectrogram
-        MelSpectrogram mel;
+        // 1. Audio preprocessing: load wav, convert to mono and resample to 16kHz
         AILA_LOG_INFO("[Transcribe] Loading audio: %s", wav_path.c_str());
+        AudioBuffer audio;
         std::string preprocess_error;
-        if (!wav_to_mel(wav_path, mel, &preprocess_error)) {
-            set_error(EngineErrorCode::RuntimeError, "Audio preprocessing failed: " + preprocess_error);
+        if (!load_audio(wav_path, audio, &preprocess_error)) {
+            set_error(EngineErrorCode::RuntimeError, "Audio loading failed: " + preprocess_error);
             return "";
         }
-        AILA_LOG_INFO("[Transcribe] Mel: %d frames x %d bins, actual=%d", mel.n_frames, mel.n_mels, mel.actual_frames);
 
-        // 2. Upload mel to GPU — transpose from frame-major (F×M) to NCHW (1×M×F)
-        int mel_padded_frames = mel.n_frames;
-        int mel_actual_frames = mel.actual_frames;
-        int nM = mel.n_mels;
-        // Transpose: src[frame*nM + mel] → dst[mel*padded + frame] (NCHW layout)
-        std::vector<bf16> mel_bf16(static_cast<size_t>(mel_padded_frames) * nM);
-        for (int f = 0; f < mel_padded_frames; ++f)
-            for (int m = 0; m < nM; ++m)
-                mel_bf16[m * mel_padded_frames + f] = bf16(mel.data[f * nM + m]);
-
-        Tensor mel_device = Tensor::allocate(*ctx_, {1, nM, mel_padded_frames});
-        ctx_->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(bf16));
-
-        {
-            static bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
-            if (dump_logits) {
-                std::vector<float> mel_f32(mel_bf16.size());
-                for (size_t i = 0; i < mel_bf16.size(); ++i) {
-                    mel_f32[i] = static_cast<float>(mel_bf16[i]);
-                }
-                std::ofstream lf("debug_cpp_mel.bin", std::ios::binary);
-                lf.write(reinterpret_cast<const char*>(mel_f32.data()), mel_f32.size() * sizeof(float));
-                AILA_LOG_INFO("[Transcribe] Dumped prefill mel");
+        std::vector<float> mono;
+        if (audio.channels > 1) {
+            mono.resize(audio.samples.size() / audio.channels);
+            for (size_t i = 0; i < mono.size(); ++i) {
+                float sum = 0.0f;
+                for (int c = 0; c < audio.channels; ++c)
+                    sum += audio.samples[i * audio.channels + c];
+                mono[i] = sum / static_cast<float>(audio.channels);
             }
+        } else {
+            mono = std::move(audio.samples);
         }
 
-        // 3. Audio encoder (GPU)
-        int audio_len = 0;
-        int od = model_spec_.audio.output_dim;
-        int max_audio_len = ((mel_actual_frames + 99) / 100) * 13 + 32;
-        Tensor af_tmp = Tensor::allocate(*ctx_, {max_audio_len, od});
-        std::string enc_error;
-        if (!audio_encoder_->encode(*ctx_, mel_device, mel_actual_frames,
-                                     af_tmp, audio_len, &enc_error)) {
-            set_error(EngineErrorCode::RuntimeError, "Audio encoding failed: " + enc_error);
-            return "";
-        }
-        Tensor audio_features = Tensor::allocate(*ctx_, {audio_len, od});
-        bf16* af_dst = audio_features.data_as<bf16>();
-        bf16* af_src = af_tmp.data_as<bf16>();
-        ctx_->queue().memcpy(af_dst, af_src, static_cast<size_t>(audio_len) * od * sizeof(bf16));
-        AILA_LOG_INFO("[Transcribe] Audio encoded: %d tokens", audio_len);
+        std::vector<float> mono_16k;
+        resample_to_16k(mono, audio.sample_rate, mono_16k);
+        int audio_n_samples = static_cast<int>(mono_16k.size());
+        AILA_LOG_INFO("[Transcribe] Mono 16kHz audio: %d samples (%.1f seconds)", audio_n_samples, static_cast<float>(audio_n_samples) / 16000.0f);
 
-        // 4. Build prompt tokens using tokenizer for text content
+        // 2. Segment detection
+        float search_sec = 3.0f;
+        if (search_sec > segment_sec / 2.0f) search_sec = segment_sec / 2.0f;
+        int target_samples = static_cast<int>(segment_sec * 16000);
+        int margin_samples = static_cast<int>(search_sec * 16000);
+
+        std::vector<int> splits;
+        splits.push_back(0);
+        if (segment_sec <= 0.0f || audio_n_samples <= target_samples + margin_samples) {
+            splits.push_back(audio_n_samples);
+        } else {
+            int pos = 0;
+            while (pos + target_samples + margin_samples < audio_n_samples) {
+                int split = find_split_point(mono_16k.data(), audio_n_samples, pos + target_samples, search_sec);
+                splits.push_back(split);
+                pos = split;
+            }
+            splits.push_back(audio_n_samples);
+        }
+        AILA_LOG_INFO("[Transcribe] Splitting audio into %zu segment(s)", splits.size() - 1);
+
+        std::string accumulated_result = "";
+        std::string first_seg_lang = "";
+        int min_samples = 8000; // 0.5s minimum padding
+
         int audio_start_id = model_spec_.audio_start_token_id;
         int audio_end_id   = model_spec_.audio_end_token_id;
         int audio_pad_id   = model_spec_.audio_token_id;
         int im_start_id    = config_.im_start_id;
         int im_end_id      = config_.im_end_id;
 
-        std::vector<int> prompt_ids;
-        auto add_text = [&](const std::string& t) {
-            auto ids = tokenizer_.encode(t);
-            prompt_ids.insert(prompt_ids.end(), ids.begin(), ids.end());
-        };
+        for (size_t s = 0; s < splits.size() - 1; ++s) {
+            int seg_start = splits[s];
+            int seg_end = splits[s + 1];
+            int seg_samples = seg_end - seg_start;
 
-        // <|im_start|>system\n<|im_end|>\n  (empty system prompt for ASR)
-        prompt_ids.push_back(im_start_id);
-        add_text("system\n");
-        prompt_ids.push_back(im_end_id);
-        add_text("\n");
-
-        // <|im_start|>user\n<|audio_start|><|audio_pad|>xN<|audio_end|>\n<|im_end|>\n
-        prompt_ids.push_back(im_start_id);
-        add_text("user\n");
-        prompt_ids.push_back(audio_start_id);
-        for (int i = 0; i < audio_len; ++i) prompt_ids.push_back(audio_pad_id);
-        prompt_ids.push_back(audio_end_id);
-        add_text("\n");
-        prompt_ids.push_back(im_end_id);
-        add_text("\n");
-
-        // <|im_start|>assistant\n
-        prompt_ids.push_back(im_start_id);
-        add_text("assistant\n");
-        if (!forced_language.empty()) {
-            std::string normalized_forced = aila_asr::normalize_language_name(forced_language);
-            add_text("language " + normalized_forced);
-            int asr_text_id = tokenizer_.special_token_id("<asr_text>");
-            if (asr_text_id != -1) {
-                prompt_ids.push_back(asr_text_id);
+            std::vector<float> seg_buf(mono_16k.begin() + seg_start, mono_16k.begin() + seg_end);
+            if (seg_samples < min_samples) {
+                seg_buf.resize(min_samples, 0.0f);
             }
-        }
-        AILA_LOG_INFO("[Transcribe] Prompt: %zu tokens", prompt_ids.size());
 
-        // 5. Download audio features and set overrides
-        std::vector<bf16> audio_bf16(static_cast<size_t>(audio_len) * model_spec_.audio.output_dim);
-        ctx_->memcpy_d2h(audio_bf16.data(), audio_features.data(), audio_bf16.size() * sizeof(bf16));
-        ctx_->synchronize();
-
-        {
-            static bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
-            if (dump_logits) {
-                std::vector<float> af_f32(audio_bf16.size());
-                for (size_t i = 0; i < audio_bf16.size(); ++i) {
-                    af_f32[i] = static_cast<float>(audio_bf16[i]);
-                }
-                std::ofstream lf("debug_cpp_af.bin", std::ios::binary);
-                lf.write(reinterpret_cast<const char*>(af_f32.data()), af_f32.size() * sizeof(float));
-                AILA_LOG_INFO("[Transcribe] Dumped prefill audio features");
+            // 2.1 Compute Mel spectrogram for the segment
+            MelSpectrogram mel;
+            std::string prep_err;
+            if (!compute_mel_spectrogram(seg_buf, mel, &prep_err)) {
+                set_error(EngineErrorCode::RuntimeError, "Segment spectrogram failed: " + prep_err);
+                return "";
             }
-        }
 
-        std::vector<int> pad_positions;
-        for (size_t i = 0; i < prompt_ids.size(); ++i)
-            if (prompt_ids[i] == audio_pad_id) pad_positions.push_back(static_cast<int>(i));
-        // 6. Reset backend state BEFORE setting overrides/positions
-        backend_->reset();
-        cached_ids_.clear();
+            // 2.2 Upload Mel to GPU and run Audio Encoder
+            int mel_padded_frames = mel.n_frames;
+            int mel_actual_frames = mel.actual_frames;
+            int nM = mel.n_mels;
+            std::vector<bf16> mel_bf16(static_cast<size_t>(mel_padded_frames) * nM);
+            for (int f = 0; f < mel_padded_frames; ++f)
+                for (int m = 0; m < nM; ++m)
+                    mel_bf16[m * mel_padded_frames + f] = bf16(mel.data[f * nM + m]);
 
-        backend_->set_embedding_overrides(pad_positions, audio_bf16, model_spec_.audio.output_dim);
-        AILA_LOG_INFO("[Transcribe] Overrides set: %zu positions", pad_positions.size());
+            Tensor mel_device = Tensor::allocate(*ctx_, {1, nM, mel_padded_frames});
+            ctx_->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(bf16));
 
-        // 7. MRoPE positions (can be disabled via AILA_NO_MROPE=1 for debugging)
-        if (!aila::env::read_flag("AILA_NO_MROPE", false)) {
-            int total_len = static_cast<int>(prompt_ids.size());
-            std::vector<int> pos_t(total_len), pos_h(total_len), pos_w(total_len);
-            for (int i = 0; i < total_len; ++i) {
-                pos_t[i] = i; pos_h[i] = i; pos_w[i] = i;
+            int audio_len = 0;
+            int od = model_spec_.audio.output_dim;
+            int max_audio_len = ((mel_actual_frames + 99) / 100) * 13 + 32;
+            Tensor af_tmp = Tensor::allocate(*ctx_, {max_audio_len, od});
+            std::string enc_error;
+            if (!audio_encoder_->encode(*ctx_, mel_device, mel_actual_frames,
+                                         af_tmp, audio_len, &enc_error)) {
+                set_error(EngineErrorCode::RuntimeError, "Audio encoding failed: " + enc_error);
+                return "";
             }
-            backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, 0);
-            AILA_LOG_INFO("[Transcribe] MRoPE positions set");
-        } else {
-            AILA_LOG_INFO("[Transcribe] MRoPE disabled (AILA_NO_MROPE=1)");
-        }
+            Tensor audio_features = Tensor::allocate(*ctx_, {audio_len, od});
+            bf16* af_dst = audio_features.data_as<bf16>();
+            bf16* af_src = af_tmp.data_as<bf16>();
+            ctx_->queue().memcpy(af_dst, af_src, static_cast<size_t>(audio_len) * od * sizeof(bf16));
 
-        // 8. Prefill
-        int* device_ids = static_cast<int*>(ctx_->alloc_device(prompt_ids.size() * sizeof(int)));
-        ctx_->memcpy_h2d_async(device_ids, prompt_ids.data(), prompt_ids.size() * sizeof(int));
-        GenerationConfig tuned_gen = gen_config;
-        if (tuned_gen.max_new_tokens <= 0) tuned_gen.max_new_tokens = 256;
-
-        int prompt_len = static_cast<int>(prompt_ids.size());
-        AILA_LOG_INFO("[Transcribe] Prefill: %d tokens", prompt_len);
-        Tensor* logits_ptr = &backend_->forward(*ctx_, device_ids, prompt_len);
-        ctx_->free_device(device_ids);
-
-        // Debug: dump prefill logits for 1.7B comparison
-        static bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
-        if (dump_logits) {
+            std::vector<bf16> audio_bf16(static_cast<size_t>(audio_len) * model_spec_.audio.output_dim);
+            ctx_->memcpy_d2h(audio_bf16.data(), audio_features.data(), audio_bf16.size() * sizeof(bf16));
             ctx_->synchronize();
-            std::vector<float> lvec(config_.vocab_size);
-            if (logits_ptr->dtype() == dnnl::memory::data_type::f32)
-                ctx_->memcpy_d2h(lvec.data(), logits_ptr->data(), lvec.size() * sizeof(float));
-            else {
-                std::vector<bf16> tmp(config_.vocab_size);
-                ctx_->memcpy_d2h(tmp.data(), logits_ptr->data(), tmp.size() * sizeof(bf16));
-                for (int vi=0;vi<config_.vocab_size;++vi) lvec[vi]=(float)tmp[vi];
+
+            // Collapse guard loop
+            bool use_past = past_text_conditioning;
+            int retry_count = 0;
+            std::string seg_text = "";
+            std::string seg_lang = "";
+
+            while (retry_count < 2) {
+                std::vector<int> prompt_ids;
+                auto add_text = [&](const std::string& t) {
+                    auto ids = tokenizer_.encode(t);
+                    prompt_ids.insert(prompt_ids.end(), ids.begin(), ids.end());
+                };
+
+                // <|im_start|>system\n[system prompt]\n<|im_end|>\n
+                prompt_ids.push_back(im_start_id);
+                add_text("system\n");
+                if (!system_prompt.empty()) {
+                    add_text(system_prompt);
+                }
+                prompt_ids.push_back(im_end_id);
+                add_text("\n");
+
+                // <|im_start|>user\n<|audio_start|><|audio_pad|>xN<|audio_end|>\n<|im_end|>\n
+                prompt_ids.push_back(im_start_id);
+                add_text("user\n");
+                prompt_ids.push_back(audio_start_id);
+                for (int i = 0; i < audio_len; ++i) prompt_ids.push_back(audio_pad_id);
+                prompt_ids.push_back(audio_end_id);
+                add_text("\n");
+                prompt_ids.push_back(im_end_id);
+                add_text("\n");
+
+                // <|im_start|>assistant\n
+                prompt_ids.push_back(im_start_id);
+                add_text("assistant\n");
+
+                if (!forced_language.empty()) {
+                    std::string normalized_forced = aila_asr::normalize_language_name(forced_language);
+                    add_text("language " + normalized_forced);
+                    int asr_text_id = tokenizer_.special_token_id("<asr_text>");
+                    if (asr_text_id != -1) {
+                        prompt_ids.push_back(asr_text_id);
+                    }
+                }
+
+                if (use_past && !accumulated_result.empty()) {
+                    std::vector<int> past_ids = tokenizer_.encode(accumulated_result);
+                    prompt_ids.insert(prompt_ids.end(), past_ids.begin(), past_ids.end());
+                    int asr_text_id = tokenizer_.special_token_id("<asr_text>");
+                    if (asr_text_id != -1) {
+                        prompt_ids.push_back(asr_text_id);
+                    }
+                }
+
+                std::vector<int> pad_positions;
+                for (size_t i = 0; i < prompt_ids.size(); ++i)
+                    if (prompt_ids[i] == audio_pad_id) pad_positions.push_back(static_cast<int>(i));
+
+                backend_->reset();
+                cached_ids_.clear();
+                backend_->set_embedding_overrides(pad_positions, audio_bf16, model_spec_.audio.output_dim);
+
+                if (!aila::env::read_flag("AILA_NO_MROPE", false)) {
+                    int total_len = static_cast<int>(prompt_ids.size());
+                    std::vector<int> pos_t(total_len), pos_h(total_len), pos_w(total_len);
+                    for (int i = 0; i < total_len; ++i) {
+                        pos_t[i] = i; pos_h[i] = i; pos_w[i] = i;
+                    }
+                    backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, 0);
+                }
+
+                int* device_ids = static_cast<int*>(ctx_->alloc_device(prompt_ids.size() * sizeof(int)));
+                ctx_->memcpy_h2d_async(device_ids, prompt_ids.data(), prompt_ids.size() * sizeof(int));
+                GenerationConfig tuned_gen = gen_config;
+                if (tuned_gen.max_new_tokens <= 0) tuned_gen.max_new_tokens = 256;
+
+                int prompt_len = static_cast<int>(prompt_ids.size());
+                Tensor* logits_ptr = &backend_->forward(*ctx_, device_ids, prompt_len);
+                ctx_->free_device(device_ids);
+
+                if (backend_->supports_vision_embedding_override())
+                    backend_->clear_mrope_positions();
+
+                std::vector<int> generated_ids;
+                int* one_token_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                for (int step = 0; step < tuned_gen.max_new_tokens; ++step) {
+                    int next_token;
+                    if (!tuned_gen.do_sample) {
+                        int* argmax_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                        ops::argmax(*ctx_, *logits_ptr, config_.vocab_size, argmax_dev);
+                        ctx_->memcpy_d2h(&next_token, argmax_dev, sizeof(int));
+                        ctx_->free_device(argmax_dev);
+                    } else {
+                        next_token = ops::sample_with_config(*ctx_, *logits_ptr, config_.vocab_size,
+                                                             tuned_gen, generated_ids);
+                    }
+
+                    if (next_token == config_.eos_token_id || next_token == config_.im_end_id) break;
+                    generated_ids.push_back(next_token);
+                    ctx_->memcpy_h2d(one_token_dev, &next_token, sizeof(int));
+                    logits_ptr = &backend_->forward(*ctx_, one_token_dev, 1);
+                }
+                ctx_->free_device(one_token_dev);
+
+                std::string raw = tokenizer_.decode(generated_ids);
+                aila_asr::parse_asr_output(raw, forced_language, seg_lang, seg_text);
+
+                // Collapse detection: if core audio is long (>= 8s) and we generated too few tokens
+                bool collapse = false;
+                if (use_past && !accumulated_result.empty()) {
+                    float core_sec = static_cast<float>(seg_end - seg_start) / 16000.0f;
+                    if (core_sec >= 8.0f) {
+                        int min_tokens = static_cast<int>(core_sec * 1.75f);
+                        if (min_tokens < 12) min_tokens = 12;
+                        if (static_cast<int>(generated_ids.size()) < min_tokens) {
+                            collapse = true;
+                        }
+                    }
+                }
+
+                if (collapse) {
+                    AILA_LOG_WARN("[Transcribe] Collapse detected in segment %zu (tokens=%zu). Retrying without past text history.", s, generated_ids.size());
+                    use_past = false;
+                    retry_count++;
+                    continue;
+                }
+                break;
             }
-            std::ofstream lf("debug_cpp_logits.bin", std::ios::binary);
-            lf.write(reinterpret_cast<const char*>(lvec.data()), lvec.size() * sizeof(float));
-            AILA_LOG_INFO("[Transcribe] Dumped prefill logits");
-        }
 
-        if (backend_->supports_vision_embedding_override())
-            backend_->clear_mrope_positions();
-
-        // Decode loop
-        std::vector<int> generated_ids;
-        int* one_token_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        for (int step = 0; step < tuned_gen.max_new_tokens; ++step) {
-            int next_token;
-            if (!tuned_gen.do_sample) {
-                int* argmax_dev = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-                ops::argmax(*ctx_, *logits_ptr, config_.vocab_size, argmax_dev);
-                ctx_->memcpy_d2h(&next_token, argmax_dev, sizeof(int));
-                ctx_->free_device(argmax_dev);
-            } else {
-                next_token = ops::sample_with_config(*ctx_, *logits_ptr, config_.vocab_size,
-                                                     tuned_gen, generated_ids);
+            if (first_seg_lang.empty()) {
+                first_seg_lang = seg_lang;
             }
 
-            if (next_token == config_.eos_token_id || next_token == config_.im_end_id) break;
-            generated_ids.push_back(next_token);
-            ctx_->memcpy_h2d(one_token_dev, &next_token, sizeof(int));
-            logits_ptr = &backend_->forward(*ctx_, one_token_dev, 1);
+            // Append segment result to accumulated result
+            if (!seg_text.empty()) {
+                bool need_space = false;
+                if (!accumulated_result.empty()) {
+                    int prev_ch = static_cast<unsigned char>(accumulated_result.back());
+                    int next_ch = static_cast<unsigned char>(seg_text.front());
+                    if (should_insert_boundary_space(prev_ch, next_ch)) {
+                        need_space = true;
+                    }
+                }
+
+                if (need_space) {
+                    accumulated_result += " ";
+                    if (token_callback) {
+                        token_callback(" ");
+                    }
+                }
+                accumulated_result += seg_text;
+                if (token_callback) {
+                    token_callback(seg_text);
+                }
+            }
         }
-        ctx_->free_device(one_token_dev);
-
-        // 9. Decode and parse output
-        std::string raw = tokenizer_.decode(generated_ids);
-
-        std::string parsed_lang;
-        std::string parsed_text;
-        aila_asr::parse_asr_output(raw, forced_language, parsed_lang, parsed_text);
 
         if (language_out) {
-            *language_out = parsed_lang;
+            *language_out = first_seg_lang;
         }
 
-        cached_ids_ = prompt_ids;
-        cached_ids_.insert(cached_ids_.end(), generated_ids.begin(), generated_ids.end());
-
-        return parsed_text;
+        return accumulated_result;
     }
 
     double benchmark_prefill(const std::vector<int>& token_ids) {

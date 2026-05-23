@@ -143,10 +143,18 @@ typedef int (*AilaTokenCallback)(const char* token_text, void* user_data);
 #### `aila_transcribe`
 
 ```c
-char* aila_transcribe(AilaEngine* engine, const char* wav_path,
-                      const AilaGenConfig* config,
-                      const char* forced_language,
-                      char** language_out);
+char* aila_transcribe(
+    AilaEngine* engine,
+    const char* wav_path,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt,
+    float segment_sec,
+    int past_text_conditioning,
+    AilaTokenCallback token_callback,
+    void* user_data,
+    char** language_out
+);
 ```
 
 Transcribes an audio file (blocking). Supports WAV, MP3, FLAC, and other audio formats.
@@ -155,6 +163,11 @@ If the loaded model does not support ASR (i.e. not configured with Qwen3-ASR mod
 - `wav_path` — Path to the audio file.
 - `config` — Generation configuration (can be `NULL` for defaults).
 - `forced_language` — Optional language name to force (e.g., `"Chinese"`, `"English"`). Set to `NULL` or `""` for auto-detection.
+- `system_prompt` — Optional system prompt to guide/bias transcription (e.g., spelling/role bias). Can be `NULL`.
+- `segment_sec` — Segment split duration in seconds. Set to `<= 0.0` to disable segmentation and transcribe as a single chunk.
+- `past_text_conditioning` — `1` to enable past-text conditioning (uses previous transcript segment as historical context for next segment), `0` to disable.
+- `token_callback` — Optional real-time streaming callback receiving segment pieces as they are decoded.
+- `user_data` — Optional user-defined pointer passed back to `token_callback`.
 - `language_out` — If not `NULL`, receives a newly allocated UTF-8 string containing the recognized/forced language name (e.g., `"Chinese"`, `"English"`). The caller **must** free this string with `aila_free_string()`.
 
 Returns a newly allocated UTF-8 string containing the clean transcription text (stripped of control tags like `<asr_text>` and language prefixes). The caller **must** free the returned string with `aila_free_string()`. Returns `NULL` on error.
@@ -316,7 +329,18 @@ lib.aila_engine_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.aila_engine_init.restype = ctypes.c_int
 lib.aila_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 lib.aila_generate.restype = ctypes.c_void_p
-lib.aila_transcribe.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+lib.aila_transcribe.argtypes = [
+    ctypes.c_void_p,          # engine
+    ctypes.c_char_p,          # wav_path
+    ctypes.c_void_p,          # config
+    ctypes.c_char_p,          # forced_language
+    ctypes.c_char_p,          # system_prompt
+    ctypes.c_float,           # segment_sec
+    ctypes.c_int,             # past_text_conditioning
+    TokenCallback,            # token_callback
+    ctypes.c_void_p,          # user_data
+    ctypes.POINTER(ctypes.c_char_p) # language_out
+]
 lib.aila_transcribe.restype = ctypes.c_void_p
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
@@ -364,7 +388,18 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern IntPtr aila_engine_create();
     [DllImport("AilaShared.dll")] static extern int aila_engine_init(IntPtr e, string dir, int maxSeq);
     [DllImport("AilaShared.dll")] static extern IntPtr aila_generate(IntPtr e, string prompt, ref AilaGenConfig cfg);
-    [DllImport("AilaShared.dll")] static extern IntPtr aila_transcribe(IntPtr e, string wavPath, ref AilaGenConfig cfg, string forcedLang, out IntPtr langOut);
+    [DllImport("AilaShared.dll")] static extern IntPtr aila_transcribe(
+        IntPtr e,
+        string wavPath,
+        ref AilaGenConfig cfg,
+        string forcedLang,
+        string systemPrompt,
+        float segmentSec,
+        int pastTextConditioning,
+        AilaTokenCallback tokenCallback,
+        IntPtr userData,
+        out IntPtr langOut
+    );
     [DllImport("AilaShared.dll")] static extern void aila_free_string(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_engine_destroy(IntPtr e);
     // ... etc
@@ -388,6 +423,11 @@ extern "C" {
         wav_path: *const c_char,
         config: *const AilaGenConfig,
         forced_language: *const c_char,
+        system_prompt: *const c_char,
+        segment_sec: f32,
+        past_text_conditioning: c_int,
+        token_callback: AilaTokenCallback,
+        user_data: *mut c_void,
         language_out: *mut *mut c_char,
     ) -> *mut c_char;
     fn aila_free_string(s: *mut c_char);

@@ -219,6 +219,11 @@ AILA_API char* aila_transcribe(
     const char* wav_path,
     const AilaGenConfig* config,
     const char* forced_language,
+    const char* system_prompt,
+    float segment_sec,
+    int past_text_conditioning,
+    AilaTokenCallback token_callback,
+    void* user_data,
     char** language_out
 );
 

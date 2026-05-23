@@ -102,7 +102,18 @@ class AilaAPI:
         self._set("aila_generate_messages_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
 
         self._set("aila_free_string", None, [c_void_p])
-        self._set("aila_transcribe", c_void_p, [c_void_p, c_char_p, c_void_p, c_char_p, POINTER(c_char_p)])
+        self._set("aila_transcribe", c_void_p, [
+            c_void_p,          # engine
+            c_char_p,          # wav_path
+            c_void_p,          # config
+            c_char_p,          # forced_language
+            c_char_p,          # system_prompt
+            c_float,           # segment_sec
+            c_int,             # past_text_conditioning
+            TokenCallback,     # token_callback
+            c_void_p,          # user_data
+            POINTER(c_char_p)  # language_out
+        ])
 
         self._set("aila_set_log_callback", None, [LogCallback, c_void_p])
         self._set("aila_set_log_level", None, [c_int])
@@ -524,7 +535,7 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
     if not is_asr_model:
         # Defense test for non-ASR models
         lang_p = c_char_p()
-        out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, byref(lang_p))
+        out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, None, 0.0, 0, TokenCallback(), None, byref(lang_p))
         test("transcribe on non-ASR model returns NULL", out_p is None)
         err = api.aila_last_error_code(engine)
         test("transcribe error code is RUNTIME (6)", err == 6) # RUNTIME
@@ -538,7 +549,7 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
     # Test 1: Auto-detection (forced_language = None)
     lang_p = c_char_p()
     t0 = time.time()
-    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, byref(lang_p))
+    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), None, None, 0.0, 0, TokenCallback(), None, byref(lang_p))
     elapsed = time.time() - t0
 
     test("transcribe (auto-detect) returns non-NULL", out_p is not None)
@@ -558,7 +569,7 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
 
     # Test 2: Forced Language (forced_language = "English")
     lang_p = c_char_p()
-    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), b"English", byref(lang_p))
+    out_p = api.aila_transcribe(engine, wav_path.encode(), byref(cfg), b"English", None, 0.0, 0, TokenCallback(), None, byref(lang_p))
     test("transcribe (forced language) returns non-NULL", out_p is not None)
     if out_p:
         text = string_at(out_p).decode("utf-8", errors="replace")
@@ -574,8 +585,40 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
         api.Free_string(lang_p)
 
     # Test 3: NULL safety
-    test("transcribe(NULL engine) returns NULL", api.aila_transcribe(None, wav_path.encode(), None, None, None) is None)
-    test("transcribe(NULL wav_path) returns NULL", api.aila_transcribe(engine, None, None, None, None) is None)
+    test("transcribe(NULL engine) returns NULL", api.aila_transcribe(None, wav_path.encode(), None, None, None, 0.0, 0, TokenCallback(), None, None) is None)
+    test("transcribe(NULL wav_path) returns NULL", api.aila_transcribe(engine, None, None, None, None, 0.0, 0, TokenCallback(), None, None) is None)
+
+    # Test 4: System Prompt and Streaming Callback
+    streaming_tokens = []
+    @TokenCallback
+    def on_asr_token(piece_p, _userdata):
+        piece = string_at(piece_p).decode("utf-8", errors="replace") if piece_p else ""
+        streaming_tokens.append(piece)
+        return 0
+
+    lang_p = c_char_p()
+    out_p = api.aila_transcribe(
+        engine,
+        wav_path.encode(),
+        byref(cfg),
+        None,
+        b"Preserve spelling",
+        5.0,
+        1,
+        on_asr_token,
+        None,
+        byref(lang_p)
+    )
+    test("transcribe with advanced parameters returns non-NULL", out_p is not None)
+    if out_p:
+        text = string_at(out_p).decode("utf-8", errors="replace")
+        test("advanced transcribe text length > 0", len(text) > 0, text)
+        test("advanced streaming tokens received", len(streaming_tokens) > 0, f"{len(streaming_tokens)} segment chunks: {streaming_tokens}")
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(out_p)
+    if lang_p.value:
+        api.Free_string = getattr(api, "aila_free_string")
+        api.Free_string(lang_p)
 
 
 def test_stress_long_prompt(api: AilaAPI, engine):
