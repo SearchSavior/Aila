@@ -227,4 +227,47 @@ AILA_API char* aila_transcribe(
     char** language_out
 );
 
+typedef struct AilaTranscribeStream AilaTranscribeStream;
+
+/**
+ * Create a real-time streaming ASR context.
+ * Returns NULL on error or if the model does not support ASR.
+ */
+AILA_API AilaTranscribeStream* aila_transcribe_stream_create(
+    AilaEngine* engine,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt
+);
+
+/**
+ * Feed mono 16kHz Float PCM audio samples into the ASR stream.
+ * Returns 0 on success, non-zero on error.
+ */
+AILA_API int aila_transcribe_stream_feed(
+    AilaTranscribeStream* stream,
+    const float* samples,
+    int sample_count
+);
+
+/**
+ * Get the current transcription text from the stream.
+ * @param stream       ASR stream context
+ * @param out_stable   [out] Receives a newly allocated UTF-8 string containing the stable text.
+ *                     Must be freed with aila_free_string() by the caller. Can be NULL.
+ * @param out_partial  [out] Receives a newly allocated UTF-8 string containing the temporary text.
+ *                     Must be freed with aila_free_string() by the caller. Can be NULL.
+ * Returns 0 on success, non-zero on error.
+ */
+AILA_API int aila_transcribe_stream_get_text(
+    AilaTranscribeStream* stream,
+    char** out_stable,
+    char** out_partial
+);
+
+/**
+ * Destroy the ASR stream context and free all allocated resources.
+ */
+AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
+
 #endif /* AILA_API_H */

@@ -115,6 +115,26 @@ class AilaAPI:
             POINTER(c_char_p)  # language_out
         ])
 
+        self._set("aila_transcribe_stream_create", c_void_p, [
+            c_void_p,          # engine
+            c_void_p,          # config
+            c_char_p,          # forced_language
+            c_char_p,          # system_prompt
+        ])
+        self._set("aila_transcribe_stream_feed", c_int, [
+            c_void_p,          # stream
+            POINTER(ctypes.c_float), # samples
+            c_int,             # sample_count
+        ])
+        self._set("aila_transcribe_stream_get_text", c_int, [
+            c_void_p,          # stream
+            POINTER(c_char_p), # out_stable
+            POINTER(c_char_p), # out_partial
+        ])
+        self._set("aila_transcribe_stream_destroy", None, [
+            c_void_p,          # stream
+        ])
+
         self._set("aila_set_log_callback", None, [LogCallback, c_void_p])
         self._set("aila_set_log_level", None, [c_int])
 
@@ -619,6 +639,129 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
     if lang_p.value:
         api.Free_string = getattr(api, "aila_free_string")
         api.Free_string(lang_p)
+
+    # Test 5: Real-time Streaming Input ASR (Online ASR)
+    print("\n[ASR Stream Input (Online ASR)]")
+    import struct
+
+    # Load English test WAV
+    wav_path = "./This is an English test.wav"
+    if not os.path.isfile(wav_path):
+        skip("stream input test", f"audio file not found at {wav_path}")
+        return
+
+    # Read float samples with a custom WAV parser to support IEEE Float (format 3)
+    def read_wav_custom(path):
+        with open(path, "rb") as f:
+            riff = f.read(4)
+            if riff != b"RIFF":
+                raise ValueError("Not a RIFF file")
+            f.read(4)
+            wave_tag = f.read(4)
+            if wave_tag != b"WAVE":
+                raise ValueError("Not a WAVE file")
+
+            audio_format = 1
+            num_channels = 1
+            sample_rate = 16000
+            bits_per_sample = 16
+            data = b""
+
+            while True:
+                subchunk_id = f.read(4)
+                if not subchunk_id or len(subchunk_id) < 4:
+                    break
+                subchunk_size_bytes = f.read(4)
+                if not subchunk_size_bytes or len(subchunk_size_bytes) < 4:
+                    break
+                subchunk_size = struct.unpack("<I", subchunk_size_bytes)[0]
+
+                if subchunk_id == b"fmt ":
+                    fmt_data = f.read(subchunk_size)
+                    audio_format, num_channels, sample_rate = struct.unpack("<HHI", fmt_data[:8])
+                    bits_per_sample = struct.unpack("<H", fmt_data[14:16])[0]
+                elif subchunk_id == b"data":
+                    data = f.read(subchunk_size)
+                    break
+                else:
+                    f.seek(subchunk_size, 1)
+
+            if not data:
+                raise ValueError("No data chunk found")
+
+            if audio_format == 3:  # IEEE float
+                n_elements = len(data) // 4
+                samples = struct.unpack(f"<{n_elements}f", data)
+                float_samples = list(samples)
+            elif audio_format == 1:  # PCM
+                if bits_per_sample == 16:
+                    n_elements = len(data) // 2
+                    samples = struct.unpack(f"<{n_elements}h", data)
+                    float_samples = [s / 32768.0 for s in samples]
+                elif bits_per_sample == 8:
+                    n_elements = len(data)
+                    samples = struct.unpack(f"<{n_elements}B", data)
+                    float_samples = [(s - 128) / 128.0 for s in samples]
+                else:
+                    raise ValueError(f"Unsupported PCM bits per sample: {bits_per_sample}")
+            else:
+                raise ValueError(f"Unsupported audio format tag: {audio_format}")
+
+            if num_channels > 1:
+                mono = []
+                for i in range(0, len(float_samples), num_channels):
+                    mono.append(sum(float_samples[i:i+num_channels]) / num_channels)
+                float_samples = mono
+
+            return float_samples
+
+    try:
+        float_samples = read_wav_custom(wav_path)
+    except Exception as e:
+        skip("stream input test", f"failed to parse WAV: {e}")
+        return
+
+    # Create transcribe stream
+    stream = api.aila_transcribe_stream_create(engine, byref(cfg), None, b"System prompt bias")
+    test("transcribe_stream_create returns non-NULL", stream is not None)
+    if stream:
+        # Feed audio chunk by chunk (1.0s chunks)
+        chunk_size = 16000
+        stable_texts = []
+        partial_texts = []
+
+        for i in range(0, len(float_samples), chunk_size):
+            chunk = float_samples[i:i+chunk_size]
+            arr = (ctypes.c_float * len(chunk))(*chunk)
+            ret_feed = api.aila_transcribe_stream_feed(stream, arr, len(chunk))
+            test(f"feed chunk {i//chunk_size} returns OK", ret_feed == 0)
+
+            out_stable = c_char_p()
+            out_partial = c_char_p()
+            ret_get = api.aila_transcribe_stream_get_text(stream, byref(out_stable), byref(out_partial))
+            test(f"get_text chunk {i//chunk_size} returns OK", ret_get == 0)
+
+            stable_val = string_at(out_stable).decode("utf-8", errors="replace") if out_stable.value else ""
+            partial_val = string_at(out_partial).decode("utf-8", errors="replace") if out_partial.value else ""
+
+            if out_stable.value:
+                api.Free_string = getattr(api, "aila_free_string")
+                api.Free_string(out_stable)
+            if out_partial.value:
+                api.Free_string = getattr(api, "aila_free_string")
+                api.Free_string(out_partial)
+
+            if stable_val:
+                stable_texts.append(stable_val)
+            if partial_val:
+                partial_texts.append(partial_val)
+
+        print(f"  Stable text progress: {stable_texts}")
+        print(f"  Final partial text: {partial_texts[-1] if partial_texts else ''}")
+
+        # Destroy stream
+        api.aila_transcribe_stream_destroy(stream)
+        test("stream destroyed successfully", True)
 
 
 def test_stress_long_prompt(api: AilaAPI, engine):

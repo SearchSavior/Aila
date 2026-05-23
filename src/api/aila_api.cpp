@@ -320,3 +320,120 @@ AILA_API char* aila_transcribe(
         return nullptr;
     }
 }
+
+struct AilaTranscribeStream {
+    AilaTranscribeStream(
+        InferenceEngine* engine,
+        const GenerationConfig& gen_config,
+        const std::string& forced_language,
+        const std::string& system_prompt
+    ) : cpp_stream(engine, gen_config, forced_language, system_prompt) {}
+
+    InferenceEngine::TranscribeStream cpp_stream;
+};
+
+AILA_API AilaTranscribeStream* aila_transcribe_stream_create(
+    AilaEngine* engine,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt
+) {
+    if (!engine) return nullptr;
+
+    try {
+        engine->engine.clear_error();
+
+        if (engine->engine.model_spec().family != ModelFamily::Qwen3ASR) {
+            engine->engine.set_error(EngineErrorCode::RuntimeError, "Model does not support ASR");
+            return nullptr;
+        }
+
+        GenerationConfig cfg = to_cpp_config(config);
+        std::string cpp_forced = forced_language ? forced_language : "";
+        std::string cpp_sys = system_prompt ? system_prompt : "";
+
+        return new AilaTranscribeStream(&(engine->engine), cfg, cpp_forced, cpp_sys);
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Create transcribe stream failed: %s", e.what());
+        engine->engine.set_error(EngineErrorCode::RuntimeError, e.what());
+        return nullptr;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Create transcribe stream failed: unknown exception");
+        engine->engine.set_error(EngineErrorCode::RuntimeError, "Unknown exception in stream creation");
+        return nullptr;
+    }
+}
+
+AILA_API int aila_transcribe_stream_feed(
+    AilaTranscribeStream* stream,
+    const float* samples,
+    int sample_count
+) {
+    if (!stream || !samples || sample_count <= 0) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        stream->cpp_stream.feed_audio(samples, static_cast<size_t>(sample_count));
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Stream feed failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Stream feed failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_transcribe_stream_get_text(
+    AilaTranscribeStream* stream,
+    char** out_stable,
+    char** out_partial
+) {
+    if (out_stable) *out_stable = nullptr;
+    if (out_partial) *out_partial = nullptr;
+
+    if (!stream) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::string stable;
+        std::string partial;
+        stream->cpp_stream.get_text(stable, partial);
+
+        if (out_stable && !stable.empty()) {
+            char* s = static_cast<char*>(malloc(stable.size() + 1));
+            if (s) {
+                memcpy(s, stable.c_str(), stable.size() + 1);
+                *out_stable = s;
+            }
+        }
+
+        if (out_partial && !partial.empty()) {
+            char* p = static_cast<char*>(malloc(partial.size() + 1));
+            if (p) {
+                memcpy(p, partial.c_str(), partial.size() + 1);
+                *out_partial = p;
+            }
+        }
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Stream get text failed: %s", e.what());
+        if (out_stable && *out_stable) { free(*out_stable); *out_stable = nullptr; }
+        if (out_partial && *out_partial) { free(*out_partial); *out_partial = nullptr; }
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Stream get text failed: unknown exception");
+        if (out_stable && *out_stable) { free(*out_stable); *out_stable = nullptr; }
+        if (out_partial && *out_partial) { free(*out_partial); *out_partial = nullptr; }
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream) {
+    if (stream) {
+        delete stream;
+    }
+}

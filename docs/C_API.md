@@ -172,6 +172,76 @@ If the loaded model does not support ASR (i.e. not configured with Qwen3-ASR mod
 
 Returns a newly allocated UTF-8 string containing the clean transcription text (stripped of control tags like `<asr_text>` and language prefixes). The caller **must** free the returned string with `aila_free_string()`. Returns `NULL` on error.
 
+### Real-Time Streaming Input ASR (Online ASR)
+
+Aila supports real-time streaming input ASR for live audio transcription (e.g., from a microphone). The user feeds mono 16kHz float PCM chunks, and Aila returns the incremental stable text and the temporary partial text (which updates as more audio is received).
+
+#### `AilaTranscribeStream`
+
+An opaque struct representing a real-time streaming ASR session.
+
+#### `aila_transcribe_stream_create`
+
+```c
+AilaTranscribeStream* aila_transcribe_stream_create(
+    AilaEngine* engine,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt
+);
+```
+
+Creates a streaming ASR context. Returns `NULL` on error or if the loaded model does not support ASR.
+
+- `engine` — Initialized engine handle.
+- `config` — Generation configuration (can be `NULL` for defaults).
+- `forced_language` — Optional language name to force (e.g., `"Chinese"`, `"English"`). Set to `NULL` or `""` for auto-detection.
+- `system_prompt` — Optional system prompt to bias the stream transcription. Can be `NULL`.
+
+#### `aila_transcribe_stream_feed`
+
+```c
+int aila_transcribe_stream_feed(
+    AilaTranscribeStream* stream,
+    const float* samples,
+    int sample_count
+);
+```
+
+Feeds raw PCM float 16kHz mono samples into the streaming ASR buffer.
+
+- `stream` — Active stream context.
+- `samples` — Array of float audio samples (16kHz, mono).
+- `sample_count` — Number of float samples in the array.
+
+Returns `0` (`AILA_OK`) on success, non-zero on error.
+
+#### `aila_transcribe_stream_get_text`
+
+```c
+int aila_transcribe_stream_get_text(
+    AilaTranscribeStream* stream,
+    char** out_stable,
+    char** out_partial
+);
+```
+
+Retrieves the current transcribed text.
+
+- `stream` — Active stream context.
+- `out_stable` — [out] Receives a newly allocated UTF-8 string containing the stable (finalized) transcription text. The caller **must** free this string with `aila_free_string()`. Can be `NULL`.
+- `out_partial` — [out] Receives a newly allocated UTF-8 string containing the temporary (unstable) transcription text representing the latest active speech chunk. The caller **must** free this string with `aila_free_string()`. Can be `NULL`.
+
+Returns `0` (`AILA_OK`) on success, non-zero on error.
+
+#### `aila_transcribe_stream_destroy`
+
+```c
+void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
+```
+
+Destroys the streaming ASR context and frees all associated memory. Passing `NULL` is safe.
+
 ### Memory Management
 
 #### `aila_free_string`
@@ -342,6 +412,14 @@ lib.aila_transcribe.argtypes = [
     ctypes.POINTER(ctypes.c_char_p) # language_out
 ]
 lib.aila_transcribe.restype = ctypes.c_void_p
+lib.aila_transcribe_stream_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+lib.aila_transcribe_stream_create.restype = ctypes.c_void_p
+lib.aila_transcribe_stream_feed.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+lib.aila_transcribe_stream_feed.restype = ctypes.c_int
+lib.aila_transcribe_stream_get_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)]
+lib.aila_transcribe_stream_get_text.restype = ctypes.c_int
+lib.aila_transcribe_stream_destroy.argtypes = [ctypes.c_void_p]
+lib.aila_transcribe_stream_destroy.restype = None
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
 
@@ -400,6 +478,10 @@ class Aila {
         IntPtr userData,
         out IntPtr langOut
     );
+    [DllImport("AilaShared.dll")] static extern IntPtr aila_transcribe_stream_create(IntPtr e, ref AilaGenConfig cfg, string forcedLang, string systemPrompt);
+    [DllImport("AilaShared.dll")] static extern int aila_transcribe_stream_feed(IntPtr s, float[] samples, int sampleCount);
+    [DllImport("AilaShared.dll")] static extern int aila_transcribe_stream_get_text(IntPtr s, out IntPtr stableOut, out IntPtr partialOut);
+    [DllImport("AilaShared.dll")] static extern void aila_transcribe_stream_destroy(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_free_string(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_engine_destroy(IntPtr e);
     // ... etc
@@ -430,6 +512,15 @@ extern "C" {
         user_data: *mut c_void,
         language_out: *mut *mut c_char,
     ) -> *mut c_char;
+    fn aila_transcribe_stream_create(
+        engine: *mut c_void,
+        config: *const AilaGenConfig,
+        forced_language: *const c_char,
+        system_prompt: *const c_char,
+    ) -> *mut c_void;
+    fn aila_transcribe_stream_feed(stream: *mut c_void, samples: *const f32, sample_count: c_int) -> c_int;
+    fn aila_transcribe_stream_get_text(stream: *mut c_void, out_stable: *mut *mut c_char, out_partial: *mut *mut c_char) -> c_int;
+    fn aila_transcribe_stream_destroy(stream: *mut c_void);
     fn aila_free_string(s: *mut c_char);
     fn aila_engine_destroy(engine: *mut c_void);
 }
