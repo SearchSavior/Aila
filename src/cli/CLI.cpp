@@ -135,6 +135,11 @@ Options:
   --log-level <level>      Minimum log level (debug/info/warning/error, default: info)
   --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
   --lora <path>              LoRA adapter directory (or set AILA_LORA_DIR)
+  --forced-lang <lang>     Force ASR language (e.g. Chinese, English)
+  --asr-system <prompt>    ASR system prompt text bias
+  --asr-segment <sec>      ASR segment split duration in seconds (default: 0.0, disabled)
+  --asr-past               Enable past-text conditioning history for ASR segments
+  --no-asr-past            Disable past-text conditioning for ASR segments (default)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -316,6 +321,26 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.transcribe_path = argv[++i];
             continue;
         }
+        if (arg == "--forced-lang" && i + 1 < argc) {
+            opts.forced_language = argv[++i];
+            continue;
+        }
+        if (arg == "--asr-system" && i + 1 < argc) {
+            opts.system_prompt = argv[++i];
+            continue;
+        }
+        if (arg == "--asr-segment" && i + 1 < argc) {
+            opts.segment_sec = static_cast<float>(std::atof(argv[++i]));
+            continue;
+        }
+        if (arg == "--asr-past") {
+            opts.past_text_conditioning = true;
+            continue;
+        }
+        if (arg == "--no-asr-past") {
+            opts.past_text_conditioning = false;
+            continue;
+        }
         // Positional: treat first positional as model dir
         if (arg[0] != '-' && opts.model_dir.empty()) {
             opts.model_dir = arg;
@@ -396,9 +421,49 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         if (engine) {
             std::cout << "\n[Context]" << std::endl;
             std::cout << "  KV cache tokens:  " << engine->context_length()
-                      << " / " << engine->max_context_length() << std::endl;
+                       << " / " << engine->max_context_length() << std::endl;
             std::cout << "  History turns:    " << engine->history().size() << std::endl;
             std::cout << std::endl;
+        }
+        return true;
+    });
+
+    registry.register_command("/transcribe", "Transcribe audio file (ASR)", [&, engine](const std::string& args) {
+        if (args.empty()) {
+            std::cout << "[ASR] Usage: /transcribe <wav_path>" << std::endl;
+            return true;
+        }
+        if (!engine) {
+            std::cout << "[ASR] Engine is not initialized" << std::endl;
+            return true;
+        }
+        if (engine->model_spec().family != ModelFamily::Qwen3ASR) {
+            std::cout << "[ASR] Current loaded model is not an ASR model!" << std::endl;
+            return true;
+        }
+        std::cout << "[ASR] Transcribing: " << args << std::endl;
+
+        std::string lang;
+        std::string transcript = engine->transcribe(
+            args,
+            gen_config,
+            &lang,
+            "",    // forced_language (auto-detect)
+            "",    // system_prompt (default none)
+            20.0f, // segment_sec = 20.0s
+            true,  // past_text_conditioning = true
+            [](const std::string& token_text) {
+                std::cout << token_text << std::flush;
+            }
+        );
+
+        if (engine->last_error_code() != EngineErrorCode::Ok) {
+            std::cout << "\n[ASR] Error: " << engine->last_error_message() << std::endl;
+        } else {
+            std::cout << "\n[ASR] Finished." << std::endl;
+            if (!lang.empty()) {
+                std::cout << "[ASR] Detected Language: " << lang << std::endl;
+            }
         }
         return true;
     });

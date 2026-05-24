@@ -135,12 +135,41 @@ int main(int argc, char** argv) {
     // ASR transcription mode
     if (!opts.transcribe_path.empty()) {
         gen_config.do_sample = false;  // greedy for ASR
-        std::string transcript = engine.transcribe(opts.transcribe_path, gen_config);
+        std::string lang;
+        std::string transcript;
+
+        std::function<void(const std::string&)> token_cb = nullptr;
+        if (opts.stream_output) {
+            token_cb = [](const std::string& token_text) {
+                std::cout << token_text << std::flush;
+            };
+        }
+
+        transcript = engine.transcribe(
+            opts.transcribe_path,
+            gen_config,
+            &lang,
+            opts.forced_language,
+            opts.system_prompt,
+            opts.segment_sec,
+            opts.past_text_conditioning,
+            token_cb
+        );
+
         if (engine.last_error_code() != EngineErrorCode::Ok) {
             AILA_LOG_ERROR("Transcription failed: %s", engine.last_error_message().c_str());
             return 2;
         }
-        std::cout << transcript << std::endl;
+
+        if (opts.stream_output) {
+            std::cout << std::endl;
+        } else {
+            std::cout << transcript << std::endl;
+        }
+
+        if (!lang.empty()) {
+            std::cout << "[Language] " << lang << std::endl;
+        }
         return 0;
     }
 

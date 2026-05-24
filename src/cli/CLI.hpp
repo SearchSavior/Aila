@@ -53,6 +53,10 @@ struct CLIOptions {
 
     // ASR transcription mode
     std::string transcribe_path;    // --transcribe
+    std::string forced_language;    // --forced-lang
+    std::string system_prompt;      // --asr-system
+    float segment_sec = 0.0f;       // --asr-segment
+    bool past_text_conditioning = false; // --asr-past / --no-asr-past
 };
 
 // Parse command-line arguments
