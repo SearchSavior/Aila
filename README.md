@@ -18,8 +18,9 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **🔢 Bfloat16 inference** — dense (unquantized) models via oneDNN matmul primitives
 - **🏗️ Qwen3.5 Hybrid architecture** — full GPU acceleration for the dual attention (GQA + DeltaNet linear attention) architecture
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
-- **👁️ Vision (Qwen3.5)** — image understanding with CPU preprocessing and GPU vision transformer
-- **🔄 Streaming output** — token-level streaming callback with abort support
+- 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
+- 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
+- 🔄 Streaming output — token-level streaming callback with abort support
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
 - **🔌 C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
@@ -27,12 +28,13 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 
 ## 📦 Supported Models
 
-| Model | Architecture | Quantization | Vision |
-|-------|-------------|-------------|--------|
-| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
-| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
-| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
-| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
+| Model | Architecture | Quantization | Vision | Audio (ASR) |
+|-------|-------------|-------------|--------|-------------|
+| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
+| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
+| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
+| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
+| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
 
@@ -63,7 +65,7 @@ Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
 
 | Engine | Backend | Model | Prefill | Decode |
 |--------|---------|-------|---------|--------|
-| **Aila 0.1.2** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1649 tok/s** | 58 tok/s |
+| **Aila 0.1.3** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1649 tok/s** | 58 tok/s |
 | llama.cpp b8996 | SYCL | Qwen3.5-4B Q4_K_XL | 1290 tok/s | 28 tok/s |
 | llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | **60 tok/s** |
 
@@ -76,6 +78,9 @@ Aila delivers the highest prefill throughput and competitive decode performance 
 ```powershell
 # Interactive conversation
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline
+
+# Offline audio transcription (ASR)
+Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
 # Single prompt from JSON file
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json prompt.json
@@ -116,6 +121,11 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `--bench-sample` / `--bench-greedy` | Benchmark decode mode | greedy |
 | `--log-level <level>` | Minimum log level (verbose/debug/info/warning/error) | info |
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
+| `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
+| `--forced-lang <lang>` | Force ASR language (e.g. Chinese, English) | (none) |
+| `--asr-system <prompt>` | ASR system prompt text bias | (none) |
+| `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
+| `--asr-past` / `--no-asr-past` | Toggle past-text conditioning for ASR segments | no-asr-past |
 | `-h, --help` | Show help | — |
 | `-v, --version` | Show version | — |
 
@@ -125,6 +135,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 |---------|-------------|
 | `/help` | Show available commands |
 | `/quit`, `/exit` | Exit |
+| `/transcribe <path>` | Transcribe audio file (ASR) |
 | `/clear` | Clear conversation history |
 | `/context` | Show context usage |
 | `/greedy` | Switch to greedy decoding |
