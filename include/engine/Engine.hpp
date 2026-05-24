@@ -2079,6 +2079,7 @@ public:
                 retry_count++;
                 continue;
             }
+            last_transcribe_tokens_ += static_cast<int>(generated_ids.size());
             break;
         }
 
@@ -2099,6 +2100,10 @@ public:
                            bool past_text_conditioning = false,
                            std::function<void(const std::string&)> token_callback = nullptr) {
         clear_error();
+        last_transcribe_duration_s_ = 0.0;
+        last_transcribe_latency_ms_ = 0.0;
+        last_transcribe_tokens_ = 0;
+        auto t_start = std::chrono::high_resolution_clock::now();
 
         if (model_spec_.family != ModelFamily::Qwen3ASR || !audio_encoder_) {
             set_error(EngineErrorCode::RuntimeError, "ASR backend not initialized");
@@ -2208,6 +2213,10 @@ public:
         if (language_out) {
             *language_out = first_seg_lang;
         }
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        last_transcribe_latency_ms_ = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        last_transcribe_duration_s_ = static_cast<double>(audio_n_samples) / 16000.0;
 
         return accumulated_result;
     }
@@ -2463,6 +2472,9 @@ public:
 
     EngineErrorCode last_error_code() const { return last_error_code_; }
     const std::string& last_error_message() const { return last_error_message_; }
+    double last_transcribe_duration_s() const { return last_transcribe_duration_s_; }
+    double last_transcribe_latency_ms() const { return last_transcribe_latency_ms_; }
+    int last_transcribe_tokens() const { return last_transcribe_tokens_; }
 
 private:
 
@@ -2662,4 +2674,7 @@ private:
     bool benchmark_seed_ready_ = false;
     EngineErrorCode last_error_code_ = EngineErrorCode::Ok;
     std::string last_error_message_;
+    double last_transcribe_duration_s_ = 0.0;
+    double last_transcribe_latency_ms_ = 0.0;
+    int last_transcribe_tokens_ = 0;
 };

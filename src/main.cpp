@@ -170,6 +170,18 @@ int main(int argc, char** argv) {
         if (!lang.empty()) {
             std::cout << "[Language] " << lang << std::endl;
         }
+
+        double audio_s = engine.last_transcribe_duration_s();
+        double latency_ms = engine.last_transcribe_latency_ms();
+        int tokens = engine.last_transcribe_tokens();
+        double speed = latency_ms > 0 ? (audio_s / (latency_ms / 1000.0)) : 0.0;
+        double tok_s = latency_ms > 0 ? (static_cast<double>(tokens) / (latency_ms / 1000.0)) : 0.0;
+
+        std::cout << "[Audio: " << std::fixed << std::setprecision(1) << audio_s << "s, "
+                  << "Latency: " << std::fixed << std::setprecision(0) << latency_ms << "ms, "
+                  << "Speed: " << std::fixed << std::setprecision(1) << speed << "x, "
+                  << tok_s << " tok/s]" << std::endl;
+
         return 0;
     }
 
